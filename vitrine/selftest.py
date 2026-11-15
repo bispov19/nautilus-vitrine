@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import copy
 import os
+import shutil
+import tempfile
 import time
 
 from gi.repository import Gio, GLib
 
-from . import imageload, native
+from . import discovery, imageload, native
 from .util import log
 
 STEP_MS = 1500
@@ -225,7 +227,7 @@ def run(ctl) -> bool:
 
     def tile_uris(page):
         uris = []
-        for box in (page.places_box, page.bookmarks_box):
+        for box in (page.places_box,):
             child = box.get_first_child()
             while child is not None:
                 uris.append(getattr(child, "_vitrine_uri", None))
@@ -295,20 +297,28 @@ def run(ctl) -> bool:
         ctl.show_computer(True)
         page = ctl.computer
         page.set_item_hidden("starred:///", True)
-        page.set_section_enabled("bookmarks", False)
+        page.set_section_enabled("devices", False)
 
     @step
     def c8():
         page = ctl.computer
         uris = tile_uris(page)
         check("personalizar: ocultar item e seção",
-              "starred:///" not in uris and not page.sections["bookmarks"].get_visible()
+              "starred:///" not in uris and not page.sections["devices"].get_visible()
               and page.sections["places"].get_visible(),
               f"itens={uris}")
         page.set_item_hidden("starred:///", False)
-        page.set_section_enabled("bookmarks", True)
+        page.set_section_enabled("devices", True)
+        uris = tile_uris(page)
         check("personalizar: mostrar de novo",
-              "starred:///" in tile_uris(page) and page.sections["bookmarks"].get_visible())
+              "starred:///" in uris and page.sections["devices"].get_visible())
+        home_uri = Gio.File.new_for_uri(home).get_uri().rstrip("/")
+        special = [i for i, u in enumerate(uris) if (GLib.Uri.peek_scheme(u) or "") != "file"]
+        folders = [i for i, u in enumerate(uris) if (GLib.Uri.peek_scheme(u) or "") == "file"]
+        check("pastas num grupo único: pasta pessoal primeiro, locais especiais no fim",
+              uris and uris[0].rstrip("/") == home_uri
+              and (not special or not folders or max(folders) < min(special)),
+              f"ordem={uris}")
         try:
             page.open_settings()
             dlg = page._settings_dialog
@@ -337,6 +347,64 @@ def run(ctl) -> bool:
         check("abrir Recentes pelo Meu computador",
               ctl.content_stack.get_visible_child_name() == "tabs" and st["uri"] == "recent:///",
               str(st))
+        ctl.navigate(home)
+
+    # ── descoberta automática de pastas ──
+    disc: dict[str, str] = {}
+
+    @step
+    def d1():
+        ratio = 0.6
+        check("descoberta: classifica mídia, documentos, mista e vazia",
+              discovery.classify(["image/jpeg"] * 5 + ["text/plain"], ratio) == "media"
+              and discovery.classify(["application/pdf"] * 5, ratio) == "documents"
+              and discovery.classify(["image/png"] * 3 + ["text/plain"] * 3, ratio) is None
+              and discovery.classify([], ratio) is None)
+        root = tempfile.mkdtemp(prefix="vitrine-selftest-")
+        disc["root"] = root
+        for name, files in (("fotos", [f"f{i}.jpg" for i in range(6)]),
+                            ("docs", [f"d{i}.pdf" for i in range(3)] + [f"n{i}.txt" for i in range(3)])):
+            path = os.path.join(root, name)
+            os.makedirs(path)
+            for f in files:
+                open(os.path.join(path, f), "wb").close()
+            disc[name] = Gio.File.new_for_path(path).get_uri()
+        cfg.settings["folder_discovery"] = True
+        cfg.settings["default_mode"] = "grid"  # prova que documentos vão para a lista
+        cfg.settings["remember_per_folder"] = False
+        ctl.navigate(disc["fotos"])
+
+    @step
+    def d2():
+        st = state()
+        check("descoberta: pasta de fotos abre em ícones extra grandes",
+              st["view"] == "grid" and st["zoom"] == "extra-large", str(st))
+        ctl.navigate(disc["docs"])
+
+    @step
+    def d3():
+        st = state()
+        check("descoberta: pasta de documentos abre em lista", st["view"] == "list", str(st))
+        ctl.user_set_mode("grid", "medium")
+
+    @step
+    def d4():
+        ctl.navigate(disc["fotos"])
+
+    @step
+    def d5():
+        ctl.navigate(disc["docs"])
+
+    @step
+    def d6():
+        st = state()
+        check("descoberta: escolha manual tem prioridade na pasta",
+              st["view"] == "grid" and cfg.rule_for(disc["docs"])[0] is None, str(st))
+        discovery.forget_manual(disc["docs"])
+        shutil.rmtree(disc["root"], ignore_errors=True)
+        cfg.settings["folder_discovery"] = False
+        cfg.settings["default_mode"] = "list"
+        cfg.settings["remember_per_folder"] = saved_settings.get("remember_per_folder", True)
         ctl.navigate(home)
 
     @step

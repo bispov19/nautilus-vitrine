@@ -30,12 +30,15 @@ DEFAULT_SETTINGS = {
     "auto_media_grid": True,
     "auto_media_zoom": "extra-large",
     "auto_media_ratio": 0.6,
+    # Descoberta automática de pastas: mídia → ícones extra grandes, documentos → lista,
+    # mistas/vazias → padrão. Desligada = comportamento de sempre (auto_media_grid acima).
+    "folder_discovery": False,
     # Abrir o Nautilus já na página "Meu computador" (quando abre na pasta pessoal,
     # que é o que acontece pelo menu de aplicativos ou numa janela nova).
     "start_on_computer": False,
     # Entrada "Meu computador" no topo da barra lateral.
     "computer_in_sidebar": True,
-    # Seções desligadas: {"places": false, "bookmarks": ..., "devices": ..., "network": ...}
+    # Seções desligadas: {"places": false, "devices": ..., "network": ...}
     "computer_sections": {},
     # Itens ocultos (URIs de locais/marcadores ou chaves de dispositivos).
     "computer_hidden": [],

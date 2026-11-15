@@ -18,8 +18,7 @@ ANNOUNCE_DEDUP_S = 15
 
 # Seções da página (chave em settings.json → "computer_sections").
 SECTIONS = (
-    ("places", "Locais", "Pasta pessoal, Recentes, Favoritos, Rede, Lixeira"),
-    ("bookmarks", "Marcadores", "As pastas fixadas na barra lateral"),
+    ("places", "Pastas", "Pasta pessoal, Documentos, Downloads, as pastas fixadas, Lixeira…"),
     ("devices", "Dispositivos e unidades", "Discos, pen drives, HDs externos, cartões"),
     ("network", "Rede", "Compartilhamentos montados"),
     ("disks_button", "Atalho para o app Discos", "Formatar e particionar"),
@@ -34,6 +33,42 @@ _FALLBACK_PLACES = (
     ("trash:///", "Lixeira", "user-trash-symbolic", 1),
 )
 _COLOR_ICON_FIX = {"user-trash-full": "user-trash-full", "user-trash": "user-trash"}
+
+# Pastas principais do usuário, nesta ordem, logo depois da pasta pessoal.
+_MAIN_USER_DIRS = (
+    GLib.UserDirectory.DIRECTORY_DOCUMENTS,
+    GLib.UserDirectory.DIRECTORY_DOWNLOAD,
+    GLib.UserDirectory.DIRECTORY_PICTURES,
+    GLib.UserDirectory.DIRECTORY_MUSIC,
+    GLib.UserDirectory.DIRECTORY_VIDEOS,
+)
+
+
+def _uri_key(uri: str) -> str:
+    return uri.rstrip("/") if uri.startswith("file://") else uri
+
+
+def order_places(entries: list[dict]) -> list[dict]:
+    """Um grupo único e previsível: pasta pessoal; Documentos, Downloads, Imagens,
+    Músicas, Vídeos; as demais pastas em ordem alfabética; por fim os locais
+    especiais (Recentes, Favoritos, Rede, Lixeira…) na ordem da barra lateral."""
+    home = _uri_key(Gio.File.new_for_path(os.path.expanduser("~")).get_uri())
+    rank = {home: 0}
+    for i, kind in enumerate(_MAIN_USER_DIRS, 1):
+        path = GLib.get_user_special_dir(kind)
+        if path:
+            rank.setdefault(_uri_key(Gio.File.new_for_path(path).get_uri()), i)
+
+    def key(item):
+        pos, e = item
+        uri = _uri_key(e["uri"])
+        if uri in rank:
+            return (0, rank[uri], "", pos)
+        if (GLib.Uri.peek_scheme(e["uri"]) or "") == "file":
+            return (1, 0, GLib.utf8_collate_key_for_filename(e["label"], -1), pos)
+        return (2, 0, "", pos)
+
+    return [e for _pos, e in sorted(enumerate(entries), key=key)]
 
 
 def _color_icon(gicon, uri: str) -> Gio.Icon:
@@ -264,13 +299,16 @@ class ComputerPage(Gtk.ScrolledWindow):
         head.append(customize)
         body.append(head)
 
+        # Todas as pastas da barra lateral (locais e marcadores) numa grade só.
         self.places_box = self._flowbox(max_per_line=8)
-        self.bookmarks_box = self._flowbox(max_per_line=8)
+        self.places_box.set_homogeneous(True)
+        self.places_box.set_column_spacing(6)
+        self.places_box.set_row_spacing(6)
+        self.places_box.add_css_class("vitrine-folders")
         self.devices_box = self._flowbox(max_per_line=4)
         self.network_box = self._flowbox(max_per_line=4)
         self.sections: dict[str, Gtk.Widget] = {
-            "places": self._section("Locais", self.places_box),
-            "bookmarks": self._section("Marcadores", self.bookmarks_box),
+            "places": self._section("Pastas", self.places_box),
             "devices": self._section("Dispositivos e unidades", self.devices_box),
             "network": self._section("Rede", self.network_box),
         }
@@ -323,7 +361,7 @@ class ComputerPage(Gtk.ScrolledWindow):
         self._start_usage_poll()
 
     def _boxes(self):
-        return (self.places_box, self.bookmarks_box, self.devices_box, self.network_box)
+        return (self.places_box, self.devices_box, self.network_box)
 
     # ── preferências ──
     def _cfg(self):
@@ -336,7 +374,8 @@ class ComputerPage(Gtk.ScrolledWindow):
         return set(self._cfg().get("computer_hidden") or [])
 
     def places(self) -> list[dict]:
-        """Locais da barra lateral (sem os dispositivos, que têm cards próprios)."""
+        """Locais e marcadores da barra lateral (sem os dispositivos, que têm cards
+        próprios), num grupo único na ordem de `order_places`."""
         entries = [e for e in native.sidebar_places(self.ctl.win) if not e["device"]]
         if not entries:
             entries = fallback_places()
@@ -346,7 +385,7 @@ class ComputerPage(Gtk.ScrolledWindow):
                 continue
             seen.add(e["uri"])
             out.append(e)
-        return out
+        return order_places(out)
 
     def _on_hub_changed(self) -> None:
         self._dirty = True
@@ -366,10 +405,8 @@ class ComputerPage(Gtk.ScrolledWindow):
         for entry in self.places():
             if entry["uri"] in hidden:
                 continue
-            key = "places" if entry["section"] == 1 else "bookmarks"
-            box = self.places_box if key == "places" else self.bookmarks_box
-            box.append(self._place_tile(entry))
-            counts[key] += 1
+            self.places_box.append(self._place_tile(entry))
+            counts["places"] += 1
 
         for dev in self.hub.devices():
             if dev.key in hidden:
@@ -390,12 +427,14 @@ class ComputerPage(Gtk.ScrolledWindow):
         self._refresh_usage()
 
     def _place_tile(self, entry: dict) -> Gtk.FlowBoxChild:
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, valign=Gtk.Align.START)
         box.add_css_class("vitrine-tile")
         img = Gtk.Image.new_from_gicon(_color_icon(entry.get("gicon"), entry["uri"]))
         img.set_pixel_size(48)
+        # Até duas linhas, centralizadas: nomes longos continuam legíveis.
         lbl = Gtk.Label(label=entry["label"], ellipsize=Pango.EllipsizeMode.END,
-                        max_width_chars=12)
+                        wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, lines=2,
+                        justify=Gtk.Justification.CENTER, width_chars=10, max_width_chars=12)
         box.append(img)
         box.append(lbl)
         child = Gtk.FlowBoxChild()
@@ -655,7 +694,14 @@ class ComputerPage(Gtk.ScrolledWindow):
                bool(cfg.get("notify_new_devices")), lambda v: cfg.set("notify_new_devices", v))
         page.add(general)
 
-        sections = Adw.PreferencesGroup(title="Seções",
+        views = Adw.PreferencesGroup(title="Visualização das pastas")
+        switch(views, "Descoberta automática de pastas",
+               "Fotos e vídeos em ícones extra grandes, documentos em lista. "
+               "Escolhas feitas à mão numa pasta têm prioridade",
+               bool(cfg.get("folder_discovery")), lambda v: cfg.set("folder_discovery", v))
+        page.add(views)
+
+        sections =Adw.PreferencesGroup(title="Seções",
                                         description="Quais blocos aparecem na página")
         for key, title, subtitle in SECTIONS:
             switch(sections, title, subtitle, self.section_enabled(key),
@@ -666,8 +712,7 @@ class ComputerPage(Gtk.ScrolledWindow):
         items = Adw.PreferencesGroup(title="Itens",
                                      description="Desligue o que não quer ver no Meu computador")
         for entry in self.places():
-            sub = "Marcador" if entry["section"] != 1 else "Local"
-            switch(items, entry["label"], sub, entry["uri"] not in hidden,
+            switch(items, entry["label"], "Pasta", entry["uri"] not in hidden,
                    lambda v, u=entry["uri"]: self.set_item_hidden(u, not v))
         for dev in self.hub.devices():
             switch(items, dev.name, "Dispositivo" if dev.kind != "network" else "Rede",

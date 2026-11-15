@@ -68,6 +68,7 @@ O botão **Abrir** usa o aplicativo padrão. O botão 👁 (ou a tecla **Espaço
 - Trocou de visualização numa pasta, com **Ctrl+1** (lista), **Ctrl+2** (ícones), **Ctrl+3** (colunas), os botões ou o menu? A Vitrine **lembra a escolha para aquela pasta**. Pastas sem regra usam o seu padrão.
 - O **zoom dos ícones também é salvo por pasta**: ícones gigantes em *Imagens*, ícones normais em *Downloads*.
 - **Pastas de fotos e vídeos são detectadas automaticamente.** Se a maioria dos arquivos for imagem ou vídeo, a pasta abre em ícones grandes.
+- **Descoberta automática de pastas** (opcional, desligada por padrão): olha o tipo dos arquivos de cada pasta e escolhe a visualização. Maioria de fotos/vídeos → ícones extra grandes; maioria de documentos e outros arquivos → lista; pasta mista ou vazia → o seu padrão. Só lê o nome/extensão de até 200 itens (rápido mesmo em pastas enormes) e guarda o resultado até a pasta mudar. Uma escolha feita à mão numa pasta sempre vence a descoberta. Ligue no menu **Visualização desta pasta** ou em **Personalizar** (✎ no Meu computador).
 - Na primeira execução, *Imagens* e *Vídeos* já vêm configuradas para ícones grandes, **incluindo as subpastas**.
 - Navegando em colunas, as subpastas continuam em colunas.
 
@@ -76,6 +77,7 @@ Clique com o botão direito no **fundo de qualquer pasta** e escolha **Visualiza
 - Lista · Ícones · Ícones grandes · Colunas
 - Aplicar também às subpastas / Não aplicar às subpastas
 - Esquecer esta pasta (usar o padrão)
+- Ligar/desligar a descoberta automática de pastas
 - Usar a visualização atual como padrão
 - Mostrar/ocultar pré-visualização
 
@@ -83,7 +85,7 @@ Clique com o botão direito no **fundo de qualquer pasta** e escolha **Visualiza
 
 Abra pela entrada **Meu computador** no topo da barra lateral, com **Ctrl+Shift+C** ou pelo clique direito no fundo de uma pasta.
 
-- **Locais e Marcadores**: tudo o que está na barra lateral do Nautilus, com os mesmos nomes e na mesma ordem: Pasta pessoal, Recentes, Favoritos, Rede, Lixeira e as suas pastas fixadas (Downloads, Documentos, Projetos…). Fixou ou removeu uma pasta da barra lateral? O Meu computador acompanha.
+- **Pastas**: tudo o que está na barra lateral do Nautilus, com os mesmos nomes, numa grade única: primeiro a Pasta pessoal, depois Documentos, Downloads, Imagens, Músicas e Vídeos, em seguida as demais pastas fixadas em ordem alfabética e, por fim, Recentes, Favoritos, Rede e Lixeira. Fixou ou removeu uma pasta da barra lateral? O Meu computador acompanha.
 - **Dispositivos e unidades**: disco do sistema, outros discos, pen drives, HDs externos, cartões de memória e celulares, cada um com **barra de uso** (azul, laranja acima de 80%, vermelha acima de 92%) e "X livres de Y · sistema de arquivos". O uso é atualizado a cada 10 segundos enquanto a página está aberta.
 - **Rede**: compartilhamentos montados (SMB, SFTP, WebDAV…), quando houver.
 - **Dispositivos não montados** aparecem também. Ao abrir, a Vitrine monta o dispositivo e pede a senha se ele for criptografado.
@@ -100,7 +102,7 @@ A página fecha sozinha quando você navega para qualquer lugar: barra lateral, 
 - **Abrir o Nautilus no Meu computador**: ao abrir o Arquivos pelo menu de aplicativos ou numa janela nova (Ctrl+N), ele começa aqui. Se outro programa pedir uma pasta específica, ela é respeitada.
 - Mostrar ou esconder a entrada **Meu computador na barra lateral**.
 - Ligar ou desligar o **aviso de dispositivo novo**.
-- Escolher quais **seções** aparecem: Locais, Marcadores, Dispositivos e unidades, Rede e o atalho para o Discos.
+- Escolher quais **seções** aparecem: Pastas, Dispositivos e unidades, Rede e o atalho para o Discos.
 - Escolher **item por item** o que aparece. Também dá para ocultar direto pelo clique direito → *Ocultar do Meu computador*.
 - **Mostrar tudo de novo**, com um clique.
 
@@ -188,11 +190,12 @@ Tudo funciona sem configurar nada. Para ajustes finos, edite os arquivos abaixo 
 | `auto_media_grid` | `true` | Abrir pastas de fotos/vídeos em ícones grandes |
 | `auto_media_zoom` | `"extra-large"` | Zoom usado nessas pastas |
 | `auto_media_ratio` | `0.6` | Proporção mínima de mídia para considerar "pasta de fotos" |
+| `folder_discovery` | `false` | Descoberta automática de pastas (mídia → ícones extra grandes, documentos → lista). Usa também `auto_media_zoom` e `auto_media_ratio` |
 | `default_mode` | do Nautilus | Visualização das pastas sem regra: `list`, `grid` ou `columns` |
 | `default_grid_zoom` | do Nautilus | Zoom padrão dos ícones |
 | `start_on_computer` | `false` | Abrir o Nautilus já no Meu computador (quando abre na pasta pessoal) |
 | `computer_in_sidebar` | `true` | Entrada "Meu computador" no topo da barra lateral |
-| `computer_sections` | `{}` | Seções desligadas, ex.: `{"network": false}` (`places`, `bookmarks`, `devices`, `network`, `disks_button`) |
+| `computer_sections` | `{}` | Seções desligadas, ex.: `{"network": false}` (`places`, `devices`, `network`, `disks_button`) |
 | `computer_hidden` | `[]` | Itens ocultos: URIs de locais (`"trash:///"`) ou chaves de dispositivos |
 | `notify_new_devices` | `true` | Avisar quando um pen drive, HD externo ou cartão for conectado |
 

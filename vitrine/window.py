@@ -6,7 +6,7 @@ import os
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
-from . import native
+from . import discovery, native
 from .columns import ColumnStrip
 from .computer import ComputerPage
 from .preview import PreviewPane
@@ -447,10 +447,17 @@ class WindowController:
             return GLib.SOURCE_REMOVE
         rule, _exact = self.cfg.rule_for(uri)
         current = getattr(slot, "_vitrine_mode", None)
+        discover = bool(self.cfg.get("folder_discovery"))
+        manual = discovery.manual_choice(uri) if discover else None
         if rule:
             self.apply_mode(slot, rule.get("mode", "list"), rule.get("zoom"))
+        elif manual:
+            self.apply_mode(slot, *manual)  # escolha manual vence a descoberta
         elif current == "columns":
             self.apply_mode(slot, "columns")  # navegar em colunas continua em colunas
+        elif discover:
+            discovery.discover(uri, float(self.cfg.get("auto_media_ratio")),
+                               lambda kind: self._apply_discovered(slot, uri, kind))
         elif self.cfg.get("auto_media_grid"):
             self._detect_media(slot, uri)
         else:
@@ -489,6 +496,8 @@ class WindowController:
             rule, exact = self.cfg.rule_for(uri) if uri else (None, False)
             zoom = ((rule or {}).get("zoom") if exact else None) or self.ext.current_grid_zoom()
         self.apply_mode(slot, mode, zoom)
+        if uri and native.is_regular_location(uri):
+            discovery.remember_manual(uri, mode, zoom if mode == "grid" else None)
         if self.cfg.get("remember_per_folder") and native.is_regular_location(uri):
             self.cfg.set_rule(uri, mode=mode, zoom=zoom if mode == "grid" else None)
 
@@ -540,6 +549,20 @@ class WindowController:
         if is_media:
             debug(f"pasta de mídia detectada: {uri}")
             self.apply_mode(slot, "grid", self.cfg.get("auto_media_zoom"))
+        else:
+            self.apply_mode(slot, self.cfg.get("default_mode"))
+
+    @guarded
+    def _apply_discovered(self, slot, uri: str, kind: str | None) -> None:
+        """Descoberta automática: mídia → ícones extra grandes; documentos → lista;
+        mista/vazia → padrão."""
+        if native.slot_uri(slot) != uri or discovery.manual_choice(uri):
+            return  # já saiu da pasta, ou o usuário escolheu à mão enquanto analisávamos
+        debug(f"descoberta: {uri} -> {kind}")
+        if kind == "media":
+            self.apply_mode(slot, "grid", self.cfg.get("auto_media_zoom"))
+        elif kind == "documents":
+            self.apply_mode(slot, "list")
         else:
             self.apply_mode(slot, self.cfg.get("default_mode"))
 

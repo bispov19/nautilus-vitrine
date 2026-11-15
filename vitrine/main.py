@@ -13,7 +13,7 @@ gi.require_version("Adw", "1")
 gi.require_version("Nautilus", "4.1")
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Nautilus  # noqa: E402
 
-from . import native  # noqa: E402
+from . import discovery, native  # noqa: E402
 from .computer import DeviceHub  # noqa: E402
 from .config import GRID_ZOOMS, Config  # noqa: E402
 from .util import guarded, log  # noqa: E402
@@ -31,6 +31,15 @@ CSS = b"""
 .vitrine-computer { background-color: var(--view-bg-color); }
 .vitrine-computer flowboxchild { padding: 0; border-radius: 12px; }
 .vitrine-tile { padding: 12px 8px; min-width: 96px; border-radius: 12px; }
+.vitrine-folders > flowboxchild { transition: background-color 150ms ease-out; }
+.vitrine-folders > flowboxchild:hover {
+  background-color: color-mix(in srgb, currentColor 5%, transparent); }
+.vitrine-folders > flowboxchild:active {
+  background-color: color-mix(in srgb, currentColor 9%, transparent); }
+.vitrine-folders > flowboxchild:selected {
+  background-color: color-mix(in srgb, var(--accent-bg-color) 18%, transparent); }
+.vitrine-folders > flowboxchild:selected:hover {
+  background-color: color-mix(in srgb, var(--accent-bg-color) 24%, transparent); }
 .vitrine-card { padding: 12px 14px; }
 .vitrine-computer flowboxchild:selected > .vitrine-card,
 .vitrine-card.vitrine-new { box-shadow: inset 0 0 0 2px var(--accent-bg-color); }
@@ -213,6 +222,9 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         elif rule:
             add("info", "(herdando a regra de uma pasta acima)", lambda c: None)
 
+        add("discovery", "Desligar a descoberta automática de pastas"
+            if self.cfg.get("folder_discovery") else "Ligar a descoberta automática de pastas",
+            self._toggle_discovery)
         add("default", "Usar a visualização atual como padrão", self._make_default)
         add("preview", "Mostrar/ocultar pré-visualização (Ctrl+Shift+P)",
             lambda c: c.set_preview_visible(not c.preview.get_visible()))
@@ -233,10 +245,20 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
 
     def _forget(self, ctl: WindowController, uri: str) -> None:
         self.cfg.forget(uri)
+        discovery.forget_manual(uri)
         slot = ctl.active_slot()
         if slot is not None:
             slot._vitrine_mode = None
             ctl._apply_rule_for_slot(slot, native.slot_uri(slot))
+
+    def _toggle_discovery(self, ctl: WindowController) -> None:
+        on = not self.cfg.get("folder_discovery")
+        self.cfg.set("folder_discovery", on)
+        ctl.toast("Descoberta automática de pastas ligada" if on
+                  else "Descoberta automática de pastas desligada")
+        slot = ctl.active_slot()
+        if on and slot is not None:
+            ctl._apply_rule_for_slot(slot, native.slot_uri(slot))  # já vale para a pasta atual
 
     def _make_default(self, ctl: WindowController) -> None:
         slot = ctl.active_slot()

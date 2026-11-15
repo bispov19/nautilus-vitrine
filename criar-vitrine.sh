@@ -524,8 +524,7 @@ ANNOUNCE_DEDUP_S = 15
 
 # Seções da página (chave em settings.json → "computer_sections").
 SECTIONS = (
-    ("places", "Locais", "Pasta pessoal, Recentes, Favoritos, Rede, Lixeira"),
-    ("bookmarks", "Marcadores", "As pastas fixadas na barra lateral"),
+    ("places", "Pastas", "Pasta pessoal, Documentos, Downloads, as pastas fixadas, Lixeira…"),
     ("devices", "Dispositivos e unidades", "Discos, pen drives, HDs externos, cartões"),
     ("network", "Rede", "Compartilhamentos montados"),
     ("disks_button", "Atalho para o app Discos", "Formatar e particionar"),
@@ -540,6 +539,42 @@ _FALLBACK_PLACES = (
     ("trash:///", "Lixeira", "user-trash-symbolic", 1),
 )
 _COLOR_ICON_FIX = {"user-trash-full": "user-trash-full", "user-trash": "user-trash"}
+
+# Pastas principais do usuário, nesta ordem, logo depois da pasta pessoal.
+_MAIN_USER_DIRS = (
+    GLib.UserDirectory.DIRECTORY_DOCUMENTS,
+    GLib.UserDirectory.DIRECTORY_DOWNLOAD,
+    GLib.UserDirectory.DIRECTORY_PICTURES,
+    GLib.UserDirectory.DIRECTORY_MUSIC,
+    GLib.UserDirectory.DIRECTORY_VIDEOS,
+)
+
+
+def _uri_key(uri: str) -> str:
+    return uri.rstrip("/") if uri.startswith("file://") else uri
+
+
+def order_places(entries: list[dict]) -> list[dict]:
+    """Um grupo único e previsível: pasta pessoal; Documentos, Downloads, Imagens,
+    Músicas, Vídeos; as demais pastas em ordem alfabética; por fim os locais
+    especiais (Recentes, Favoritos, Rede, Lixeira…) na ordem da barra lateral."""
+    home = _uri_key(Gio.File.new_for_path(os.path.expanduser("~")).get_uri())
+    rank = {home: 0}
+    for i, kind in enumerate(_MAIN_USER_DIRS, 1):
+        path = GLib.get_user_special_dir(kind)
+        if path:
+            rank.setdefault(_uri_key(Gio.File.new_for_path(path).get_uri()), i)
+
+    def key(item):
+        pos, e = item
+        uri = _uri_key(e["uri"])
+        if uri in rank:
+            return (0, rank[uri], "", pos)
+        if (GLib.Uri.peek_scheme(e["uri"]) or "") == "file":
+            return (1, 0, GLib.utf8_collate_key_for_filename(e["label"], -1), pos)
+        return (2, 0, "", pos)
+
+    return [e for _pos, e in sorted(enumerate(entries), key=key)]
 
 
 def _color_icon(gicon, uri: str) -> Gio.Icon:
@@ -770,13 +805,16 @@ class ComputerPage(Gtk.ScrolledWindow):
         head.append(customize)
         body.append(head)
 
+        # Todas as pastas da barra lateral (locais e marcadores) numa grade só.
         self.places_box = self._flowbox(max_per_line=8)
-        self.bookmarks_box = self._flowbox(max_per_line=8)
+        self.places_box.set_homogeneous(True)
+        self.places_box.set_column_spacing(6)
+        self.places_box.set_row_spacing(6)
+        self.places_box.add_css_class("vitrine-folders")
         self.devices_box = self._flowbox(max_per_line=4)
         self.network_box = self._flowbox(max_per_line=4)
         self.sections: dict[str, Gtk.Widget] = {
-            "places": self._section("Locais", self.places_box),
-            "bookmarks": self._section("Marcadores", self.bookmarks_box),
+            "places": self._section("Pastas", self.places_box),
             "devices": self._section("Dispositivos e unidades", self.devices_box),
             "network": self._section("Rede", self.network_box),
         }
@@ -829,7 +867,7 @@ class ComputerPage(Gtk.ScrolledWindow):
         self._start_usage_poll()
 
     def _boxes(self):
-        return (self.places_box, self.bookmarks_box, self.devices_box, self.network_box)
+        return (self.places_box, self.devices_box, self.network_box)
 
     # ── preferências ──
     def _cfg(self):
@@ -842,7 +880,8 @@ class ComputerPage(Gtk.ScrolledWindow):
         return set(self._cfg().get("computer_hidden") or [])
 
     def places(self) -> list[dict]:
-        """Locais da barra lateral (sem os dispositivos, que têm cards próprios)."""
+        """Locais e marcadores da barra lateral (sem os dispositivos, que têm cards
+        próprios), num grupo único na ordem de `order_places`."""
         entries = [e for e in native.sidebar_places(self.ctl.win) if not e["device"]]
         if not entries:
             entries = fallback_places()
@@ -852,7 +891,7 @@ class ComputerPage(Gtk.ScrolledWindow):
                 continue
             seen.add(e["uri"])
             out.append(e)
-        return out
+        return order_places(out)
 
     def _on_hub_changed(self) -> None:
         self._dirty = True
@@ -872,10 +911,8 @@ class ComputerPage(Gtk.ScrolledWindow):
         for entry in self.places():
             if entry["uri"] in hidden:
                 continue
-            key = "places" if entry["section"] == 1 else "bookmarks"
-            box = self.places_box if key == "places" else self.bookmarks_box
-            box.append(self._place_tile(entry))
-            counts[key] += 1
+            self.places_box.append(self._place_tile(entry))
+            counts["places"] += 1
 
         for dev in self.hub.devices():
             if dev.key in hidden:
@@ -896,12 +933,14 @@ class ComputerPage(Gtk.ScrolledWindow):
         self._refresh_usage()
 
     def _place_tile(self, entry: dict) -> Gtk.FlowBoxChild:
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, valign=Gtk.Align.START)
         box.add_css_class("vitrine-tile")
         img = Gtk.Image.new_from_gicon(_color_icon(entry.get("gicon"), entry["uri"]))
         img.set_pixel_size(48)
+        # Até duas linhas, centralizadas: nomes longos continuam legíveis.
         lbl = Gtk.Label(label=entry["label"], ellipsize=Pango.EllipsizeMode.END,
-                        max_width_chars=12)
+                        wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, lines=2,
+                        justify=Gtk.Justification.CENTER, width_chars=10, max_width_chars=12)
         box.append(img)
         box.append(lbl)
         child = Gtk.FlowBoxChild()
@@ -1161,7 +1200,14 @@ class ComputerPage(Gtk.ScrolledWindow):
                bool(cfg.get("notify_new_devices")), lambda v: cfg.set("notify_new_devices", v))
         page.add(general)
 
-        sections = Adw.PreferencesGroup(title="Seções",
+        views = Adw.PreferencesGroup(title="Visualização das pastas")
+        switch(views, "Descoberta automática de pastas",
+               "Fotos e vídeos em ícones extra grandes, documentos em lista. "
+               "Escolhas feitas à mão numa pasta têm prioridade",
+               bool(cfg.get("folder_discovery")), lambda v: cfg.set("folder_discovery", v))
+        page.add(views)
+
+        sections =Adw.PreferencesGroup(title="Seções",
                                         description="Quais blocos aparecem na página")
         for key, title, subtitle in SECTIONS:
             switch(sections, title, subtitle, self.section_enabled(key),
@@ -1172,8 +1218,7 @@ class ComputerPage(Gtk.ScrolledWindow):
         items = Adw.PreferencesGroup(title="Itens",
                                      description="Desligue o que não quer ver no Meu computador")
         for entry in self.places():
-            sub = "Marcador" if entry["section"] != 1 else "Local"
-            switch(items, entry["label"], sub, entry["uri"] not in hidden,
+            switch(items, entry["label"], "Pasta", entry["uri"] not in hidden,
                    lambda v, u=entry["uri"]: self.set_item_hidden(u, not v))
         for dev in self.hub.devices():
             switch(items, dev.name, "Dispositivo" if dev.kind != "network" else "Rede",
@@ -1289,12 +1334,15 @@ DEFAULT_SETTINGS = {
     "auto_media_grid": True,
     "auto_media_zoom": "extra-large",
     "auto_media_ratio": 0.6,
+    # Descoberta automática de pastas: mídia → ícones extra grandes, documentos → lista,
+    # mistas/vazias → padrão. Desligada = comportamento de sempre (auto_media_grid acima).
+    "folder_discovery": False,
     # Abrir o Nautilus já na página "Meu computador" (quando abre na pasta pessoal,
     # que é o que acontece pelo menu de aplicativos ou numa janela nova).
     "start_on_computer": False,
     # Entrada "Meu computador" no topo da barra lateral.
     "computer_in_sidebar": True,
-    # Seções desligadas: {"places": false, "bookmarks": ..., "devices": ..., "network": ...}
+    # Seções desligadas: {"places": false, "devices": ..., "network": ...}
     "computer_sections": {},
     # Itens ocultos (URIs de locais/marcadores ou chaves de dispositivos).
     "computer_hidden": [],
@@ -1429,7 +1477,117 @@ class Config:
         return GLib.SOURCE_REMOVE
 __VITRINE_ARQUIVO_4__
 mkdir -p "vitrine"
-cat > 'vitrine/imageload.py' <<'__VITRINE_ARQUIVO_5__'
+cat > 'vitrine/discovery.py' <<'__VITRINE_ARQUIVO_5__'
+"""Descoberta automática de pastas: olha uma amostra dos arquivos (tipo MIME pela
+extensão, sem ler o conteúdo) e diz se a pasta é de mídia, de documentos ou mista.
+
+    "media"      maioria de fotos/vídeos      → ícones extra grandes
+    "documents"  maioria de outros arquivos   → lista
+    None         mista, vazia ou poucos itens → visualização padrão
+
+O resultado fica em cache e vale enquanto a pasta não mudar (data de modificação).
+Escolhas manuais feitas nesta sessão têm prioridade sobre a descoberta."""
+
+from __future__ import annotations
+
+from gi.repository import Gio, GLib
+
+SAMPLE = 200          # itens lidos no máximo, mesmo em pastas enormes
+MIN_FILES = 4         # menos arquivos que isso do tipo predominante → sem palpite
+CACHE_MAX = 500
+_ATTRS = "standard::name,standard::type,standard::fast-content-type,standard::is-hidden"
+
+_CACHE: dict[str, tuple[int, str | None]] = {}   # uri → (mtime, tipo)
+_MANUAL: dict[str, tuple[str, str | None]] = {}  # uri → (modo, zoom) escolhidos à mão
+
+
+def is_media_type(content_type: str) -> bool:
+    return content_type.startswith(("image/", "video/"))
+
+
+def classify(content_types: list[str], ratio: float) -> str | None:
+    """Tipo predominante entre os arquivos amostrados (só arquivos, sem pastas)."""
+    total = len(content_types)
+    if total == 0:
+        return None
+    media = sum(1 for t in content_types if is_media_type(t))
+    other = total - media
+    if media >= MIN_FILES and media / total >= ratio:
+        return "media"
+    if other >= MIN_FILES and other / total >= ratio:
+        return "documents"
+    return None
+
+
+def _fast_type(info: Gio.FileInfo) -> str:
+    ctype = info.get_attribute_string("standard::fast-content-type")
+    if not ctype or ctype == "application/x-zerosize":  # arquivo vazio: vale a extensão
+        ctype, _uncertain = Gio.content_type_guess(info.get_name(), None)
+    return ctype or ""
+
+
+def _store(uri: str, mtime: int, kind: str | None) -> None:
+    if len(_CACHE) >= CACHE_MAX:
+        _CACHE.pop(next(iter(_CACHE)))
+    _CACHE[uri] = (mtime, kind)
+
+
+def discover(uri: str, ratio: float, callback) -> None:
+    """Assíncrono: chama `callback(tipo)` com "media", "documents" ou None."""
+    gfile = Gio.File.new_for_uri(uri)
+    mtime = [None]
+
+    def on_info(f, res):
+        try:
+            mtime[0] = f.query_info_finish(res).get_attribute_uint64("time::modified")
+        except GLib.Error:
+            mtime[0] = None
+        hit = _CACHE.get(uri)
+        if hit is not None and mtime[0] is not None and hit[0] == mtime[0]:
+            callback(hit[1])
+            return
+        f.enumerate_children_async(_ATTRS, Gio.FileQueryInfoFlags.NONE,
+                                   GLib.PRIORITY_DEFAULT, None, on_enum)
+
+    def on_enum(f, res):
+        try:
+            en = f.enumerate_children_finish(res)
+        except GLib.Error:
+            callback(None)
+            return
+        en.next_files_async(SAMPLE, GLib.PRIORITY_DEFAULT, None, on_files)
+
+    def on_files(en, res):
+        try:
+            infos = en.next_files_finish(res)
+        except GLib.Error:
+            infos = []
+        en.close_async(GLib.PRIORITY_LOW, None, None)
+        types = [_fast_type(i) for i in infos
+                 if i.get_file_type() == Gio.FileType.REGULAR and not i.get_is_hidden()]
+        kind = classify(types, ratio)
+        if mtime[0] is not None:
+            _store(uri, mtime[0], kind)
+        callback(kind)
+
+    gfile.query_info_async("time::modified", Gio.FileQueryInfoFlags.NONE,
+                           GLib.PRIORITY_DEFAULT, None, on_info)
+
+
+# ── escolhas manuais (valem nesta sessão, mesmo sem "lembrar por pasta") ──
+def remember_manual(uri: str, mode: str, zoom: str | None) -> None:
+    _MANUAL[uri] = (mode, zoom)
+
+
+def manual_choice(uri: str) -> tuple[str, str | None] | None:
+    return _MANUAL.get(uri)
+
+
+def forget_manual(uri: str) -> None:
+    _MANUAL.pop(uri, None)
+__VITRINE_ARQUIVO_5__
+mkdir -p "vitrine"
+cat > 'vitrine/imageload.py' <<'__VITRINE_ARQUIVO_6__'
 """Carregamento rápido de imagens para o preview.
 
 No Fedora 45 o gdk-pixbuf usa o glycin, que abre um processo isolado (sandbox)
@@ -1612,9 +1770,9 @@ THUMB_ATTRS = ",".join(
     for s in ("", "-normal", "-large", "-xlarge", "-xxlarge")
     for k in ("path", "is-valid")
 )
-__VITRINE_ARQUIVO_5__
+__VITRINE_ARQUIVO_6__
 mkdir -p "vitrine"
-cat > 'vitrine/main.py' <<'__VITRINE_ARQUIVO_6__'
+cat > 'vitrine/main.py' <<'__VITRINE_ARQUIVO_7__'
 """Ponto central: descobre as janelas do Nautilus e oferece o menu "Visualização desta pasta"."""
 
 from __future__ import annotations
@@ -1630,7 +1788,7 @@ gi.require_version("Adw", "1")
 gi.require_version("Nautilus", "4.1")
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Nautilus  # noqa: E402
 
-from . import native  # noqa: E402
+from . import discovery, native  # noqa: E402
 from .computer import DeviceHub  # noqa: E402
 from .config import GRID_ZOOMS, Config  # noqa: E402
 from .util import guarded, log  # noqa: E402
@@ -1648,6 +1806,15 @@ CSS = b"""
 .vitrine-computer { background-color: var(--view-bg-color); }
 .vitrine-computer flowboxchild { padding: 0; border-radius: 12px; }
 .vitrine-tile { padding: 12px 8px; min-width: 96px; border-radius: 12px; }
+.vitrine-folders > flowboxchild { transition: background-color 150ms ease-out; }
+.vitrine-folders > flowboxchild:hover {
+  background-color: color-mix(in srgb, currentColor 5%, transparent); }
+.vitrine-folders > flowboxchild:active {
+  background-color: color-mix(in srgb, currentColor 9%, transparent); }
+.vitrine-folders > flowboxchild:selected {
+  background-color: color-mix(in srgb, var(--accent-bg-color) 18%, transparent); }
+.vitrine-folders > flowboxchild:selected:hover {
+  background-color: color-mix(in srgb, var(--accent-bg-color) 24%, transparent); }
 .vitrine-card { padding: 12px 14px; }
 .vitrine-computer flowboxchild:selected > .vitrine-card,
 .vitrine-card.vitrine-new { box-shadow: inset 0 0 0 2px var(--accent-bg-color); }
@@ -1830,6 +1997,9 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         elif rule:
             add("info", "(herdando a regra de uma pasta acima)", lambda c: None)
 
+        add("discovery", "Desligar a descoberta automática de pastas"
+            if self.cfg.get("folder_discovery") else "Ligar a descoberta automática de pastas",
+            self._toggle_discovery)
         add("default", "Usar a visualização atual como padrão", self._make_default)
         add("preview", "Mostrar/ocultar pré-visualização (Ctrl+Shift+P)",
             lambda c: c.set_preview_visible(not c.preview.get_visible()))
@@ -1850,10 +2020,20 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
 
     def _forget(self, ctl: WindowController, uri: str) -> None:
         self.cfg.forget(uri)
+        discovery.forget_manual(uri)
         slot = ctl.active_slot()
         if slot is not None:
             slot._vitrine_mode = None
             ctl._apply_rule_for_slot(slot, native.slot_uri(slot))
+
+    def _toggle_discovery(self, ctl: WindowController) -> None:
+        on = not self.cfg.get("folder_discovery")
+        self.cfg.set("folder_discovery", on)
+        ctl.toast("Descoberta automática de pastas ligada" if on
+                  else "Descoberta automática de pastas desligada")
+        slot = ctl.active_slot()
+        if on and slot is not None:
+            ctl._apply_rule_for_slot(slot, native.slot_uri(slot))  # já vale para a pasta atual
 
     def _make_default(self, ctl: WindowController) -> None:
         slot = ctl.active_slot()
@@ -1862,9 +2042,9 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         if mode == "grid":
             self.cfg.set("default_grid_zoom", self.current_grid_zoom())
         log(f"novo padrão: {mode}")
-__VITRINE_ARQUIVO_6__
+__VITRINE_ARQUIVO_7__
 mkdir -p "vitrine"
-cat > 'vitrine/native.py' <<'__VITRINE_ARQUIVO_7__'
+cat > 'vitrine/native.py' <<'__VITRINE_ARQUIVO_8__'
 """Ponte com as partes internas do Nautilus (aba/slot, modo de visualização, seleção).
 
 Regra de ouro: nunca guardar referência forte a widgets ou modelos do Nautilus.
@@ -2119,9 +2299,9 @@ class ModelWatch:
             self._callback(model)
         except Exception as err:  # noqa: BLE001
             log(f"ModelWatch callback: {err}")
-__VITRINE_ARQUIVO_7__
+__VITRINE_ARQUIVO_8__
 mkdir -p "vitrine"
-cat > 'vitrine/preview.py' <<'__VITRINE_ARQUIVO_8__'
+cat > 'vitrine/preview.py' <<'__VITRINE_ARQUIVO_9__'
 """Painel de pré-visualização à direita: imagem, texto, miniatura de vídeo/PDF e informações."""
 
 from __future__ import annotations
@@ -2646,9 +2826,9 @@ class PreviewPane(Gtk.Box):
             self._on_navigate(self._current_uri)
         else:
             util.open_uri(self._current_uri)
-__VITRINE_ARQUIVO_8__
+__VITRINE_ARQUIVO_9__
 mkdir -p "vitrine"
-cat > 'vitrine/selftest.py' <<'__VITRINE_ARQUIVO_9__'
+cat > 'vitrine/selftest.py' <<'__VITRINE_ARQUIVO_10__'
 """Autoteste dentro do Nautilus real. Só roda com VITRINE_SELFTEST=1.
 
 Navega por pastas, troca modos, seleciona arquivos e grava PASSOU/FALHOU no log.
@@ -2659,11 +2839,13 @@ from __future__ import annotations
 
 import copy
 import os
+import shutil
+import tempfile
 import time
 
 from gi.repository import Gio, GLib
 
-from . import imageload, native
+from . import discovery, imageload, native
 from .util import log
 
 STEP_MS = 1500
@@ -2876,7 +3058,7 @@ def run(ctl) -> bool:
 
     def tile_uris(page):
         uris = []
-        for box in (page.places_box, page.bookmarks_box):
+        for box in (page.places_box,):
             child = box.get_first_child()
             while child is not None:
                 uris.append(getattr(child, "_vitrine_uri", None))
@@ -2946,20 +3128,28 @@ def run(ctl) -> bool:
         ctl.show_computer(True)
         page = ctl.computer
         page.set_item_hidden("starred:///", True)
-        page.set_section_enabled("bookmarks", False)
+        page.set_section_enabled("devices", False)
 
     @step
     def c8():
         page = ctl.computer
         uris = tile_uris(page)
         check("personalizar: ocultar item e seção",
-              "starred:///" not in uris and not page.sections["bookmarks"].get_visible()
+              "starred:///" not in uris and not page.sections["devices"].get_visible()
               and page.sections["places"].get_visible(),
               f"itens={uris}")
         page.set_item_hidden("starred:///", False)
-        page.set_section_enabled("bookmarks", True)
+        page.set_section_enabled("devices", True)
+        uris = tile_uris(page)
         check("personalizar: mostrar de novo",
-              "starred:///" in tile_uris(page) and page.sections["bookmarks"].get_visible())
+              "starred:///" in uris and page.sections["devices"].get_visible())
+        home_uri = Gio.File.new_for_uri(home).get_uri().rstrip("/")
+        special = [i for i, u in enumerate(uris) if (GLib.Uri.peek_scheme(u) or "") != "file"]
+        folders = [i for i, u in enumerate(uris) if (GLib.Uri.peek_scheme(u) or "") == "file"]
+        check("pastas num grupo único: pasta pessoal primeiro, locais especiais no fim",
+              uris and uris[0].rstrip("/") == home_uri
+              and (not special or not folders or max(folders) < min(special)),
+              f"ordem={uris}")
         try:
             page.open_settings()
             dlg = page._settings_dialog
@@ -2990,6 +3180,64 @@ def run(ctl) -> bool:
               str(st))
         ctl.navigate(home)
 
+    # ── descoberta automática de pastas ──
+    disc: dict[str, str] = {}
+
+    @step
+    def d1():
+        ratio = 0.6
+        check("descoberta: classifica mídia, documentos, mista e vazia",
+              discovery.classify(["image/jpeg"] * 5 + ["text/plain"], ratio) == "media"
+              and discovery.classify(["application/pdf"] * 5, ratio) == "documents"
+              and discovery.classify(["image/png"] * 3 + ["text/plain"] * 3, ratio) is None
+              and discovery.classify([], ratio) is None)
+        root = tempfile.mkdtemp(prefix="vitrine-selftest-")
+        disc["root"] = root
+        for name, files in (("fotos", [f"f{i}.jpg" for i in range(6)]),
+                            ("docs", [f"d{i}.pdf" for i in range(3)] + [f"n{i}.txt" for i in range(3)])):
+            path = os.path.join(root, name)
+            os.makedirs(path)
+            for f in files:
+                open(os.path.join(path, f), "wb").close()
+            disc[name] = Gio.File.new_for_path(path).get_uri()
+        cfg.settings["folder_discovery"] = True
+        cfg.settings["default_mode"] = "grid"  # prova que documentos vão para a lista
+        cfg.settings["remember_per_folder"] = False
+        ctl.navigate(disc["fotos"])
+
+    @step
+    def d2():
+        st = state()
+        check("descoberta: pasta de fotos abre em ícones extra grandes",
+              st["view"] == "grid" and st["zoom"] == "extra-large", str(st))
+        ctl.navigate(disc["docs"])
+
+    @step
+    def d3():
+        st = state()
+        check("descoberta: pasta de documentos abre em lista", st["view"] == "list", str(st))
+        ctl.user_set_mode("grid", "medium")
+
+    @step
+    def d4():
+        ctl.navigate(disc["fotos"])
+
+    @step
+    def d5():
+        ctl.navigate(disc["docs"])
+
+    @step
+    def d6():
+        st = state()
+        check("descoberta: escolha manual tem prioridade na pasta",
+              st["view"] == "grid" and cfg.rule_for(disc["docs"])[0] is None, str(st))
+        discovery.forget_manual(disc["docs"])
+        shutil.rmtree(disc["root"], ignore_errors=True)
+        cfg.settings["folder_discovery"] = False
+        cfg.settings["default_mode"] = "list"
+        cfg.settings["remember_per_folder"] = saved_settings.get("remember_per_folder", True)
+        ctl.navigate(home)
+
     @step
     def s11():
         st = state()
@@ -3016,9 +3264,9 @@ def run(ctl) -> bool:
 
     GLib.timeout_add(STEP_MS, runner)
     return GLib.SOURCE_REMOVE
-__VITRINE_ARQUIVO_9__
+__VITRINE_ARQUIVO_10__
 mkdir -p "vitrine"
-cat > 'vitrine/util.py' <<'__VITRINE_ARQUIVO_10__'
+cat > 'vitrine/util.py' <<'__VITRINE_ARQUIVO_11__'
 """Utilitários: log, varredura da árvore de widgets e operações de arquivo nativas."""
 
 from __future__ import annotations
@@ -3254,9 +3502,9 @@ def format_time(dt: GLib.DateTime | None) -> str:
     if dt is None:
         return "—"
     return dt.to_local().format("%d/%m/%Y %H:%M")
-__VITRINE_ARQUIVO_10__
+__VITRINE_ARQUIVO_11__
 mkdir -p "vitrine"
-cat > 'vitrine/window.py' <<'__VITRINE_ARQUIVO_11__'
+cat > 'vitrine/window.py' <<'__VITRINE_ARQUIVO_12__'
 """Controlador por janela: injeta Colunas + Pré-visualização e aplica as regras por pasta."""
 
 from __future__ import annotations
@@ -3265,7 +3513,7 @@ import os
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
-from . import native
+from . import discovery, native
 from .columns import ColumnStrip
 from .computer import ComputerPage
 from .preview import PreviewPane
@@ -3706,10 +3954,17 @@ class WindowController:
             return GLib.SOURCE_REMOVE
         rule, _exact = self.cfg.rule_for(uri)
         current = getattr(slot, "_vitrine_mode", None)
+        discover = bool(self.cfg.get("folder_discovery"))
+        manual = discovery.manual_choice(uri) if discover else None
         if rule:
             self.apply_mode(slot, rule.get("mode", "list"), rule.get("zoom"))
+        elif manual:
+            self.apply_mode(slot, *manual)  # escolha manual vence a descoberta
         elif current == "columns":
             self.apply_mode(slot, "columns")  # navegar em colunas continua em colunas
+        elif discover:
+            discovery.discover(uri, float(self.cfg.get("auto_media_ratio")),
+                               lambda kind: self._apply_discovered(slot, uri, kind))
         elif self.cfg.get("auto_media_grid"):
             self._detect_media(slot, uri)
         else:
@@ -3748,6 +4003,8 @@ class WindowController:
             rule, exact = self.cfg.rule_for(uri) if uri else (None, False)
             zoom = ((rule or {}).get("zoom") if exact else None) or self.ext.current_grid_zoom()
         self.apply_mode(slot, mode, zoom)
+        if uri and native.is_regular_location(uri):
+            discovery.remember_manual(uri, mode, zoom if mode == "grid" else None)
         if self.cfg.get("remember_per_folder") and native.is_regular_location(uri):
             self.cfg.set_rule(uri, mode=mode, zoom=zoom if mode == "grid" else None)
 
@@ -3799,6 +4056,20 @@ class WindowController:
         if is_media:
             debug(f"pasta de mídia detectada: {uri}")
             self.apply_mode(slot, "grid", self.cfg.get("auto_media_zoom"))
+        else:
+            self.apply_mode(slot, self.cfg.get("default_mode"))
+
+    @guarded
+    def _apply_discovered(self, slot, uri: str, kind: str | None) -> None:
+        """Descoberta automática: mídia → ícones extra grandes; documentos → lista;
+        mista/vazia → padrão."""
+        if native.slot_uri(slot) != uri or discovery.manual_choice(uri):
+            return  # já saiu da pasta, ou o usuário escolheu à mão enquanto analisávamos
+        debug(f"descoberta: {uri} -> {kind}")
+        if kind == "media":
+            self.apply_mode(slot, "grid", self.cfg.get("auto_media_zoom"))
+        elif kind == "documents":
+            self.apply_mode(slot, "list")
         else:
             self.apply_mode(slot, self.cfg.get("default_mode"))
 
@@ -3878,9 +4149,9 @@ class WindowController:
         if self.strip is not None:
             self.strip.teardown()
         self.ext.forget_window(self.win)
-__VITRINE_ARQUIVO_11__
+__VITRINE_ARQUIVO_12__
 mkdir -p "tools"
-cat > 'tools/smoke_test.py' <<'__VITRINE_ARQUIVO_12__'
+cat > 'tools/smoke_test.py' <<'__VITRINE_ARQUIVO_13__'
 """Teste rápido FORA do Nautilus: abre as colunas e o painel de preview numa janela
 própria e salva uma captura em PNG. Uso:
 
@@ -3962,9 +4233,9 @@ app = Adw.Application(application_id="io.github.vitrine.SmokeTest",
                       flags=Gio.ApplicationFlags.NON_UNIQUE)
 app.connect("activate", on_activate)
 app.run([])
-__VITRINE_ARQUIVO_12__
+__VITRINE_ARQUIVO_13__
 mkdir -p "tools"
-cat > 'tools/build_bootstrap.py' <<'__VITRINE_ARQUIVO_13__'
+cat > 'tools/build_bootstrap.py' <<'__VITRINE_ARQUIVO_14__'
 """Gera `criar-vitrine.sh`: um único script bash que recria o projeto inteiro
 (todos os arquivos) numa pasta e, se você quiser, já instala no Nautilus.
 
@@ -4079,8 +4350,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-__VITRINE_ARQUIVO_13__
-cat > 'install.sh' <<'__VITRINE_ARQUIVO_14__'
+__VITRINE_ARQUIVO_14__
+cat > 'install.sh' <<'__VITRINE_ARQUIVO_15__'
 #!/usr/bin/env bash
 # Instala a Vitrine para o seu usuário (não precisa de root, exceto para o nautilus-python).
 #
@@ -4138,8 +4409,8 @@ if [[ "$RESTART" == 1 ]]; then
   (setsid nautilus >/dev/null 2>&1 &)
 fi
 echo "Pronto. Log: ${XDG_CACHE_HOME:-$HOME/.cache}/nautilus-vitrine/vitrine.log"
-__VITRINE_ARQUIVO_14__
-cat > 'uninstall.sh' <<'__VITRINE_ARQUIVO_15__'
+__VITRINE_ARQUIVO_15__
+cat > 'uninstall.sh' <<'__VITRINE_ARQUIVO_16__'
 #!/usr/bin/env bash
 # Remove a Vitrine. Suas regras por pasta ficam em ~/.config/nautilus-vitrine
 # (use --purge para apagá-las também).
@@ -4151,15 +4422,15 @@ if [[ "${1:-}" == "--purge" ]]; then
 fi
 nautilus -q 2>/dev/null || true
 echo "Vitrine removida. Abra o Arquivos de novo para voltar ao Nautilus original."
-__VITRINE_ARQUIVO_15__
+__VITRINE_ARQUIVO_16__
 mkdir -p ".vscode"
-cat > '.vscode/extensions.json' <<'__VITRINE_ARQUIVO_16__'
+cat > '.vscode/extensions.json' <<'__VITRINE_ARQUIVO_17__'
 {
   "recommendations": ["ms-python.python", "ms-python.vscode-pylance"]
 }
-__VITRINE_ARQUIVO_16__
+__VITRINE_ARQUIVO_17__
 mkdir -p ".vscode"
-cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_17__'
+cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_18__'
 {
   "python.defaultInterpreterPath": "/usr/bin/python3",
   "python.analysis.extraPaths": ["${workspaceFolder}"],
@@ -4167,9 +4438,9 @@ cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_17__'
   "editor.rulers": [100],
   "[python]": { "editor.tabSize": 4 }
 }
-__VITRINE_ARQUIVO_17__
+__VITRINE_ARQUIVO_18__
 mkdir -p ".vscode"
-cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_18__'
+cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_19__'
 {
   // Ctrl+Shift+P → "Tasks: Run Task" para ver estas tarefas.
   // Ctrl+Shift+B roda a tarefa padrão (instalar em modo dev + reiniciar o Nautilus).
@@ -4240,8 +4511,8 @@ cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_18__'
     }
   ]
 }
-__VITRINE_ARQUIVO_18__
-cat > 'README.md' <<'__VITRINE_ARQUIVO_19__'
+__VITRINE_ARQUIVO_19__
+cat > 'README.md' <<'__VITRINE_ARQUIVO_20__'
 # Vitrine para Nautilus
 
 **Modo Colunas, painel de pré-visualização, visualização por pasta e "Meu computador" para o Arquivos (Nautilus) do GNOME, inspirados no Finder do macOS, sem perder nenhuma função nativa.**
@@ -4312,6 +4583,7 @@ O botão **Abrir** usa o aplicativo padrão. O botão 👁 (ou a tecla **Espaço
 - Trocou de visualização numa pasta, com **Ctrl+1** (lista), **Ctrl+2** (ícones), **Ctrl+3** (colunas), os botões ou o menu? A Vitrine **lembra a escolha para aquela pasta**. Pastas sem regra usam o seu padrão.
 - O **zoom dos ícones também é salvo por pasta**: ícones gigantes em *Imagens*, ícones normais em *Downloads*.
 - **Pastas de fotos e vídeos são detectadas automaticamente.** Se a maioria dos arquivos for imagem ou vídeo, a pasta abre em ícones grandes.
+- **Descoberta automática de pastas** (opcional, desligada por padrão): olha o tipo dos arquivos de cada pasta e escolhe a visualização. Maioria de fotos/vídeos → ícones extra grandes; maioria de documentos e outros arquivos → lista; pasta mista ou vazia → o seu padrão. Só lê o nome/extensão de até 200 itens (rápido mesmo em pastas enormes) e guarda o resultado até a pasta mudar. Uma escolha feita à mão numa pasta sempre vence a descoberta. Ligue no menu **Visualização desta pasta** ou em **Personalizar** (✎ no Meu computador).
 - Na primeira execução, *Imagens* e *Vídeos* já vêm configuradas para ícones grandes, **incluindo as subpastas**.
 - Navegando em colunas, as subpastas continuam em colunas.
 
@@ -4320,6 +4592,7 @@ Clique com o botão direito no **fundo de qualquer pasta** e escolha **Visualiza
 - Lista · Ícones · Ícones grandes · Colunas
 - Aplicar também às subpastas / Não aplicar às subpastas
 - Esquecer esta pasta (usar o padrão)
+- Ligar/desligar a descoberta automática de pastas
 - Usar a visualização atual como padrão
 - Mostrar/ocultar pré-visualização
 
@@ -4327,7 +4600,7 @@ Clique com o botão direito no **fundo de qualquer pasta** e escolha **Visualiza
 
 Abra pela entrada **Meu computador** no topo da barra lateral, com **Ctrl+Shift+C** ou pelo clique direito no fundo de uma pasta.
 
-- **Locais e Marcadores**: tudo o que está na barra lateral do Nautilus, com os mesmos nomes e na mesma ordem: Pasta pessoal, Recentes, Favoritos, Rede, Lixeira e as suas pastas fixadas (Downloads, Documentos, Projetos…). Fixou ou removeu uma pasta da barra lateral? O Meu computador acompanha.
+- **Pastas**: tudo o que está na barra lateral do Nautilus, com os mesmos nomes, numa grade única: primeiro a Pasta pessoal, depois Documentos, Downloads, Imagens, Músicas e Vídeos, em seguida as demais pastas fixadas em ordem alfabética e, por fim, Recentes, Favoritos, Rede e Lixeira. Fixou ou removeu uma pasta da barra lateral? O Meu computador acompanha.
 - **Dispositivos e unidades**: disco do sistema, outros discos, pen drives, HDs externos, cartões de memória e celulares, cada um com **barra de uso** (azul, laranja acima de 80%, vermelha acima de 92%) e "X livres de Y · sistema de arquivos". O uso é atualizado a cada 10 segundos enquanto a página está aberta.
 - **Rede**: compartilhamentos montados (SMB, SFTP, WebDAV…), quando houver.
 - **Dispositivos não montados** aparecem também. Ao abrir, a Vitrine monta o dispositivo e pede a senha se ele for criptografado.
@@ -4344,7 +4617,7 @@ A página fecha sozinha quando você navega para qualquer lugar: barra lateral, 
 - **Abrir o Nautilus no Meu computador**: ao abrir o Arquivos pelo menu de aplicativos ou numa janela nova (Ctrl+N), ele começa aqui. Se outro programa pedir uma pasta específica, ela é respeitada.
 - Mostrar ou esconder a entrada **Meu computador na barra lateral**.
 - Ligar ou desligar o **aviso de dispositivo novo**.
-- Escolher quais **seções** aparecem: Locais, Marcadores, Dispositivos e unidades, Rede e o atalho para o Discos.
+- Escolher quais **seções** aparecem: Pastas, Dispositivos e unidades, Rede e o atalho para o Discos.
 - Escolher **item por item** o que aparece. Também dá para ocultar direto pelo clique direito → *Ocultar do Meu computador*.
 - **Mostrar tudo de novo**, com um clique.
 
@@ -4432,11 +4705,12 @@ Tudo funciona sem configurar nada. Para ajustes finos, edite os arquivos abaixo 
 | `auto_media_grid` | `true` | Abrir pastas de fotos/vídeos em ícones grandes |
 | `auto_media_zoom` | `"extra-large"` | Zoom usado nessas pastas |
 | `auto_media_ratio` | `0.6` | Proporção mínima de mídia para considerar "pasta de fotos" |
+| `folder_discovery` | `false` | Descoberta automática de pastas (mídia → ícones extra grandes, documentos → lista). Usa também `auto_media_zoom` e `auto_media_ratio` |
 | `default_mode` | do Nautilus | Visualização das pastas sem regra: `list`, `grid` ou `columns` |
 | `default_grid_zoom` | do Nautilus | Zoom padrão dos ícones |
 | `start_on_computer` | `false` | Abrir o Nautilus já no Meu computador (quando abre na pasta pessoal) |
 | `computer_in_sidebar` | `true` | Entrada "Meu computador" no topo da barra lateral |
-| `computer_sections` | `{}` | Seções desligadas, ex.: `{"network": false}` (`places`, `bookmarks`, `devices`, `network`, `disks_button`) |
+| `computer_sections` | `{}` | Seções desligadas, ex.: `{"network": false}` (`places`, `devices`, `network`, `disks_button`) |
 | `computer_hidden` | `[]` | Itens ocultos: URIs de locais (`"trash:///"`) ou chaves de dispositivos |
 | `notify_new_devices` | `true` | Avisar quando um pen drive, HD externo ou cartão for conectado |
 
@@ -4574,8 +4848,8 @@ A técnica de injeção na janela foi inspirada no projeto **[My Computer for Na
 ## Licença
 
 [MIT](LICENSE)
-__VITRINE_ARQUIVO_19__
-cat > 'LICENSE' <<'__VITRINE_ARQUIVO_20__'
+__VITRINE_ARQUIVO_20__
+cat > 'LICENSE' <<'__VITRINE_ARQUIVO_21__'
 MIT License
 
 Copyright (c) 2026 Vitrine para Nautilus contributors
@@ -4601,15 +4875,15 @@ SOFTWARE.
 ---
 Inspired by "My Computer for Nautilus" (https://github.com/yannmasoch/nautilus-my-computer),
 Copyright (c) 2026 Yann Masoch, MIT License.
-__VITRINE_ARQUIVO_20__
-cat > '.gitignore' <<'__VITRINE_ARQUIVO_21__'
+__VITRINE_ARQUIVO_21__
+cat > '.gitignore' <<'__VITRINE_ARQUIVO_22__'
 __pycache__/
 *.pyc
 *.tmp
 dist/
 dist-build.log
-__VITRINE_ARQUIVO_21__
-cat > 'Makefile' <<'__VITRINE_ARQUIVO_22__'
+__VITRINE_ARQUIVO_22__
+cat > 'Makefile' <<'__VITRINE_ARQUIVO_23__'
 # Empacotamento local.  Requer: sudo dnf install make rpm-build python3-devel
 #
 #   make rpm        gera o RPM em dist/
@@ -4643,9 +4917,9 @@ install-rpm:
 
 clean:
 	rm -rf $(DIST)
-__VITRINE_ARQUIVO_22__
+__VITRINE_ARQUIVO_23__
 mkdir -p "packaging"
-cat > 'packaging/nautilus-vitrine.spec' <<'__VITRINE_ARQUIVO_23__'
+cat > 'packaging/nautilus-vitrine.spec' <<'__VITRINE_ARQUIVO_24__'
 %global extdir %{_datadir}/nautilus-python/extensions
 
 Name:           nautilus-vitrine
@@ -4706,9 +4980,9 @@ install -p -m 0644 vitrine/*.py %{buildroot}%{extdir}/vitrine/
 
 * Wed Nov 11 2026 Vinicius Bispo - 0.1.0-1
 - Primeira versão: modo Colunas, painel de pré-visualização e visualização por pasta
-__VITRINE_ARQUIVO_23__
+__VITRINE_ARQUIVO_24__
 mkdir -p ".copr"
-cat > '.copr/Makefile' <<'__VITRINE_ARQUIVO_24__'
+cat > '.copr/Makefile' <<'__VITRINE_ARQUIVO_25__'
 # Usado pelo COPR (método "make srpm"): gera o SRPM direto do repositório git.
 # O COPR chama:  make -f .copr/Makefile srpm outdir=<pasta> spec=<arquivo .spec>
 SPEC := packaging/nautilus-vitrine.spec
@@ -4723,7 +4997,7 @@ srpm:
 	rpmbuild -bs $(SPEC) \
 		--define "_sourcedir $(outdir)" \
 		--define "_srcrpmdir $(outdir)"
-__VITRINE_ARQUIVO_24__
+__VITRINE_ARQUIVO_25__
 
 chmod +x install.sh uninstall.sh
 echo "Projeto criado em $TARGET"
