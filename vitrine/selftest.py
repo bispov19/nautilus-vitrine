@@ -12,9 +12,9 @@ import shutil
 import tempfile
 import time
 
-from gi.repository import Gio, GLib
+from gi.repository import Gio, GLib, Gtk
 
-from . import discovery, imageload, native
+from . import discovery, imageload, native, util
 from .util import log
 
 STEP_MS = 1500
@@ -328,6 +328,16 @@ def run(ctl) -> bool:
             ok = False
             log(f"open_settings: {err!r}")
         check("tela de personalização abre", ok)
+        try:
+            ctl.open_settings("about")
+            dlg = page._settings_dialog
+            visible = dlg.get_visible_page()
+            ok = visible is not None and visible.get_name() == "about"
+            dlg.close()
+        except Exception as err:  # noqa: BLE001
+            ok = False
+            log(f"open_settings(about): {err!r}")
+        check("menu ☰ → Sobre abre o diálogo já na página Sobre", ok)
         cfg.settings["start_on_computer"] = True
         project_dir = Gio.File.new_for_uri(project).get_uri()
         check("opção abrir no Meu computador (só ao abrir na pasta pessoal)",
@@ -405,6 +415,56 @@ def run(ctl) -> bool:
         cfg.settings["folder_discovery"] = False
         cfg.settings["default_mode"] = "list"
         cfg.settings["remember_per_folder"] = saved_settings.get("remember_per_folder", True)
+        ctl.navigate(home)
+
+    # ── Voltar/Avançar com o Meu computador ──
+    target = pictures_uri or project
+
+    def on_computer() -> bool:
+        return ctl.content_stack.get_visible_child_name() == "computer"
+
+    def same(uri_a, uri_b) -> bool:
+        return bool(uri_a and uri_b) and Gio.File.new_for_uri(uri_a).equal(
+            Gio.File.new_for_uri(uri_b))
+
+    @step
+    def h1():
+        app = ctl.win.get_application()
+        accels = app.get_accels_for_action("vitrine.back") if app is not None else []
+        swapped = [w for w in util.walk(ctl.win) if isinstance(w, Gtk.Button)
+                   and w.get_action_name() == "vitrine.back"]
+        check("Voltar: botões ← e Alt+← passam pela Vitrine",
+              swapped and "<alt>left" in [a.lower() for a in accels], f"botões={len(swapped)} atalhos={accels}")
+        ctl.show_computer(True)  # Pasta pessoal → Meu computador
+
+    @step
+    def h2():
+        ctl.leave_computer_and_open(target)  # → Imagens
+
+    @step
+    def h3():
+        ctl.win.activate_action("vitrine.back", None)
+
+    @step
+    def h4():
+        check("Voltar: Imagens → Meu computador", on_computer()
+              and same(state()["uri"], target), str(state()))
+        ctl.win.activate_action("vitrine.forward", None)
+
+    @step
+    def h5():
+        check("Avançar: Meu computador → Imagens", not on_computer()
+              and same(state()["uri"], target), str(state()))
+        ctl.win.activate_action("vitrine.back", None)
+
+    @step
+    def h6():
+        ctl.win.activate_action("vitrine.back", None)  # Meu computador → Pasta pessoal
+
+    @step
+    def h7():
+        check("Voltar: Meu computador → Pasta pessoal", not on_computer()
+              and same(state()["uri"], home), str(state()))
         ctl.navigate(home)
 
     @step

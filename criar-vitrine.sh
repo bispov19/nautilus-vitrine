@@ -46,9 +46,127 @@ __VITRINE_ARQUIVO_0__
 mkdir -p "vitrine"
 cat > 'vitrine/__init__.py' <<'__VITRINE_ARQUIVO_1__'
 """Vitrine para Nautilus."""
+
+# Fonte única da versão no código. O `Version:` de packaging/nautilus-vitrine.spec
+# precisa ser igual (tools/smoke_test.py confere).
+__version__ = "0.3.0"
 __VITRINE_ARQUIVO_1__
 mkdir -p "vitrine"
-cat > 'vitrine/columns.py' <<'__VITRINE_ARQUIVO_2__'
+cat > 'vitrine/about.py' <<'__VITRINE_ARQUIVO_2__'
+"""Página "Sobre" do diálogo de personalização.
+
+Fica num módulo próprio porque não depende de nada do Meu computador (só da versão,
+da logo e da URL do projeto): pode ser montada e testada numa janela fora do Nautilus
+(tools/smoke_test.py) e não aumenta o computer.py, que já é grande.
+"""
+
+from __future__ import annotations
+
+import os
+
+from gi.repository import Adw, Gdk, Gtk
+
+from . import __version__
+from .util import ASSETS, log
+
+REPO_URL = "https://github.com/bispov19/nautilus-vitrine"
+LICENSE = "MIT"
+FEATURES = ("Modo Colunas · Painel de pré-visualização · Visualização por pasta · "
+            "Descoberta automática de pastas · Meu computador · Aviso de dispositivo novo")
+
+_css_loaded = False
+
+
+def _ensure_css() -> None:
+    """Carrega assets/about.css uma única vez por processo."""
+    global _css_loaded
+    display = Gdk.Display.get_default()
+    if _css_loaded or display is None:
+        return
+    provider = Gtk.CssProvider()
+    provider.load_from_path(os.path.join(ASSETS, "about.css"))
+    Gtk.StyleContext.add_provider_for_display(
+        display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    _css_loaded = True
+
+
+def _row(title: str, subtitle: str, icon: str) -> Adw.ActionRow:
+    row = Adw.ActionRow(title=title, subtitle=subtitle, use_markup=False)
+    row.set_subtitle_lines(0)  # 0 = sem limite: o texto quebra linha em vez de cortar
+    row.add_prefix(Gtk.Image.new_from_icon_name(icon))
+    return row
+
+
+def _hero() -> Gtk.Widget:
+    card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, halign=Gtk.Align.FILL)
+    card.add_css_class("vitrine-about-hero")
+
+    logo = Gtk.Image.new_from_file(os.path.join(ASSETS, "nautilus-vitrine-mark.svg"))
+    logo.set_pixel_size(140)
+    logo.set_margin_bottom(6)
+    card.append(logo)
+
+    title = Gtk.Label(label="Vitrine para Nautilus", wrap=True,
+                      justify=Gtk.Justification.CENTER)
+    title.add_css_class("title-1")
+    card.append(title)
+
+    tagline = Gtk.Label(
+        label="Modo Colunas, pré-visualização e Meu computador para o Nautilus, "
+              "inspirados no Finder do macOS",
+        wrap=True, justify=Gtk.Justification.CENTER, max_width_chars=48)
+    tagline.add_css_class("dim-label")
+    card.append(tagline)
+
+    version = Gtk.Label(label=f"Versão {__version__}  •  {LICENSE}")
+    version.add_css_class("caption")
+    version.add_css_class("dim-label")
+    version.set_margin_top(6)
+    card.append(version)
+    return card
+
+
+def _open_repo(row: Gtk.Widget) -> None:
+    def done(launcher, result):
+        try:
+            launcher.launch_finish(result)
+        except Exception as err:  # noqa: BLE001  (GLib.Error, inclusive "cancelado")
+            log(f"não foi possível abrir {REPO_URL}: {err}")
+
+    root = row.get_root()
+    Gtk.UriLauncher(uri=REPO_URL).launch(root if isinstance(root, Gtk.Window) else None,
+                                         None, done)
+
+
+def build_about_page() -> Adw.PreferencesPage:
+    _ensure_css()
+    page = Adw.PreferencesPage(title="Sobre", icon_name="nautilus-vitrine-symbolic",
+                               name="about")
+
+    hero = Adw.PreferencesGroup()
+    hero.add(_hero())
+    page.add(hero)
+
+    links = Adw.PreferencesGroup(title="Links")
+    repo = _row("Repositório no GitHub", REPO_URL.removeprefix("https://"),
+                "web-browser-symbolic")
+    repo.set_activatable(True)
+    repo.add_suffix(Gtk.Image.new_from_icon_name("adw-external-link-symbolic"))
+    repo.set_tooltip_text(REPO_URL)
+    repo.connect("activated", _open_repo)
+    links.add(repo)
+    page.add(links)
+
+    credits = Adw.PreferencesGroup(title="Créditos")
+    credits.add(_row("Vini", "Web Developer · Autor e mantenedor", "avatar-default-symbolic"))
+    credits.add(_row("Recursos", FEATURES, "starred-symbolic"))
+    credits.add(_row("Aviso", "A Vitrine é um projeto independente e de código aberto. "
+                     "Não é afiliada ao GNOME nem à Apple.", "dialog-information-symbolic"))
+    page.add(credits)
+    return page
+__VITRINE_ARQUIVO_2__
+mkdir -p "vitrine"
+cat > 'vitrine/columns.py' <<'__VITRINE_ARQUIVO_3__'
 """Modo Colunas (estilo Finder) em formato híbrido.
 
 À esquerda ficam colunas leves com as pastas-pai do local atual. A pasta atual
@@ -501,9 +619,9 @@ class ColumnStrip(Gtk.Box):
         adj = self.scroller.get_hadjustment()
         adj.set_value(max(0.0, adj.get_upper() - adj.get_page_size()))
         return GLib.SOURCE_REMOVE
-__VITRINE_ARQUIVO_2__
+__VITRINE_ARQUIVO_3__
 mkdir -p "vitrine"
-cat > 'vitrine/computer.py' <<'__VITRINE_ARQUIVO_3__'
+cat > 'vitrine/computer.py' <<'__VITRINE_ARQUIVO_4__'
 """Página "Meu computador": pastas, discos e dispositivos (com uso de espaço) e
 aviso quando um pen drive, HD externo, cartão ou celular é conectado."""
 
@@ -516,6 +634,7 @@ import time
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
 
 from . import native, util
+from .about import build_about_page
 from .util import guarded, log
 
 FS_ATTRS = "filesystem::size,filesystem::free,filesystem::type,filesystem::readonly"
@@ -792,17 +911,10 @@ class ComputerPage(Gtk.ScrolledWindow):
         title.add_css_class("title-1")
         subtitle = Gtk.Label(label=f"{socket.gethostname()} · {_os_name()}", xalign=0)
         subtitle.add_css_class("dim-label")
-        head_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
-        head_text.append(title)
-        head_text.append(subtitle)
-        customize = Gtk.Button(icon_name="document-edit-symbolic", valign=Gtk.Align.CENTER,
-                               tooltip_text="Personalizar o Meu computador")
-        customize.add_css_class("flat")
-        customize.add_css_class("circular")
-        customize.connect("clicked", lambda *_: self.open_settings())
-        head = Gtk.Box(spacing=12)
-        head.append(head_text)
-        head.append(customize)
+        # A personalização fica no menu ☰ da linha "Meu computador" na barra lateral.
+        head = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+        head.append(title)
+        head.append(subtitle)
         body.append(head)
 
         # Todas as pastas da barra lateral (locais e marcadores) numa grade só.
@@ -827,9 +939,17 @@ class ComputerPage(Gtk.ScrolledWindow):
         self.disks_button.connect("clicked", lambda *_: self._launch("gnome-disks"))
         self._has_disks_app = GLib.find_program_in_path("gnome-disks") is not None
         body.append(self.disks_button)
-        self.empty_label = Gtk.Label(
-            label="Tudo oculto. Use o botão ✎ acima para escolher o que aparece aqui.")
-        self.empty_label.add_css_class("dim-label")
+        # Página vazia: o único caminho garantido para a personalização (a linha da
+        # barra lateral pode estar oculta e não sobra item para o clique direito).
+        self.empty_label = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                                   halign=Gtk.Align.CENTER)
+        empty_text = Gtk.Label(label="Tudo oculto. Escolha o que aparece aqui.")
+        empty_text.add_css_class("dim-label")
+        empty_btn = Gtk.Button(label="Personalizar…", halign=Gtk.Align.CENTER)
+        empty_btn.add_css_class("pill")
+        empty_btn.connect("clicked", lambda *_: self.ctl.open_settings("customize"))
+        self.empty_label.append(empty_text)
+        self.empty_label.append(empty_btn)
         body.append(self.empty_label)
 
         hub.on_changed(self._on_hub_changed)
@@ -1172,13 +1292,17 @@ class ComputerPage(Gtk.ScrolledWindow):
         self._cfg().set("computer_sections", sections)
         self.ctl.ext.refresh_computer_pages()
 
-    def open_settings(self) -> None:
-        """Escolher o que aparece no Meu computador e se o Nautilus abre direto nele."""
+    def open_settings(self, page_name: str = "customize") -> None:
+        """Escolher o que aparece no Meu computador e se o Nautilus abre direto nele.
+        `page_name`: "customize" ou "about" (abre já na página Sobre)."""
         cfg = self._cfg()
         dialog = Adw.PreferencesDialog(title="Personalizar o Meu computador")
         dialog.set_search_enabled(True)
-        page = Adw.PreferencesPage(title="Meu computador", icon_name="computer-symbolic")
+        page = Adw.PreferencesPage(title="Meu computador", icon_name="computer-symbolic",
+                                   name="customize")
         dialog.add(page)
+        about_page = build_about_page()
+        dialog.add(about_page)
 
         def switch(group, title, subtitle, active, on_change):
             row = Adw.SwitchRow(title=GLib.markup_escape_text(title),
@@ -1238,7 +1362,9 @@ class ComputerPage(Gtk.ScrolledWindow):
         btn.connect("clicked", do_reset)
         reset.add(btn)
         page.add(reset)
-        dialog.present(self.get_root())
+        if page_name == "about":
+            dialog.set_visible_page(about_page)
+        dialog.present(self.ctl.win)
         self._settings_dialog = dialog
 
     def _launch(self, program: str) -> None:
@@ -1288,7 +1414,7 @@ class ComputerPage(Gtk.ScrolledWindow):
         if hide_key:
             last = Gio.Menu()
             add(last, "Ocultar do Meu computador", "hide", lambda: self.set_item_hidden(hide_key, True))
-            add(last, "Personalizar…", "customize", self.open_settings)
+            add(last, "Personalizar…", "customize", lambda: self.ctl.open_settings("customize"))
             menu.append_section(None, last)
         child.insert_action_group("vcomp", group)
         pop = Gtk.PopoverMenu.new_from_model(menu)
@@ -1299,9 +1425,9 @@ class ComputerPage(Gtk.ScrolledWindow):
         pop.set_pointing_to(rect)
         pop.connect("closed", lambda p: GLib.idle_add(p.unparent))
         pop.popup()
-__VITRINE_ARQUIVO_3__
+__VITRINE_ARQUIVO_4__
 mkdir -p "vitrine"
-cat > 'vitrine/config.py' <<'__VITRINE_ARQUIVO_4__'
+cat > 'vitrine/config.py' <<'__VITRINE_ARQUIVO_5__'
 """Preferências e regras de visualização por pasta (JSON em ~/.config/nautilus-vitrine)."""
 
 from __future__ import annotations
@@ -1475,9 +1601,9 @@ class Config:
         except OSError as err:
             log(f"config: falha ao salvar ({err})")
         return GLib.SOURCE_REMOVE
-__VITRINE_ARQUIVO_4__
+__VITRINE_ARQUIVO_5__
 mkdir -p "vitrine"
-cat > 'vitrine/discovery.py' <<'__VITRINE_ARQUIVO_5__'
+cat > 'vitrine/discovery.py' <<'__VITRINE_ARQUIVO_6__'
 """Descoberta automática de pastas: olha uma amostra dos arquivos (tipo MIME pela
 extensão, sem ler o conteúdo) e diz se a pasta é de mídia, de documentos ou mista.
 
@@ -1585,9 +1711,179 @@ def manual_choice(uri: str) -> tuple[str, str | None] | None:
 
 def forget_manual(uri: str) -> None:
     _MANUAL.pop(uri, None)
-__VITRINE_ARQUIVO_5__
+__VITRINE_ARQUIVO_6__
 mkdir -p "vitrine"
-cat > 'vitrine/imageload.py' <<'__VITRINE_ARQUIVO_6__'
+cat > 'vitrine/history.py' <<'__VITRINE_ARQUIVO_7__'
+"""Histórico de Voltar/Avançar que inclui o Meu computador.
+
+O Meu computador é uma página que a Vitrine põe *por cima* da lista do Nautilus, então
+o histórico nativo não sabe que ela existe. Este módulo guarda, para cada aba, um
+histórico no estilo de um navegador em que o Meu computador é uma entrada como outra
+qualquer, e diz o que fazer em cada Voltar/Avançar:
+
+    entradas: [Pasta pessoal@0, Meu computador@0, Documentos@1]
+
+O número depois do @ é a *profundidade* no histórico do Nautilus: quantos Voltar
+nativos existem até aquele ponto. Uma entrada do Meu computador guarda a profundidade
+da pasta que estava por baixo dela. Guardamos a profundidade (e não só a URI) porque a
+mesma pasta pode aparecer várias vezes, e às vezes o Nautilus nem navegou (ex.: abrir a
+pasta que já estava por baixo da página).
+
+Regras:
+  * Voltar/Avançar para o Meu computador: só mostra a página; o Nautilus fica parado.
+  * Voltar/Avançar para uma pasta: diferença = profundidade_alvo - profundidade_atual.
+    0 → só esconde a página; -n → n vezes `slot.back`; +n → n vezes `slot.forward`.
+  * Qualquer outra mudança de local é navegação nova: apaga o "futuro" e acrescenta.
+
+Python puro (sem GTK) para ser testado fora do Nautilus: tools/test_history.py.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+FOLDER = "folder"
+COMPUTER = "computer"
+
+
+@dataclass
+class Entry:
+    kind: str           # FOLDER ou COMPUTER
+    uri: str | None     # pasta (None para o Meu computador)
+    depth: int          # posição no histórico nativo do Nautilus
+
+    def __repr__(self) -> str:  # facilita ler os testes e o log
+        name = "MC" if self.kind == COMPUTER else (self.uri or "?").rstrip("/").rsplit("/", 1)[-1]
+        return f"{name}@{self.depth}"
+
+
+@dataclass
+class Step:
+    """O que o controlador da janela deve fazer depois de um Voltar/Avançar."""
+    show_computer: bool   # mostrar (True) ou esconder (False) a página Meu computador
+    native: int = 0       # passos nativos: negativo = slot.back, positivo = slot.forward
+
+
+class History:
+    def __init__(self) -> None:
+        self.entries: list[Entry] = []
+        self.idx = -1
+        self.depth = 0            # profundidade atual do Nautilus (nossa cópia)
+        self.pending = 0          # passos nativos que pedimos e ainda não chegaram
+        self._undo_new = None     # estado antes da última "navegação nova" (plano B)
+
+    # ── consultas ──
+    def current(self) -> Entry | None:
+        return self.entries[self.idx] if 0 <= self.idx < len(self.entries) else None
+
+    def on_computer(self) -> bool:
+        cur = self.current()
+        return cur is not None and cur.kind == COMPUTER
+
+    def busy(self) -> bool:
+        return self.pending != 0
+
+    def can_back(self) -> bool:
+        return not self.busy() and self.idx > 0
+
+    def can_forward(self) -> bool:
+        return not self.busy() and self.idx < len(self.entries) - 1
+
+    # ── eventos ──
+    def _push(self, entry: Entry) -> None:
+        del self.entries[self.idx + 1:]
+        self.entries.append(entry)
+        self.idx = len(self.entries) - 1
+
+    def on_location(self, uri: str) -> str:
+        """O Nautilus mudou de local (`notify::location`). Retorna o que aconteceu:
+
+        "step"   – um passo nativo que nós pedimos (ainda faltam outros)
+        "done"   – o último passo nativo que pedimos chegou
+        "reload" – mesma pasta de novo (recarregar): nada muda
+        "new"    – navegação nova (barra lateral, caminho, busca, clique numa pasta…)
+        """
+        self._undo_new = None
+        if self.pending:
+            self.depth += 1 if self.pending > 0 else -1
+            self.pending += -1 if self.pending > 0 else 1
+            if self.pending:
+                return "step"
+            cur = self.current()
+            if cur is not None and cur.kind == FOLDER and cur.uri == uri:
+                return "done"
+            # Chegou num lugar inesperado: registra como navegação nova.
+        cur = self.current()
+        if cur is not None and cur.kind == FOLDER and cur.uri == uri:
+            return "reload"
+        self._undo_new = ([*self.entries], self.idx, self.depth)
+        if cur is not None:
+            self.depth += 1
+        self._push(Entry(FOLDER, uri, self.depth))
+        return "new"
+
+    def open_computer(self) -> bool:
+        """Abriu o Meu computador (barra lateral, Ctrl+Shift+C, menu). False se já estava."""
+        if self.on_computer() or self.busy():
+            return False
+        self._undo_new = None
+        self._push(Entry(COMPUTER, None, self.depth))
+        return True
+
+    def start_on_computer(self) -> None:
+        """Janela aberta direto no Meu computador: ele é o primeiro lugar (Voltar desativado)."""
+        self.entries = [Entry(COMPUTER, None, self.depth)]
+        self.idx = 0
+        self._undo_new = None
+
+    def leave_computer_in_place(self, uri: str) -> None:
+        """Saiu do Meu computador para a pasta que já estava por baixo (o Nautilus não
+        navega, então não haverá `notify::location`)."""
+        if not self.on_computer():
+            return
+        self._undo_new = None
+        self._push(Entry(FOLDER, uri, self.depth))
+
+    def back(self) -> Step | None:
+        return self._go(-1)
+
+    def forward(self) -> Step | None:
+        return self._go(+1)
+
+    def _go(self, delta: int) -> Step | None:
+        if not (self.can_back() if delta < 0 else self.can_forward()):
+            return None
+        self.idx += delta
+        target = self.entries[self.idx]
+        self._undo_new = None
+        if target.kind == COMPUTER:
+            return Step(show_computer=True)
+        self.pending = target.depth - self.depth
+        return Step(show_computer=False, native=self.pending)
+
+    def cancel_pending(self) -> None:
+        """O Nautilus não respondeu a um passo pedido (ex.: pasta inacessível)."""
+        self.pending = 0
+
+    def native_went_back(self, uri: str) -> bool:
+        """Plano B: a última "navegação nova" era na verdade um Voltar do próprio Nautilus
+        que não passou por nós (ex.: menu de histórico do botão ←). Sabemos disso porque,
+        depois de uma navegação nova, o Avançar nativo fica sempre desativado.
+
+        Desfaz o acréscimo e realinha com a entrada anterior de mesma URI."""
+        if self._undo_new is None:
+            return False
+        entries, idx, _depth = self._undo_new
+        self._undo_new = None
+        for j in range(idx - 1, -1, -1):
+            e = entries[j]
+            if e.kind == FOLDER and e.uri == uri:
+                self.entries, self.idx, self.depth = entries, j, e.depth
+                return True
+        return False
+__VITRINE_ARQUIVO_7__
+mkdir -p "vitrine"
+cat > 'vitrine/imageload.py' <<'__VITRINE_ARQUIVO_8__'
 """Carregamento rápido de imagens para o preview.
 
 No Fedora 45 o gdk-pixbuf usa o glycin, que abre um processo isolado (sandbox)
@@ -1770,9 +2066,9 @@ THUMB_ATTRS = ",".join(
     for s in ("", "-normal", "-large", "-xlarge", "-xxlarge")
     for k in ("path", "is-valid")
 )
-__VITRINE_ARQUIVO_6__
+__VITRINE_ARQUIVO_8__
 mkdir -p "vitrine"
-cat > 'vitrine/main.py' <<'__VITRINE_ARQUIVO_7__'
+cat > 'vitrine/main.py' <<'__VITRINE_ARQUIVO_9__'
 """Ponto central: descobre as janelas do Nautilus e oferece o menu "Visualização desta pasta"."""
 
 from __future__ import annotations
@@ -1788,13 +2084,13 @@ gi.require_version("Adw", "1")
 gi.require_version("Nautilus", "4.1")
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Nautilus  # noqa: E402
 
-from . import discovery, native  # noqa: E402
+from . import __version__, discovery, native  # noqa: E402
 from .computer import DeviceHub  # noqa: E402
 from .config import GRID_ZOOMS, Config  # noqa: E402
-from .util import guarded, log  # noqa: E402
+from .util import ASSETS, guarded, log  # noqa: E402
 from .window import WindowController  # noqa: E402
 
-VERSION = "0.2.0"
+VERSION = __version__
 
 CSS = b"""
 .vitrine-strip { background-color: var(--view-bg-color); }
@@ -1878,6 +2174,9 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         provider.load_from_bytes(GLib.Bytes.new(CSS))
         Gtk.StyleContext.add_provider_for_display(
             display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        # Ícones da Vitrine (ex.: nautilus-vitrine-symbolic) achados pelo nome. O sufixo
+        # -symbolic faz o GTK recolorir o ícone com a cor do texto (tema claro/escuro).
+        Gtk.IconTheme.get_for_display(display).add_search_path(ASSETS)
         self._css_done = True
 
     def _schedule(self, win) -> None:
@@ -2007,7 +2306,12 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         computer = Nautilus.MenuItem(name="Vitrine::computer", label="Meu computador")
         computer.connect("activate", lambda *_a: GLib.idle_add(
             self._run, lambda c: c.show_computer(True)))
-        return [root, computer]
+        # O Nautilus põe os itens de extensões numa seção própria, antes de
+        # "Propriedades": este é o último item *da Vitrine* no menu.
+        about = Nautilus.MenuItem(name="Vitrine::about", label="Sobre a Vitrine")
+        about.connect("activate", lambda *_a: GLib.idle_add(
+            self._run, lambda c: c.open_settings("about")))
+        return [root, computer, about]
 
     def _run(self, cb) -> bool:
         ctl = self.active_controller()
@@ -2042,9 +2346,9 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         if mode == "grid":
             self.cfg.set("default_grid_zoom", self.current_grid_zoom())
         log(f"novo padrão: {mode}")
-__VITRINE_ARQUIVO_7__
+__VITRINE_ARQUIVO_9__
 mkdir -p "vitrine"
-cat > 'vitrine/native.py' <<'__VITRINE_ARQUIVO_8__'
+cat > 'vitrine/native.py' <<'__VITRINE_ARQUIVO_10__'
 """Ponte com as partes internas do Nautilus (aba/slot, modo de visualização, seleção).
 
 Regra de ouro: nunca guardar referência forte a widgets ou modelos do Nautilus.
@@ -2299,9 +2603,9 @@ class ModelWatch:
             self._callback(model)
         except Exception as err:  # noqa: BLE001
             log(f"ModelWatch callback: {err}")
-__VITRINE_ARQUIVO_8__
+__VITRINE_ARQUIVO_10__
 mkdir -p "vitrine"
-cat > 'vitrine/preview.py' <<'__VITRINE_ARQUIVO_9__'
+cat > 'vitrine/preview.py' <<'__VITRINE_ARQUIVO_11__'
 """Painel de pré-visualização à direita: imagem, texto, miniatura de vídeo/PDF e informações."""
 
 from __future__ import annotations
@@ -2826,9 +3130,9 @@ class PreviewPane(Gtk.Box):
             self._on_navigate(self._current_uri)
         else:
             util.open_uri(self._current_uri)
-__VITRINE_ARQUIVO_9__
+__VITRINE_ARQUIVO_11__
 mkdir -p "vitrine"
-cat > 'vitrine/selftest.py' <<'__VITRINE_ARQUIVO_10__'
+cat > 'vitrine/selftest.py' <<'__VITRINE_ARQUIVO_12__'
 """Autoteste dentro do Nautilus real. Só roda com VITRINE_SELFTEST=1.
 
 Navega por pastas, troca modos, seleciona arquivos e grava PASSOU/FALHOU no log.
@@ -2843,9 +3147,9 @@ import shutil
 import tempfile
 import time
 
-from gi.repository import Gio, GLib
+from gi.repository import Gio, GLib, Gtk
 
-from . import discovery, imageload, native
+from . import discovery, imageload, native, util
 from .util import log
 
 STEP_MS = 1500
@@ -3159,6 +3463,16 @@ def run(ctl) -> bool:
             ok = False
             log(f"open_settings: {err!r}")
         check("tela de personalização abre", ok)
+        try:
+            ctl.open_settings("about")
+            dlg = page._settings_dialog
+            visible = dlg.get_visible_page()
+            ok = visible is not None and visible.get_name() == "about"
+            dlg.close()
+        except Exception as err:  # noqa: BLE001
+            ok = False
+            log(f"open_settings(about): {err!r}")
+        check("menu ☰ → Sobre abre o diálogo já na página Sobre", ok)
         cfg.settings["start_on_computer"] = True
         project_dir = Gio.File.new_for_uri(project).get_uri()
         check("opção abrir no Meu computador (só ao abrir na pasta pessoal)",
@@ -3238,6 +3552,56 @@ def run(ctl) -> bool:
         cfg.settings["remember_per_folder"] = saved_settings.get("remember_per_folder", True)
         ctl.navigate(home)
 
+    # ── Voltar/Avançar com o Meu computador ──
+    target = pictures_uri or project
+
+    def on_computer() -> bool:
+        return ctl.content_stack.get_visible_child_name() == "computer"
+
+    def same(uri_a, uri_b) -> bool:
+        return bool(uri_a and uri_b) and Gio.File.new_for_uri(uri_a).equal(
+            Gio.File.new_for_uri(uri_b))
+
+    @step
+    def h1():
+        app = ctl.win.get_application()
+        accels = app.get_accels_for_action("vitrine.back") if app is not None else []
+        swapped = [w for w in util.walk(ctl.win) if isinstance(w, Gtk.Button)
+                   and w.get_action_name() == "vitrine.back"]
+        check("Voltar: botões ← e Alt+← passam pela Vitrine",
+              swapped and "<alt>left" in [a.lower() for a in accels], f"botões={len(swapped)} atalhos={accels}")
+        ctl.show_computer(True)  # Pasta pessoal → Meu computador
+
+    @step
+    def h2():
+        ctl.leave_computer_and_open(target)  # → Imagens
+
+    @step
+    def h3():
+        ctl.win.activate_action("vitrine.back", None)
+
+    @step
+    def h4():
+        check("Voltar: Imagens → Meu computador", on_computer()
+              and same(state()["uri"], target), str(state()))
+        ctl.win.activate_action("vitrine.forward", None)
+
+    @step
+    def h5():
+        check("Avançar: Meu computador → Imagens", not on_computer()
+              and same(state()["uri"], target), str(state()))
+        ctl.win.activate_action("vitrine.back", None)
+
+    @step
+    def h6():
+        ctl.win.activate_action("vitrine.back", None)  # Meu computador → Pasta pessoal
+
+    @step
+    def h7():
+        check("Voltar: Meu computador → Pasta pessoal", not on_computer()
+              and same(state()["uri"], home), str(state()))
+        ctl.navigate(home)
+
     @step
     def s11():
         st = state()
@@ -3264,9 +3628,9 @@ def run(ctl) -> bool:
 
     GLib.timeout_add(STEP_MS, runner)
     return GLib.SOURCE_REMOVE
-__VITRINE_ARQUIVO_10__
+__VITRINE_ARQUIVO_12__
 mkdir -p "vitrine"
-cat > 'vitrine/util.py' <<'__VITRINE_ARQUIVO_11__'
+cat > 'vitrine/util.py' <<'__VITRINE_ARQUIVO_13__'
 """Utilitários: log, varredura da árvore de widgets e operações de arquivo nativas."""
 
 from __future__ import annotations
@@ -3283,6 +3647,7 @@ gi.require_version("Gdk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, GObject, Gtk  # noqa: E402
 
+ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 LOG_DIR = os.path.join(GLib.get_user_cache_dir(), "nautilus-vitrine")
 LOG_PATH = os.path.join(LOG_DIR, "vitrine.log")
 DEBUG = os.environ.get("VITRINE_DEBUG", "") not in ("", "0")
@@ -3502,9 +3867,9 @@ def format_time(dt: GLib.DateTime | None) -> str:
     if dt is None:
         return "—"
     return dt.to_local().format("%d/%m/%Y %H:%M")
-__VITRINE_ARQUIVO_11__
+__VITRINE_ARQUIVO_13__
 mkdir -p "vitrine"
-cat > 'vitrine/window.py' <<'__VITRINE_ARQUIVO_12__'
+cat > 'vitrine/window.py' <<'__VITRINE_ARQUIVO_14__'
 """Controlador por janela: injeta Colunas + Pré-visualização e aplica as regras por pasta."""
 
 from __future__ import annotations
@@ -3516,12 +3881,16 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 from . import discovery, native
 from .columns import ColumnStrip
 from .computer import ComputerPage
+from .history import History
 from .preview import PreviewPane
-from .util import ancestor, debug, dump_tree, find_by_type_name, find_first, gtype_name, guarded, log
+from .util import (ancestor, debug, dump_tree, find_by_type_name, find_first, gtype_name, guarded,
+                   log, walk)
 
 _MOD_MASK = (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
              | Gdk.ModifierType.ALT_MASK | Gdk.ModifierType.SUPER_MASK)
 _MEDIA_SAMPLE = 250
+_NATIVE_STEP_TIMEOUT_MS = 4000   # o Nautilus não respondeu a um Voltar/Avançar pedido
+_LEAVE_FALLBACK_MS = 1500        # saiu do Meu computador e o Nautilus não navegou
 
 
 class WindowController:
@@ -3548,6 +3917,11 @@ class WindowController:
         self.sidebar_list: Gtk.ListBox | None = None
         self._computer_visible = False
         self.toasts_shown = 0
+        self.actions: Gio.SimpleActionGroup | None = None
+        self._native_forward_probe: Gtk.Button | None = None
+        self._nautilus_prefs = Gio.Settings.new("org.gnome.nautilus.preferences")
+        self._mouse_takeover = False
+        self._leave_source = 0
 
     # ───────────────────────── injeção ─────────────────────────
     def inject(self) -> bool:
@@ -3591,6 +3965,11 @@ class WindowController:
         self.content_stack.set_visible_child_name("tabs")
         inner.append(self.strip)
         inner.append(self.content_stack)
+        # Sonda invisível: o GTK deixa um botão ligado a uma ação sensível ou não conforme
+        # a ação está ativa. Assim sabemos se o Avançar *nativo* está ativo (usado pelo
+        # plano B do histórico), já que os botões ← → visíveis passam a usar nossas ações.
+        self._native_forward_probe = Gtk.Button(action_name="slot.forward", visible=False)
+        inner.append(self._native_forward_probe)
 
         self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         self.paned.set_wide_handle(False)
@@ -3604,9 +3983,11 @@ class WindowController:
         self.paned.connect("notify::position", self._on_paned_pos)
         toolbar.set_content(self.paned)
 
+        self._install_actions()
         self._inject_buttons()
         self._inject_sidebar_row()
         self._install_keys()
+        self._take_over_history()
 
         tv.connect("notify::selected-page", self._on_tab_switched)
         tv.connect("page-attached", lambda _tv, page, _pos: self._watch_slot(page.get_child()))
@@ -3627,8 +4008,12 @@ class WindowController:
         slot = self.active_slot()
         if slot is not None:
             self._on_slot_location(slot)
-        if self.should_start_on_computer(native.slot_uri(slot)):
-            self.show_computer(True)
+        if slot is not None and self.should_start_on_computer(native.slot_uri(slot)):
+            # O Meu computador *substitui* a pasta pessoal como primeiro lugar da aba,
+            # então o Voltar fica desativado, como no Nautilus quando não há para onde voltar.
+            self.history(slot).start_on_computer()
+            self._display_computer(True)
+            self._update_history_actions()
             log("janela aberta direto no Meu computador")
         return GLib.SOURCE_REMOVE
 
@@ -3668,6 +4053,7 @@ class WindowController:
         box = Gtk.Box(spacing=12)
         box.append(Gtk.Image.new_from_icon_name("computer-symbolic"))
         box.append(Gtk.Label(label="Meu computador", xalign=0, hexpand=True))
+        box.append(self._sidebar_menu_button())
         row.set_child(box)
         lb.append(row)
         lb.connect("row-activated", lambda *_a: self.show_computer(True))
@@ -3675,22 +4061,107 @@ class WindowController:
         self.sidebar_list = lb
         lb.set_visible(bool(self.cfg.get("computer_in_sidebar")))
 
-        # Clicar em qualquer local nativo da barra lateral sai do Meu computador,
-        # mesmo que seja a pasta onde a aba já está (aí o Nautilus não navega).
+        # Clicar em qualquer local nativo da barra lateral sai do Meu computador.
+        # (A nossa linha está *ao lado* da NautilusSidebar, numa barra superior do
+        # AdwToolbarView, e não dentro dela: este gesto nunca vê cliques no ☰.)
         click = Gtk.GestureClick.new()
         click.set_button(Gdk.BUTTON_PRIMARY)
         click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        click.connect("released", lambda *_a: GLib.idle_add(self._leave_computer_if_visible))
+        click.connect("released", self._on_sidebar_click, sidebar)
         sidebar.add_controller(click)
 
-    def _leave_computer_if_visible(self) -> bool:
-        if self._computer_visible:
-            self.show_computer(False)
+    def _sidebar_menu_button(self) -> Gtk.MenuButton:
+        """☰ encostado à direita da linha, onde o Nautilus põe o ⏏ dos dispositivos.
+
+        Não ativa a linha nem muda a seleção: ao receber o clique, o botão *reivindica*
+        a sequência do evento (EventSequenceState.CLAIMED) e o GTK cancela os gestos dos
+        widgets acima dele, inclusive o do ListBox que ativaria/selecionaria a linha."""
+        menu = Gio.Menu()
+        menu.append("Personalizar o Meu computador…", "vitrine.customize")
+        menu.append("Sobre a Vitrine", "vitrine.about")
+        btn = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu,
+                             valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER,
+                             tooltip_text="Opções do Meu computador")
+        btn.set_margin_start(4)
+        # Mesma classe do botão ⏏ nativo (nautilus-sidebar-row.ui): o CSS do próprio
+        # Nautilus deixa o botão igual aos nativos nos temas claro e escuro.
+        btn.add_css_class("sidebar-button")
+        btn.set_focus_on_click(False)
+        return btn
+
+    @guarded
+    def _on_sidebar_click(self, _gesture, _n, x, y, sidebar) -> None:
+        if not self._computer_visible:
+            return
+        picked = sidebar.pick(x, y, Gtk.PickFlags.DEFAULT)
+        row = ancestor(picked, lambda w: gtype_name(w) == "NautilusSidebarRow") if picked else None
+        uri = None
+        if row is not None:
+            try:
+                uri = row.get_property("uri")
+            except TypeError:
+                uri = None
+        if row is None:
+            return  # clique fora de um local (área vazia, título de seção)
+        GLib.idle_add(self._leave_computer_towards, uri)
+
+    def _leave_computer_towards(self, uri: str | None) -> bool:
+        """Sai do Meu computador indo para `uri` (que o Nautilus está abrindo, ou não)."""
+        slot = self.active_slot()
+        if slot is None or not self._computer_visible:
+            return GLib.SOURCE_REMOVE
+        if uri and self._same_as_native(slot, uri):
+            # O Nautilus não navega para a pasta que já está aberta: registramos nós.
+            self.history(slot).leave_computer_in_place(native.slot_uri(slot))
+            self._display_computer(False)
+            self._update_history_actions()
+        else:
+            self._display_computer(False)
+            self._expect_navigation(slot)
         return GLib.SOURCE_REMOVE
+
+    @staticmethod
+    def _same_as_native(slot, uri: str) -> bool:
+        loc = native.slot_location(slot)
+        return loc is not None and loc.equal(Gio.File.new_for_uri(uri))
+
+    def _expect_navigation(self, slot) -> None:
+        """Escondemos a página e o Nautilus vai navegar; o `notify::location` registra a
+        entrada. Se ele não navegar (erro, pasta inacessível), registramos que saímos
+        do Meu computador para a pasta que já estava por baixo."""
+        if self._leave_source:
+            GLib.source_remove(self._leave_source)
+
+        def fallback():
+            self._leave_source = 0
+            h = self.history(slot)
+            if h.on_computer() and not (slot is self.active_slot() and self._computer_visible):
+                h.leave_computer_in_place(native.slot_uri(slot))
+                self._update_history_actions()
+            return GLib.SOURCE_REMOVE
+
+        self._leave_source = GLib.timeout_add(_LEAVE_FALLBACK_MS, fallback)
 
     # ───────────────────────── Meu computador ─────────────────────────
     def show_computer(self, on: bool = True) -> None:
+        """Abrir/fechar o Meu computador por escolha do usuário (barra lateral, atalho,
+        menu): registra no histórico da aba e mostra/esconde a página."""
+        slot = self.active_slot()
+        if slot is None:
+            return
+        h = self.history(slot)
+        if on:
+            h.open_computer()
+        elif h.on_computer():
+            h.leave_computer_in_place(native.slot_uri(slot))
+        self._display_computer(on)
+        self._update_history_actions()
+
+    def _display_computer(self, on: bool) -> None:
+        """Só a parte visual: troca entre a lista do Nautilus e a página Meu computador."""
         if self.content_stack is None or self.computer is None:
+            return
+        if on == self._computer_visible:
             return
         self._computer_visible = on
         self.content_stack.set_visible_child_name("computer" if on else "tabs")
@@ -3719,8 +4190,175 @@ class WindowController:
         return self._computer_visible
 
     def leave_computer_and_open(self, uri: str) -> None:
-        self.show_computer(False)
+        """Abrir um item da página (pasta, disco, dispositivo recém-montado)."""
+        slot = self.active_slot()
+        if slot is None:
+            return
+        h = self.history(slot)
+        if h.on_computer() and self._same_as_native(slot, uri):
+            h.leave_computer_in_place(native.slot_uri(slot))
+            self._display_computer(False)
+            self._update_history_actions()
+            return
+        self._display_computer(False)
+        if h.on_computer():
+            self._expect_navigation(slot)
         self.navigate(uri)
+
+    def open_settings(self, page: str = "customize") -> None:
+        """Diálogo de personalização, já na página pedida ("customize" ou "about")."""
+        if self.computer is not None:
+            self.computer.open_settings(page)
+
+    # ───────────────────────── Voltar / Avançar ─────────────────────────
+    def history(self, slot) -> History:
+        """Histórico da aba (cada aba tem o seu, guardado no próprio slot)."""
+        h = getattr(slot, "_vitrine_history", None)
+        if h is None:
+            h = History()
+            slot._vitrine_history = h
+            uri = native.slot_uri(slot)
+            if uri:
+                h.on_location(uri)
+        return h
+
+    def _install_actions(self) -> None:
+        """Ações da Vitrine nesta janela, com o prefixo "vitrine." (menus, botões ← →,
+        atalhos)."""
+        group = Gio.SimpleActionGroup()
+
+        def add(name, cb):
+            act = Gio.SimpleAction.new(name, None)
+            act.connect("activate", lambda *_a: cb())
+            group.add_action(act)
+
+        add("customize", lambda: self.open_settings("customize"))
+        add("about", lambda: self.open_settings("about"))
+        add("back", lambda: self.go_history(-1))
+        add("forward", lambda: self.go_history(+1))
+        self.win.insert_action_group("vitrine", group)
+        self.actions = group
+
+    def _take_over_history(self) -> None:
+        """Faz todas as formas de Voltar/Avançar passarem pelo histórico da Vitrine.
+
+        Nautilus 51: ações slot.back/slot.forward (não existe win.back), atalhos
+        Alt+←/→ e teclas Back/Forward, botões 8/9 do mouse num gesto próprio da janela
+        e nenhum gesto de deslizar no touchpad. Cada ponto é trocado de forma
+        determinística (sem depender da ordem em que o GTK entrega os eventos)."""
+        n = self._take_over_buttons()
+        app = self.win.get_application()
+        if app is not None:
+            for nat, ours in (("slot.back", "vitrine.back"), ("slot.forward", "vitrine.forward")):
+                accels = app.get_accels_for_action(nat)
+                if accels:
+                    # Fica só na memória (não é salvo); reaplicado a cada janela nova.
+                    app.set_accels_for_action(ours, accels)
+                    app.set_accels_for_action(nat, [])
+            log(f"histórico: {n} botões ← →, atalhos {app.get_accels_for_action('vitrine.back')}")
+        self._take_over_mouse()
+        self._update_history_actions()
+
+    def _take_over_buttons(self) -> int:
+        """Botões ← → do cabeçalho e da barra inferior (janela estreita) passam a usar as
+        nossas ações. Bônus: o GTK ativa/desativa o botão conforme a ação, então o
+        estado deles reflete o histórico combinado sem código extra."""
+        n = 0
+        for nat, ours in (("slot.back", "vitrine.back"), ("slot.forward", "vitrine.forward")):
+            for w in walk(self.win):
+                if isinstance(w, Gtk.Button) and w is not self._native_forward_probe \
+                        and w.get_action_name() == nat:
+                    w.set_action_name(ours)
+                    n += 1
+        return n
+
+    def _take_over_mouse(self) -> None:
+        """Botões laterais do mouse. O Nautilus os trata num GestureClick (todos os
+        botões, fase de captura) na própria janela e navega direto, sem passar pela ação.
+        Desligamos só esse gesto (fase NONE, nada é salvo) e pomos o nosso no lugar.
+        Se não acharmos exatamente um, não mexemos em nada."""
+        found = []
+        controllers = self.win.observe_controllers()
+        for i in range(controllers.get_n_items()):
+            c = controllers.get_item(i)
+            if (isinstance(c, Gtk.GestureClick) and c.get_button() == 0
+                    and c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE):
+                found.append(c)
+        if len(found) != 1:
+            log(f"histórico: gesto do mouse do Nautilus não identificado ({len(found)}); "
+                "botões 8/9 ficam com o Nautilus")
+            return
+        found[0].set_propagation_phase(Gtk.PropagationPhase.NONE)
+        ours = Gtk.GestureClick.new()
+        ours.set_button(0)
+        ours.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        ours.connect("pressed", self._on_mouse_button)
+        self.win.add_controller(ours)
+        self._mouse_takeover = True
+
+    @guarded
+    def _on_mouse_button(self, gesture, _n, _x, _y) -> None:
+        prefs = self._nautilus_prefs
+        if not prefs.get_boolean("mouse-use-extra-buttons"):
+            return
+        button = gesture.get_current_button()
+        if button == prefs.get_uint("mouse-back-button"):
+            delta = -1
+        elif button == prefs.get_uint("mouse-forward-button"):
+            delta = +1
+        else:
+            return
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        self.go_history(delta)
+
+    def go_history(self, delta: int) -> None:
+        slot = self.active_slot()
+        if slot is None:
+            return
+        h = self.history(slot)
+        step = h.back() if delta < 0 else h.forward()
+        if step is None:
+            return
+        debug(f"histórico {'voltar' if delta < 0 else 'avançar'}: {h.entries} idx={h.idx} "
+              f"nativo={step.native}")
+        self._display_computer(step.show_computer)
+        if step.native:
+            self._native_step(slot, step.native)
+        self._update_history_actions()
+
+    def _native_step(self, slot, sign: int) -> None:
+        slot.activate_action("slot.back" if sign < 0 else "slot.forward", None)
+        h = self.history(slot)
+        before = h.pending
+
+        def timeout():
+            if h.pending == before and h.pending:
+                log("histórico: o Nautilus não respondeu ao Voltar/Avançar; desistindo")
+                h.cancel_pending()
+                self._update_history_actions()
+            return GLib.SOURCE_REMOVE
+
+        GLib.timeout_add(_NATIVE_STEP_TIMEOUT_MS, timeout)
+
+    def _update_history_actions(self) -> None:
+        if self.actions is None:
+            return
+        slot = self.active_slot()
+        h = self.history(slot) if slot is not None else None
+        self.actions.lookup_action("back").set_enabled(bool(h and h.can_back()))
+        self.actions.lookup_action("forward").set_enabled(bool(h and h.can_forward()))
+
+    def _check_hidden_native_back(self, slot, uri: str) -> bool:
+        """Plano B: depois de uma navegação nova o Avançar nativo fica sempre desativado.
+        Se ele estiver ativo, o Nautilus voltou sem passar por nós (ex.: menu de
+        histórico do botão ←)."""
+        probe = self._native_forward_probe
+        if (slot is self.active_slot() and probe is not None and probe.get_sensitive()
+                and native.slot_uri(slot) == uri
+                and self.history(slot).native_went_back(uri)):
+            debug(f"histórico: Voltar nativo detectado, realinhado em {uri}")
+            self._update_history_actions()
+        return GLib.SOURCE_REMOVE
 
     def preview_location(self, uri: str | None) -> None:
         if self.preview is None or not self.preview.get_visible():
@@ -3833,8 +4471,15 @@ class WindowController:
         slot = self.active_slot()
         if slot is None:
             return
+        # O Meu computador pertence à aba: aparece se for o lugar atual desta aba.
+        # Os botões ← → podem ter sido religados pelo Nautilus; garantimos de novo.
+        self._take_over_buttons()
+        self._update_history_actions()
+        if self.history(slot).on_computer():
+            self._display_computer(True)
+            return
         if self._computer_visible:
-            self.show_computer(False)
+            self._display_computer(False)
             return
         self._set_columns_visible(getattr(slot, "_vitrine_mode", None) == "columns")
         self._sync_active_ui(slot)
@@ -3844,11 +4489,25 @@ class WindowController:
         uri = native.slot_uri(slot)
         if uri is None:
             return
+        h = getattr(slot, "_vitrine_history", None)
+        if h is None:
+            self.history(slot)  # primeira vez: já registra `uri`
+            result = "new"
+        else:
+            result = h.on_location(uri)
+        if result == "step":
+            # Diferença de mais de um passo: pede o próximo depois que este terminou.
+            GLib.idle_add(self._native_step, slot, h.pending)
+            return
         self.ext.suppress()
         if slot is self.active_slot():
             if self._computer_visible:
-                self.show_computer(False)  # navegou (barra de caminho, voltar, busca…)
+                self._display_computer(False)  # navegou (barra de caminho, busca…)
             self._sync_active_ui(slot)
+            self._update_history_actions()
+            if result == "new":
+                # Dá tempo ao Nautilus de atualizar o estado do Avançar nativo.
+                GLib.timeout_add(150, self._check_hidden_native_back, slot, uri)
         GLib.idle_add(self._apply_rule_for_slot, slot, uri, priority=GLib.PRIORITY_LOW)
 
     def _sync_active_ui(self, slot) -> None:
@@ -4149,16 +4808,77 @@ class WindowController:
         if self.strip is not None:
             self.strip.teardown()
         self.ext.forget_window(self.win)
-__VITRINE_ARQUIVO_12__
+__VITRINE_ARQUIVO_14__
+mkdir -p "vitrine/assets"
+cat > 'vitrine/assets/about.css' <<'__VITRINE_ARQUIVO_15__'
+/* Card principal da página "Sobre" (vitrine/about.py).
+   --card-bg-color do libadwaita já é um pouco mais claro que a janela nos dois temas;
+   a borda usa o azul da logo. */
+.vitrine-about-hero {
+  background-color: var(--card-bg-color);
+  border: 1px solid #60a5fa;
+  border-radius: 16px;
+  padding: 32px 24px 24px 24px;
+}
+__VITRINE_ARQUIVO_15__
+mkdir -p "vitrine/assets"
+cat > 'vitrine/assets/nautilus-vitrine-logo.svg' <<'__VITRINE_ARQUIVO_16__'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#23232b"/>
+      <stop offset="1" stop-color="#0d0d11"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#60a5fa"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg)"/>
+  <rect x="8.75" y="8.75" width="238.5" height="238.5" rx="55.25" fill="none" stroke="url(#rim)" stroke-width="1.5"/>
+  <path d="M58 98 a18 18 0 0 1 18-18 h30 l14 16 h60 a18 18 0 0 1 18 18 v60 a18 18 0 0 1 -18 18 H76 a18 18 0 0 1 -18-18 Z" fill="none" stroke="url(#glass)" stroke-width="15" stroke-linejoin="round"/>
+  <path d="M128 120 Q131.5 136.5 148 140 Q131.5 143.5 128 160 Q124.5 143.5 108 140 Q124.5 136.5 128 120 Z" fill="#ffd166"/>
+</svg>
+__VITRINE_ARQUIVO_16__
+mkdir -p "vitrine/assets"
+cat > 'vitrine/assets/nautilus-vitrine-mark.svg' <<'__VITRINE_ARQUIVO_17__'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="glass" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#60a5fa"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+  </defs>
+  <path d="M40 90 a22 22 0 0 1 22-22 h38 l18 20 h76 a22 22 0 0 1 22 22 v74 a22 22 0 0 1 -22 22 H62 a22 22 0 0 1 -22-22 Z" fill="none" stroke="url(#glass)" stroke-width="16" stroke-linejoin="round"/>
+  <path d="M128 112 Q132.5 133.5 154 138 Q132.5 142.5 128 164 Q123.5 142.5 102 138 Q123.5 133.5 128 112 Z" fill="#ffd166"/>
+</svg>
+__VITRINE_ARQUIVO_17__
+mkdir -p "vitrine/assets"
+cat > 'vitrine/assets/nautilus-vitrine-symbolic.svg' <<'__VITRINE_ARQUIVO_18__'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Ícones simbólicos do GTK são recoloridos forçando `fill`: por isso o contorno
+       da pasta é um caminho preenchido (borda externa menos borda interna, evenodd)
+       e não um `stroke`. Mesmo desenho do contorno de 1,6 px original. -->
+  <path fill="currentColor" fill-rule="evenodd" d="M1.2 4.6 A2.2 2.2 0 0 1 3.4 2.4 H6.2 A0.8 0.8 0 0 1 6.807 2.679 L7.768 3.8 H12.6 A2.2 2.2 0 0 1 14.8 6 V12.4 A2.2 2.2 0 0 1 12.6 14.6 H3.4 A2.2 2.2 0 0 1 1.2 12.4 Z M2.8 4.6 A0.6 0.6 0 0 1 3.4 4 H5.832 L6.793 5.121 A0.8 0.8 0 0 0 7.4 5.4 H12.6 A0.6 0.6 0 0 1 13.2 6 V12.4 A0.6 0.6 0 0 1 12.6 13 H3.4 A0.6 0.6 0 0 1 2.8 12.4 Z"/>
+  <path fill="currentColor" d="M8 6.1 Q8.35 8.15 10.4 8.5 Q8.35 8.85 8 10.9 Q7.65 8.85 5.6 8.5 Q7.65 8.15 8 6.1 Z"/>
+</svg>
+__VITRINE_ARQUIVO_18__
 mkdir -p "tools"
-cat > 'tools/smoke_test.py' <<'__VITRINE_ARQUIVO_13__'
+cat > 'tools/smoke_test.py' <<'__VITRINE_ARQUIVO_19__'
 """Teste rápido FORA do Nautilus: abre as colunas e o painel de preview numa janela
-própria e salva uma captura em PNG. Uso:
+própria e salva uma captura em PNG; monta a página "Sobre" nos temas claro e escuro
+(saida-sobre-claro.png / saida-sobre-escuro.png) e confere se a versão do .spec é a
+mesma de vitrine/__init__.py. Uso:
 
     python3 tools/smoke_test.py [pasta] [arquivo-para-preview] [saida.png]
 """
 
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -4170,17 +4890,50 @@ gi.require_version("Adw", "1")
 gi.require_version("Graphene", "1.0")
 from gi.repository import Adw, Gio, GLib, Graphene, Gtk  # noqa: E402
 
+from vitrine import __version__  # noqa: E402
+from vitrine.about import build_about_page  # noqa: E402
 from vitrine.columns import ColumnStrip  # noqa: E402
 from vitrine.main import CSS  # noqa: E402
 from vitrine.preview import PreviewPane  # noqa: E402
+from vitrine.util import ASSETS  # noqa: E402
+
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 
 folder = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~")
 target = sys.argv[2] if len(sys.argv) > 2 else None
 out = sys.argv[3] if len(sys.argv) > 3 else "/tmp/vitrine-smoke.png"
+failures = []
+
+
+def check_version() -> None:
+    with open(os.path.join(ROOT, "packaging", "nautilus-vitrine.spec"), encoding="utf-8") as fh:
+        spec = re.search(r"^Version:\s*(\S+)", fh.read(), re.M).group(1)
+    ok = spec == __version__
+    print(f"versão: spec={spec} __version__={__version__} {'ok' if ok else 'DIFERENTES'}")
+    if not ok:
+        failures.append("versão")
+
+
+def save_png(widget, win, path, required=True) -> None:
+    w, h = widget.get_width(), widget.get_height()
+    paintable = Gtk.WidgetPaintable.new(widget).get_current_image()
+    snap = Gtk.Snapshot()
+    paintable.snapshot(snap, w, h)
+    node = snap.to_node()
+    if node is None:
+        if required:
+            failures.append(f"captura vazia: {path}")
+        else:
+            print(f"aviso: captura vazia (problema antigo, não bloqueia): {path}")
+        return
+    tex = win.get_renderer().render_texture(node, Graphene.Rect().init(0, 0, w, h))
+    tex.save_to_png(path)
+    print("png:", path)
 
 
 def on_activate(app):
     win = Adw.ApplicationWindow(application=app, default_width=1200, default_height=700)
+    Gtk.IconTheme.get_for_display(win.get_display()).add_search_path(ASSETS)
     prov = Gtk.CssProvider()
     prov.load_from_bytes(GLib.Bytes.new(CSS))
     Gtk.StyleContext.add_provider_for_display(win.get_display(), prov, 800)
@@ -4203,15 +4956,7 @@ def on_activate(app):
 
     def shot():
         paned.set_position(win.get_width() - 330)
-        w, h = paned.get_width(), paned.get_height()
-        paintable = Gtk.WidgetPaintable.new(paned).get_current_image()
-        snap = Gtk.Snapshot()
-        paintable.snapshot(snap, w, h)
-        node = snap.to_node()
-        if node is not None:
-            tex = win.get_renderer().render_texture(node, Graphene.Rect().init(0, 0, w, h))
-            tex.save_to_png(out)
-            print("png:", out)
+        save_png(paned, win, out, required=False)
         rows = []
         c = preview.info.get_first_child()
         while c is not None:
@@ -4223,19 +4968,250 @@ def on_activate(app):
                 for c in strip.columns]
         print("colunas:", cols)
         print("eventos:", events)
-        app.quit()
+        about_shots(app)
         return False
 
     GLib.timeout_add(2500, shot)
 
 
+def about_shots(app) -> None:
+    """Página Sobre no tema claro e depois no escuro."""
+    win = Adw.ApplicationWindow(application=app, default_width=640, default_height=900)
+    win.set_content(build_about_page())
+    win.present()
+    style = Adw.StyleManager.get_default()
+    base = os.path.splitext(out)[0]
+    schemes = [("claro", Adw.ColorScheme.FORCE_LIGHT), ("escuro", Adw.ColorScheme.FORCE_DARK)]
+
+    def next_scheme():
+        if not schemes:
+            app.quit()
+            return False
+        name, scheme = schemes.pop(0)
+        style.set_color_scheme(scheme)
+        GLib.timeout_add(700, lambda: (save_png(win, win,
+                                                f"{base}-sobre-{name}.png"), next_scheme())[1])
+        return False
+
+    GLib.timeout_add(300, next_scheme)
+
+
+check_version()
 app = Adw.Application(application_id="io.github.vitrine.SmokeTest",
                       flags=Gio.ApplicationFlags.NON_UNIQUE)
 app.connect("activate", on_activate)
 app.run([])
-__VITRINE_ARQUIVO_13__
+if failures:
+    print("FALHAS:", failures)
+    sys.exit(1)
+__VITRINE_ARQUIVO_19__
 mkdir -p "tools"
-cat > 'tools/build_bootstrap.py' <<'__VITRINE_ARQUIVO_14__'
+cat > 'tools/test_history.py' <<'__VITRINE_ARQUIVO_20__'
+"""Testes do histórico de Voltar/Avançar com o Meu computador (sem GTK, sem Nautilus).
+
+    python3 tools/test_history.py
+
+`FakeSlot` imita o histórico nativo de uma aba do Nautilus: lista de voltar, lista de
+avançar, e nenhum `notify::location` quando se abre a pasta que já está aberta.
+`Tab` faz o mesmo papel do WindowController (window.py): liga os dois.
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+from vitrine.history import History  # noqa: E402
+
+H = "file:///home/u"
+IMG = H + "/Imagens"
+DOC = H + "/Documentos"
+FER = IMG + "/Ferias"
+
+
+class FakeSlot:
+    def __init__(self, start: str, on_location) -> None:
+        self.location = start
+        self.back_list: list[str] = []
+        self.fwd_list: list[str] = []
+        self.on_location = on_location
+
+    def open(self, uri: str) -> None:
+        if uri == self.location:
+            return  # o Nautilus não navega
+        self.back_list.append(self.location)
+        self.fwd_list.clear()
+        self._set(uri)
+
+    def back(self) -> None:
+        assert self.back_list, "Voltar nativo sem histórico"
+        self.fwd_list.append(self.location)
+        self._set(self.back_list.pop())
+
+    def forward(self) -> None:
+        assert self.fwd_list, "Avançar nativo sem histórico"
+        self.back_list.append(self.location)
+        self._set(self.fwd_list.pop())
+
+    def _set(self, uri: str) -> None:
+        self.location = uri
+        self.on_location(uri)
+
+
+class Tab:
+    """Mesma cola que window.py faz entre History e o slot."""
+
+    def __init__(self, start: str = H, start_on_computer: bool = False) -> None:
+        self.h = History()
+        self.computer = False
+        self.slot = FakeSlot(start, self._on_location)
+        self._on_location(start)
+        if start_on_computer:
+            self.h.start_on_computer()
+            self.computer = True
+
+    def _native(self, sign: int) -> None:
+        self.slot.back() if sign < 0 else self.slot.forward()
+
+    def _on_location(self, uri: str) -> None:
+        result = self.h.on_location(uri)
+        if result == "step":
+            self._native(self.h.pending)
+            return
+        self.computer = False
+        if result == "new" and self.slot.fwd_list:  # plano B (window.py checa o botão →)
+            self.h.native_went_back(uri)
+
+    # ações do usuário
+    def sidebar_computer(self):
+        if self.h.open_computer():
+            self.computer = True
+
+    def open(self, uri: str):
+        """Abrir uma pasta (barra lateral, item da página, duplo clique…)."""
+        if self.computer and uri == self.slot.location:
+            self.h.leave_computer_in_place(uri)
+            self.computer = False
+        else:
+            self.slot.open(uri)
+
+    def back(self):
+        self._go(self.h.back())
+
+    def forward(self):
+        self._go(self.h.forward())
+
+    def _go(self, step):
+        assert step is not None, "botão deveria estar desativado"
+        self.computer = step.show_computer
+        if step.native:
+            self._native(step.native)
+
+    def where(self) -> str:
+        return "MC" if self.computer else self.slot.location
+
+
+def check(name, got, want):
+    ok = got == want
+    print(f"{'PASSOU' if ok else 'FALHOU'}: {name}" + ("" if ok else f"  (veio {got!r}, esperado {want!r})"))
+    return ok
+
+
+def run() -> bool:
+    results = []
+
+    # 1. Abre no MC → Imagens → Voltar → MC ; Avançar → Imagens
+    t = Tab(start_on_computer=True)
+    results.append(check("começa no MC com Voltar desativado", (t.where(), t.h.can_back()), ("MC", False)))
+    t.open(IMG)
+    t.back()
+    results.append(check("MC → Imagens → Voltar = MC", t.where(), "MC"))
+    results.append(check("…e o Voltar fica desativado de novo", t.h.can_back(), False))
+    results.append(check("…com a lista nativa ainda em Imagens", t.slot.location, IMG))
+    t.forward()
+    results.append(check("…Avançar = Imagens", t.where(), IMG))
+
+    # 2. Pasta pessoal → MC → Documentos → Voltar → MC → Voltar → Pasta pessoal
+    t = Tab()
+    t.sidebar_computer()
+    t.open(DOC)
+    t.back()
+    results.append(check("PP → MC → Doc → Voltar = MC", t.where(), "MC"))
+    t.back()
+    results.append(check("…Voltar = Pasta pessoal", t.where(), H))
+    results.append(check("…e não há mais para onde voltar", t.h.can_back(), False))
+    t.forward()
+    t.forward()
+    results.append(check("…Avançar, Avançar = MC, Documentos", t.where(), DOC))
+
+    # 3. MC → Imagens → Férias → Voltar → Imagens → Voltar → MC
+    t = Tab(start_on_computer=True)
+    t.open(IMG)
+    t.open(FER)
+    t.back()
+    results.append(check("MC → Img → Férias → Voltar = Imagens", t.where(), IMG))
+    t.back()
+    results.append(check("…Voltar = MC", t.where(), "MC"))
+
+    # 4. A mesma pasta que estava por baixo (o Nautilus não navega)
+    t = Tab()
+    t.sidebar_computer()
+    t.open(H)                 # clica na Pasta pessoal dentro do MC
+    t.back()
+    results.append(check("PP → MC → PP (sem navegar) → Voltar = MC", t.where(), "MC"))
+    t.back()
+    results.append(check("…Voltar = PP, sem Voltar nativo", (t.where(), t.slot.back_list), (H, [])))
+
+    # 5. Diferença de mais de um passo: PP → MC → Doc, Voltar (MC), clica Imagens
+    t = Tab()
+    t.sidebar_computer()
+    t.open(DOC)
+    t.back()                  # MC por cima de Documentos
+    t.open(IMG)               # navegação nova a partir de Documentos
+    t.back()
+    results.append(check("…Voltar = MC", t.where(), "MC"))
+    t.back()                  # PP está 2 passos nativos atrás (Img → Doc → PP)
+    results.append(check("…Voltar = PP (2 passos nativos encadeados)", t.where(), H))
+
+    # 6. Abas independentes
+    a, b = Tab(), Tab()
+    a.sidebar_computer()
+    results.append(check("MC numa aba não afeta a outra", (a.where(), b.where(), b.h.can_back()),
+                         ("MC", H, False)))
+
+    # 7. Recarregar não cria entrada
+    t = Tab()
+    t.open(DOC)
+    t._on_location(DOC)
+    results.append(check("recarregar não cria entrada", len(t.h.entries), 2))
+
+    # 8. Plano B: o Nautilus voltou sem passar por nós (menu de histórico do ←)
+    t = Tab(start_on_computer=True)
+    t.open(IMG)
+    t.open(FER)
+    t.slot.back()             # Voltar nativo "escondido"
+    results.append(check("plano B: realinha em Imagens", (t.where(), t.h.idx), (IMG, 1)))
+    t.back()
+    results.append(check("…e o Voltar seguinte ainda cai no MC", t.where(), "MC"))
+
+    # 9. Navegar para outro lugar fecha o MC e apaga o futuro
+    t = Tab()
+    t.sidebar_computer()
+    t.open(DOC)
+    t.back()
+    t.back()                  # PP; futuro = [MC, Doc]
+    t.open(IMG)
+    results.append(check("navegação nova apaga o Avançar", t.h.can_forward(), False))
+
+    print(f"\n{sum(results)}/{len(results)} verificações passaram")
+    return all(results)
+
+
+if __name__ == "__main__":
+    sys.exit(0 if run() else 1)
+__VITRINE_ARQUIVO_20__
+mkdir -p "tools"
+cat > 'tools/build_bootstrap.py' <<'__VITRINE_ARQUIVO_21__'
 """Gera `criar-vitrine.sh`: um único script bash que recria o projeto inteiro
 (todos os arquivos) numa pasta e, se você quiser, já instala no Nautilus.
 
@@ -4251,6 +5227,7 @@ INCLUDE = [
     "nautilus-vitrine.py",
     "vitrine",
     "tools/smoke_test.py",
+    "tools/test_history.py",
     "tools/build_bootstrap.py",
     "install.sh",
     "uninstall.sh",
@@ -4350,8 +5327,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-__VITRINE_ARQUIVO_14__
-cat > 'install.sh' <<'__VITRINE_ARQUIVO_15__'
+__VITRINE_ARQUIVO_21__
+cat > 'install.sh' <<'__VITRINE_ARQUIVO_22__'
 #!/usr/bin/env bash
 # Instala a Vitrine para o seu usuário (não precisa de root, exceto para o nautilus-python).
 #
@@ -4409,8 +5386,8 @@ if [[ "$RESTART" == 1 ]]; then
   (setsid nautilus >/dev/null 2>&1 &)
 fi
 echo "Pronto. Log: ${XDG_CACHE_HOME:-$HOME/.cache}/nautilus-vitrine/vitrine.log"
-__VITRINE_ARQUIVO_15__
-cat > 'uninstall.sh' <<'__VITRINE_ARQUIVO_16__'
+__VITRINE_ARQUIVO_22__
+cat > 'uninstall.sh' <<'__VITRINE_ARQUIVO_23__'
 #!/usr/bin/env bash
 # Remove a Vitrine. Suas regras por pasta ficam em ~/.config/nautilus-vitrine
 # (use --purge para apagá-las também).
@@ -4422,15 +5399,15 @@ if [[ "${1:-}" == "--purge" ]]; then
 fi
 nautilus -q 2>/dev/null || true
 echo "Vitrine removida. Abra o Arquivos de novo para voltar ao Nautilus original."
-__VITRINE_ARQUIVO_16__
+__VITRINE_ARQUIVO_23__
 mkdir -p ".vscode"
-cat > '.vscode/extensions.json' <<'__VITRINE_ARQUIVO_17__'
+cat > '.vscode/extensions.json' <<'__VITRINE_ARQUIVO_24__'
 {
   "recommendations": ["ms-python.python", "ms-python.vscode-pylance"]
 }
-__VITRINE_ARQUIVO_17__
+__VITRINE_ARQUIVO_24__
 mkdir -p ".vscode"
-cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_18__'
+cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_25__'
 {
   "python.defaultInterpreterPath": "/usr/bin/python3",
   "python.analysis.extraPaths": ["${workspaceFolder}"],
@@ -4438,9 +5415,9 @@ cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_18__'
   "editor.rulers": [100],
   "[python]": { "editor.tabSize": 4 }
 }
-__VITRINE_ARQUIVO_18__
+__VITRINE_ARQUIVO_25__
 mkdir -p ".vscode"
-cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_19__'
+cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_26__'
 {
   // Ctrl+Shift+P → "Tasks: Run Task" para ver estas tarefas.
   // Ctrl+Shift+B roda a tarefa padrão (instalar em modo dev + reiniciar o Nautilus).
@@ -4511,8 +5488,12 @@ cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_19__'
     }
   ]
 }
-__VITRINE_ARQUIVO_19__
-cat > 'README.md' <<'__VITRINE_ARQUIVO_20__'
+__VITRINE_ARQUIVO_26__
+cat > 'README.md' <<'__VITRINE_ARQUIVO_27__'
+<p align="center">
+  <img src="vitrine/assets/nautilus-vitrine-logo.svg" width="96" alt="Logo da Vitrine para Nautilus">
+</p>
+
 # Vitrine para Nautilus
 
 **Modo Colunas, painel de pré-visualização, visualização por pasta e "Meu computador" para o Arquivos (Nautilus) do GNOME, inspirados no Finder do macOS, sem perder nenhuma função nativa.**
@@ -4583,7 +5564,7 @@ O botão **Abrir** usa o aplicativo padrão. O botão 👁 (ou a tecla **Espaço
 - Trocou de visualização numa pasta, com **Ctrl+1** (lista), **Ctrl+2** (ícones), **Ctrl+3** (colunas), os botões ou o menu? A Vitrine **lembra a escolha para aquela pasta**. Pastas sem regra usam o seu padrão.
 - O **zoom dos ícones também é salvo por pasta**: ícones gigantes em *Imagens*, ícones normais em *Downloads*.
 - **Pastas de fotos e vídeos são detectadas automaticamente.** Se a maioria dos arquivos for imagem ou vídeo, a pasta abre em ícones grandes.
-- **Descoberta automática de pastas** (opcional, desligada por padrão): olha o tipo dos arquivos de cada pasta e escolhe a visualização. Maioria de fotos/vídeos → ícones extra grandes; maioria de documentos e outros arquivos → lista; pasta mista ou vazia → o seu padrão. Só lê o nome/extensão de até 200 itens (rápido mesmo em pastas enormes) e guarda o resultado até a pasta mudar. Uma escolha feita à mão numa pasta sempre vence a descoberta. Ligue no menu **Visualização desta pasta** ou em **Personalizar** (✎ no Meu computador).
+- **Descoberta automática de pastas** (opcional, desligada por padrão): olha o tipo dos arquivos de cada pasta e escolhe a visualização. Maioria de fotos/vídeos → ícones extra grandes; maioria de documentos e outros arquivos → lista; pasta mista ou vazia → o seu padrão. Só lê o nome/extensão de até 200 itens (rápido mesmo em pastas enormes) e guarda o resultado até a pasta mudar. Uma escolha feita à mão numa pasta sempre vence a descoberta. Ligue no menu **Visualização desta pasta** ou em **Personalizar** (menu ☰ da linha Meu computador).
 - Na primeira execução, *Imagens* e *Vídeos* já vêm configuradas para ícones grandes, **incluindo as subpastas**.
 - Navegando em colunas, as subpastas continuam em colunas.
 
@@ -4610,9 +5591,11 @@ Abra pela entrada **Meu computador** no topo da barra lateral, com **Ctrl+Shift+
 
 **Dispositivo novo conectado?** Assim que um pen drive, HD externo ou cartão é inserido, aparece um aviso na janela do Nautilus (*"Pen drive conectado — Abrir"*). O card dele ganha o selo **Novo**, fica destacado e já vem **selecionado** na página Meu computador.
 
-A página fecha sozinha quando você navega para qualquer lugar: barra lateral, barra de caminho, Voltar ou busca.
+A página fecha sozinha quando você navega para qualquer lugar: barra lateral, barra de caminho ou busca.
 
-**Personalizar:** o botão ✎ no topo da página (ou clique direito num item → *Personalizar…*) abre uma tela para:
+**Voltar e Avançar funcionam como num navegador.** O Meu computador entra no histórico de cada aba: Meu computador → Imagens → **Voltar** leva de volta ao Meu computador, e **Avançar** volta para Imagens. Vale para os botões ← →, **Alt+←** / **Alt+→** e os botões laterais do mouse. Se o Meu computador for o primeiro lugar da janela, o Voltar fica desativado enquanto ele estiver aberto. Cada aba tem o seu próprio histórico, e trocar de aba mostra o Meu computador se ele for o lugar atual daquela aba.
+
+**Personalizar:** o menu ☰ na linha **Meu computador** da barra lateral (ou clique direito num item → *Personalizar…*) abre uma tela para:
 
 - **Abrir o Nautilus no Meu computador**: ao abrir o Arquivos pelo menu de aplicativos ou numa janela nova (Ctrl+N), ele começa aqui. Se outro programa pedir uma pasta específica, ela é respeitada.
 - Mostrar ou esconder a entrada **Meu computador na barra lateral**.
@@ -4620,6 +5603,8 @@ A página fecha sozinha quando você navega para qualquer lugar: barra lateral, 
 - Escolher quais **seções** aparecem: Pastas, Dispositivos e unidades, Rede e o atalho para o Discos.
 - Escolher **item por item** o que aparece. Também dá para ocultar direto pelo clique direito → *Ocultar do Meu computador*.
 - **Mostrar tudo de novo**, com um clique.
+
+O mesmo menu ☰ tem **Sobre a Vitrine** (versão, link do repositório e créditos), que também aparece no clique direito no fundo de uma pasta.
 
 ---
 
@@ -4633,7 +5618,7 @@ A página fecha sozinha quando você navega para qualquer lugar: barra lateral, 
 ### Opção 1 (recomendada): clonar o repositório
 
 ```bash
-git clone https://github.com/viniciusbispo19/nautilus-vitrine.git
+git clone https://github.com/bispov19/nautilus-vitrine.git
 ```
 
 ```bash
@@ -4657,7 +5642,7 @@ Ele cria a pasta `~/nautilus-vitrine` com todos os arquivos e já instala. Sem `
 O pacote RPM já está pronto (`packaging/nautilus-vitrine.spec`), mas **ainda não foi publicado no COPR**. Quando estiver disponível, a instalação será:
 
 ```
-sudo dnf copr enable viniciusbispo19/nautilus-vitrine
+sudo dnf copr enable bispov19/nautilus-vitrine
 sudo dnf install nautilus-vitrine
 ```
 
@@ -4683,6 +5668,8 @@ O Nautilus volta exatamente ao original. Suas regras ficam guardadas; use `./uni
 | **Ctrl+1** / **Ctrl+2** | Lista / Ícones (nativos do Nautilus, agora lembrados por pasta) |
 | **Ctrl+Shift+P** | Mostrar/ocultar a pré-visualização |
 | **Ctrl+Shift+C** | Abrir/fechar o Meu computador |
+| **Alt+←** / **Alt+→** | Voltar / Avançar (incluindo o Meu computador) |
+| Botões laterais do mouse | Voltar / Avançar |
 | **Espaço** | Visualização rápida (Sushi) |
 | **Ctrl + roda do mouse** | Zoom (salvo por pasta na visualização em ícones) |
 | Clique do meio numa coluna | Abrir a pasta em nova janela |
@@ -4736,6 +5723,7 @@ O Nautilus não tem API pública para novas visualizações ou painéis. Assim c
 - **Nada do Nautilus é reimplementado.** A pasta atual é sempre a lista nativa, e a seleção é lida do próprio `NautilusViewModel`.
 - **Sem referências fortes.** Widgets e modelos do Nautilus nunca são mantidos vivos pela extensão; o modelo de seleção é acompanhado por *weak reference*.
 - **Operações nativas.** Mover, copiar e lixeira passam pela API D-Bus `org.gnome.Nautilus.FileOperations2`, com progresso, conflitos e Desfazer.
+- **Voltar/Avançar com o Meu computador.** O Meu computador fica *por cima* da lista do Nautilus, então o histórico nativo não sabe dele. Cada aba guarda um histórico próprio (`history.py`) em que cada entrada lembra em que ponto do histórico do Nautilus estava. Os botões ← →, os atalhos Alt+←/→ e os botões do mouse passam por esse histórico; quando o destino é uma pasta, a Vitrine pede ao Nautilus o Voltar/Avançar nativo, e quando é o Meu computador, só mostra a página.
 - **Falha segura.** Se uma versão futura do Nautilus mudar a estrutura da janela, a Vitrine simplesmente não se injeta e registra o motivo no log. Exceções em callbacks também viram log, sem derrubar o Nautilus.
 
 ### Estrutura do código
@@ -4749,12 +5737,16 @@ vitrine/
   preview.py            painel de pré-visualização
   imageload.py          carregamento rápido de imagens, cache e pré-carregamento
   computer.py           página Meu computador e monitor de dispositivos
+  history.py            Voltar/Avançar por aba incluindo o Meu computador (sem GTK)
+  about.py              página "Sobre" do diálogo de personalização
+  assets/               logo, ícone simbólico e CSS da página Sobre
   native.py             ponte com o Nautilus (slot, lista/grade, seleção)
   config.py             preferências e regras (JSON)
   util.py               log, varredura de widgets, operações D-Bus
   selftest.py           autoteste dentro do Nautilus real
 tools/
-  smoke_test.py         teste das colunas e do preview fora do Nautilus
+  smoke_test.py         colunas, preview e página Sobre fora do Nautilus
+  test_history.py       testes do histórico de Voltar/Avançar
   build_bootstrap.py    gera o criar-vitrine.sh
 packaging/
   nautilus-vitrine.spec receita do pacote RPM
@@ -4776,11 +5768,17 @@ O projeto inclui tarefas do **VS Code** (*Terminal → Run Task*):
 | Tarefa | O que faz |
 |---|---|
 | **Ctrl+Shift+B** | Instala em modo dev e reinicia o Nautilus |
-| Autoteste dentro do Nautilus | 31 verificações automáticas: injeção, colunas, preview, regras por pasta, zoom, tempo de carregamento das imagens e Meu computador (locais da barra lateral, uso de disco, aviso de dispositivo novo, personalização, abrir direto nele). Roda com regras temporárias; as suas e o zoom são restaurados no fim |
+| Autoteste dentro do Nautilus | Verificações automáticas: injeção, colunas, preview, regras por pasta, zoom, tempo de carregamento das imagens, Meu computador (locais da barra lateral, uso de disco, aviso de dispositivo novo, personalização, página Sobre, abrir direto nele) e Voltar/Avançar. Roda com regras temporárias; as suas e o zoom são restaurados no fim |
 | Rodar em modo depuração | `VITRINE_DEBUG=1 VITRINE_DUMP=1 nautilus` (inclui a árvore de widgets da janela no log) |
 | Acompanhar log | `tail -f ~/.cache/nautilus-vitrine/vitrine.log` |
-| Teste fora do Nautilus | Abre colunas e preview numa janela própria |
+| Teste fora do Nautilus | Abre colunas, preview e a página Sobre numa janela própria |
 | Gerar script único | Atualiza o `criar-vitrine.sh` |
+
+Os testes do histórico de Voltar/Avançar rodam sem o Nautilus:
+
+```bash
+python3 tools/test_history.py
+```
 
 Para rodar o autoteste pelo terminal:
 
@@ -4809,10 +5807,10 @@ O RPM sai em `dist/`; `make install-rpm` instala. A receita fica em `packaging/n
 O COPR gera o pacote direto deste repositório usando `.copr/Makefile`. Configuração única em [copr.fedorainfracloud.org](https://copr.fedorainfracloud.org):
 
 1. Entre com a conta Fedora e crie o projeto `nautilus-vitrine`, marcando os *chroots* `fedora-45-x86_64` e `fedora-44-x86_64` (e outros que quiser).
-2. Em **Packages → New package → SCM**: *Clone URL* `https://github.com/viniciusbispo19/nautilus-vitrine`, *Spec file* `packaging/nautilus-vitrine.spec`, *SRPM build method* **make srpm**.
+2. Em **Packages → New package → SCM**: *Clone URL* `https://github.com/bispov19/nautilus-vitrine`, *Spec file* `packaging/nautilus-vitrine.spec`, *SRPM build method* **make srpm**.
 3. Clique em **Rebuild**. Para gerar automaticamente a cada `git push`, ative o *webhook* do GitHub em **Settings → Integrations** do projeto COPR.
 
-Para lançar uma versão nova: aumente `Version` e acrescente uma entrada no `%changelog` do `.spec` (e o `VERSION` em `vitrine/main.py`), faça o commit e o push.
+Para lançar uma versão nova: aumente `Version` e acrescente uma entrada no `%changelog` do `.spec`, mude `__version__` em `vitrine/__init__.py` para o mesmo número (o `smoke_test.py` avisa se ficarem diferentes), faça o commit e o push.
 
 ---
 
@@ -4828,6 +5826,7 @@ Para lançar uma versão nova: aumente `Version` e acrescente uma entrada no `%c
 - Nas colunas anteriores o menu de clique direito é reduzido. Para o menu completo, use **Mostrar na lista**.
 - O zoom dos ícones é uma preferência global do Nautilus. Ao entrar numa pasta com zoom salvo, outras janelas abertas em ícones acompanham.
 - Locais especiais (Recentes, Favoritos, Lixeira, Rede, Pesquisa) mantêm o comportamento padrão do Nautilus.
+- O menu de histórico do botão ← (clique direito ou toque longo) é do Nautilus e não lista o Meu computador. Escolher um item ali funciona; a Vitrine se realinha sozinha.
 
 ## Próximos passos
 
@@ -4848,8 +5847,8 @@ A técnica de injeção na janela foi inspirada no projeto **[My Computer for Na
 ## Licença
 
 [MIT](LICENSE)
-__VITRINE_ARQUIVO_20__
-cat > 'LICENSE' <<'__VITRINE_ARQUIVO_21__'
+__VITRINE_ARQUIVO_27__
+cat > 'LICENSE' <<'__VITRINE_ARQUIVO_28__'
 MIT License
 
 Copyright (c) 2026 Vitrine para Nautilus contributors
@@ -4875,15 +5874,15 @@ SOFTWARE.
 ---
 Inspired by "My Computer for Nautilus" (https://github.com/yannmasoch/nautilus-my-computer),
 Copyright (c) 2026 Yann Masoch, MIT License.
-__VITRINE_ARQUIVO_21__
-cat > '.gitignore' <<'__VITRINE_ARQUIVO_22__'
+__VITRINE_ARQUIVO_28__
+cat > '.gitignore' <<'__VITRINE_ARQUIVO_29__'
 __pycache__/
 *.pyc
 *.tmp
 dist/
 dist-build.log
-__VITRINE_ARQUIVO_22__
-cat > 'Makefile' <<'__VITRINE_ARQUIVO_23__'
+__VITRINE_ARQUIVO_29__
+cat > 'Makefile' <<'__VITRINE_ARQUIVO_30__'
 # Empacotamento local.  Requer: sudo dnf install make rpm-build python3-devel
 #
 #   make rpm        gera o RPM em dist/
@@ -4917,18 +5916,18 @@ install-rpm:
 
 clean:
 	rm -rf $(DIST)
-__VITRINE_ARQUIVO_23__
+__VITRINE_ARQUIVO_30__
 mkdir -p "packaging"
-cat > 'packaging/nautilus-vitrine.spec' <<'__VITRINE_ARQUIVO_24__'
+cat > 'packaging/nautilus-vitrine.spec' <<'__VITRINE_ARQUIVO_31__'
 %global extdir %{_datadir}/nautilus-python/extensions
 
 Name:           nautilus-vitrine
-Version:        0.2.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Column view, preview pane and per-folder views for GNOME Files (Nautilus)
 
 License:        MIT
-URL:            https://github.com/viniciusbispo19/nautilus-vitrine
+URL:            https://github.com/bispov19/nautilus-vitrine
 Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 
 BuildArch:      noarch
@@ -4963,6 +5962,8 @@ Vitrine adds three Finder-inspired features to GNOME Files (Nautilus 50/51):
 install -d %{buildroot}%{extdir}/vitrine
 install -p -m 0644 nautilus-vitrine.py %{buildroot}%{extdir}/
 install -p -m 0644 vitrine/*.py %{buildroot}%{extdir}/vitrine/
+install -d %{buildroot}%{extdir}/vitrine/assets
+install -p -m 0644 vitrine/assets/* %{buildroot}%{extdir}/vitrine/assets/
 %py_byte_compile %{python3} %{buildroot}%{extdir}/vitrine
 
 %files
@@ -4972,6 +5973,12 @@ install -p -m 0644 vitrine/*.py %{buildroot}%{extdir}/vitrine/
 %{extdir}/vitrine/
 
 %changelog
+* Sun Nov 22 2026 Vinicius Bispo - 0.3.0-1
+- Voltar/Avançar levam de volta ao Meu computador (histórico próprio por aba)
+- Menu ☰ na linha "Meu computador" da barra lateral (Personalizar e Sobre)
+- Página "Sobre" com logo, versão, links e créditos
+- Logo e ícone simbólico da Vitrine
+
 * Wed Nov 11 2026 Vinicius Bispo - 0.2.0-1
 - Página "Meu computador" com pastas, discos e uso de espaço
 - Aviso ao conectar pen drive, HD externo ou cartão, com botão Abrir
@@ -4980,9 +5987,9 @@ install -p -m 0644 vitrine/*.py %{buildroot}%{extdir}/vitrine/
 
 * Wed Nov 11 2026 Vinicius Bispo - 0.1.0-1
 - Primeira versão: modo Colunas, painel de pré-visualização e visualização por pasta
-__VITRINE_ARQUIVO_24__
+__VITRINE_ARQUIVO_31__
 mkdir -p ".copr"
-cat > '.copr/Makefile' <<'__VITRINE_ARQUIVO_25__'
+cat > '.copr/Makefile' <<'__VITRINE_ARQUIVO_32__'
 # Usado pelo COPR (método "make srpm"): gera o SRPM direto do repositório git.
 # O COPR chama:  make -f .copr/Makefile srpm outdir=<pasta> spec=<arquivo .spec>
 SPEC := packaging/nautilus-vitrine.spec
@@ -4997,7 +6004,7 @@ srpm:
 	rpmbuild -bs $(SPEC) \
 		--define "_sourcedir $(outdir)" \
 		--define "_srcrpmdir $(outdir)"
-__VITRINE_ARQUIVO_25__
+__VITRINE_ARQUIVO_32__
 
 chmod +x install.sh uninstall.sh
 echo "Projeto criado em $TARGET"

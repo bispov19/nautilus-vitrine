@@ -9,12 +9,16 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 from . import discovery, native
 from .columns import ColumnStrip
 from .computer import ComputerPage
+from .history import History
 from .preview import PreviewPane
-from .util import ancestor, debug, dump_tree, find_by_type_name, find_first, gtype_name, guarded, log
+from .util import (ancestor, debug, dump_tree, find_by_type_name, find_first, gtype_name, guarded,
+                   log, walk)
 
 _MOD_MASK = (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
              | Gdk.ModifierType.ALT_MASK | Gdk.ModifierType.SUPER_MASK)
 _MEDIA_SAMPLE = 250
+_NATIVE_STEP_TIMEOUT_MS = 4000   # o Nautilus não respondeu a um Voltar/Avançar pedido
+_LEAVE_FALLBACK_MS = 1500        # saiu do Meu computador e o Nautilus não navegou
 
 
 class WindowController:
@@ -41,6 +45,11 @@ class WindowController:
         self.sidebar_list: Gtk.ListBox | None = None
         self._computer_visible = False
         self.toasts_shown = 0
+        self.actions: Gio.SimpleActionGroup | None = None
+        self._native_forward_probe: Gtk.Button | None = None
+        self._nautilus_prefs = Gio.Settings.new("org.gnome.nautilus.preferences")
+        self._mouse_takeover = False
+        self._leave_source = 0
 
     # ───────────────────────── injeção ─────────────────────────
     def inject(self) -> bool:
@@ -84,6 +93,11 @@ class WindowController:
         self.content_stack.set_visible_child_name("tabs")
         inner.append(self.strip)
         inner.append(self.content_stack)
+        # Sonda invisível: o GTK deixa um botão ligado a uma ação sensível ou não conforme
+        # a ação está ativa. Assim sabemos se o Avançar *nativo* está ativo (usado pelo
+        # plano B do histórico), já que os botões ← → visíveis passam a usar nossas ações.
+        self._native_forward_probe = Gtk.Button(action_name="slot.forward", visible=False)
+        inner.append(self._native_forward_probe)
 
         self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         self.paned.set_wide_handle(False)
@@ -97,9 +111,11 @@ class WindowController:
         self.paned.connect("notify::position", self._on_paned_pos)
         toolbar.set_content(self.paned)
 
+        self._install_actions()
         self._inject_buttons()
         self._inject_sidebar_row()
         self._install_keys()
+        self._take_over_history()
 
         tv.connect("notify::selected-page", self._on_tab_switched)
         tv.connect("page-attached", lambda _tv, page, _pos: self._watch_slot(page.get_child()))
@@ -120,8 +136,12 @@ class WindowController:
         slot = self.active_slot()
         if slot is not None:
             self._on_slot_location(slot)
-        if self.should_start_on_computer(native.slot_uri(slot)):
-            self.show_computer(True)
+        if slot is not None and self.should_start_on_computer(native.slot_uri(slot)):
+            # O Meu computador *substitui* a pasta pessoal como primeiro lugar da aba,
+            # então o Voltar fica desativado, como no Nautilus quando não há para onde voltar.
+            self.history(slot).start_on_computer()
+            self._display_computer(True)
+            self._update_history_actions()
             log("janela aberta direto no Meu computador")
         return GLib.SOURCE_REMOVE
 
@@ -161,6 +181,7 @@ class WindowController:
         box = Gtk.Box(spacing=12)
         box.append(Gtk.Image.new_from_icon_name("computer-symbolic"))
         box.append(Gtk.Label(label="Meu computador", xalign=0, hexpand=True))
+        box.append(self._sidebar_menu_button())
         row.set_child(box)
         lb.append(row)
         lb.connect("row-activated", lambda *_a: self.show_computer(True))
@@ -168,22 +189,107 @@ class WindowController:
         self.sidebar_list = lb
         lb.set_visible(bool(self.cfg.get("computer_in_sidebar")))
 
-        # Clicar em qualquer local nativo da barra lateral sai do Meu computador,
-        # mesmo que seja a pasta onde a aba já está (aí o Nautilus não navega).
+        # Clicar em qualquer local nativo da barra lateral sai do Meu computador.
+        # (A nossa linha está *ao lado* da NautilusSidebar, numa barra superior do
+        # AdwToolbarView, e não dentro dela: este gesto nunca vê cliques no ☰.)
         click = Gtk.GestureClick.new()
         click.set_button(Gdk.BUTTON_PRIMARY)
         click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        click.connect("released", lambda *_a: GLib.idle_add(self._leave_computer_if_visible))
+        click.connect("released", self._on_sidebar_click, sidebar)
         sidebar.add_controller(click)
 
-    def _leave_computer_if_visible(self) -> bool:
-        if self._computer_visible:
-            self.show_computer(False)
+    def _sidebar_menu_button(self) -> Gtk.MenuButton:
+        """☰ encostado à direita da linha, onde o Nautilus põe o ⏏ dos dispositivos.
+
+        Não ativa a linha nem muda a seleção: ao receber o clique, o botão *reivindica*
+        a sequência do evento (EventSequenceState.CLAIMED) e o GTK cancela os gestos dos
+        widgets acima dele, inclusive o do ListBox que ativaria/selecionaria a linha."""
+        menu = Gio.Menu()
+        menu.append("Personalizar o Meu computador…", "vitrine.customize")
+        menu.append("Sobre a Vitrine", "vitrine.about")
+        btn = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu,
+                             valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER,
+                             tooltip_text="Opções do Meu computador")
+        btn.set_margin_start(4)
+        # Mesma classe do botão ⏏ nativo (nautilus-sidebar-row.ui): o CSS do próprio
+        # Nautilus deixa o botão igual aos nativos nos temas claro e escuro.
+        btn.add_css_class("sidebar-button")
+        btn.set_focus_on_click(False)
+        return btn
+
+    @guarded
+    def _on_sidebar_click(self, _gesture, _n, x, y, sidebar) -> None:
+        if not self._computer_visible:
+            return
+        picked = sidebar.pick(x, y, Gtk.PickFlags.DEFAULT)
+        row = ancestor(picked, lambda w: gtype_name(w) == "NautilusSidebarRow") if picked else None
+        uri = None
+        if row is not None:
+            try:
+                uri = row.get_property("uri")
+            except TypeError:
+                uri = None
+        if row is None:
+            return  # clique fora de um local (área vazia, título de seção)
+        GLib.idle_add(self._leave_computer_towards, uri)
+
+    def _leave_computer_towards(self, uri: str | None) -> bool:
+        """Sai do Meu computador indo para `uri` (que o Nautilus está abrindo, ou não)."""
+        slot = self.active_slot()
+        if slot is None or not self._computer_visible:
+            return GLib.SOURCE_REMOVE
+        if uri and self._same_as_native(slot, uri):
+            # O Nautilus não navega para a pasta que já está aberta: registramos nós.
+            self.history(slot).leave_computer_in_place(native.slot_uri(slot))
+            self._display_computer(False)
+            self._update_history_actions()
+        else:
+            self._display_computer(False)
+            self._expect_navigation(slot)
         return GLib.SOURCE_REMOVE
+
+    @staticmethod
+    def _same_as_native(slot, uri: str) -> bool:
+        loc = native.slot_location(slot)
+        return loc is not None and loc.equal(Gio.File.new_for_uri(uri))
+
+    def _expect_navigation(self, slot) -> None:
+        """Escondemos a página e o Nautilus vai navegar; o `notify::location` registra a
+        entrada. Se ele não navegar (erro, pasta inacessível), registramos que saímos
+        do Meu computador para a pasta que já estava por baixo."""
+        if self._leave_source:
+            GLib.source_remove(self._leave_source)
+
+        def fallback():
+            self._leave_source = 0
+            h = self.history(slot)
+            if h.on_computer() and not (slot is self.active_slot() and self._computer_visible):
+                h.leave_computer_in_place(native.slot_uri(slot))
+                self._update_history_actions()
+            return GLib.SOURCE_REMOVE
+
+        self._leave_source = GLib.timeout_add(_LEAVE_FALLBACK_MS, fallback)
 
     # ───────────────────────── Meu computador ─────────────────────────
     def show_computer(self, on: bool = True) -> None:
+        """Abrir/fechar o Meu computador por escolha do usuário (barra lateral, atalho,
+        menu): registra no histórico da aba e mostra/esconde a página."""
+        slot = self.active_slot()
+        if slot is None:
+            return
+        h = self.history(slot)
+        if on:
+            h.open_computer()
+        elif h.on_computer():
+            h.leave_computer_in_place(native.slot_uri(slot))
+        self._display_computer(on)
+        self._update_history_actions()
+
+    def _display_computer(self, on: bool) -> None:
+        """Só a parte visual: troca entre a lista do Nautilus e a página Meu computador."""
         if self.content_stack is None or self.computer is None:
+            return
+        if on == self._computer_visible:
             return
         self._computer_visible = on
         self.content_stack.set_visible_child_name("computer" if on else "tabs")
@@ -212,8 +318,175 @@ class WindowController:
         return self._computer_visible
 
     def leave_computer_and_open(self, uri: str) -> None:
-        self.show_computer(False)
+        """Abrir um item da página (pasta, disco, dispositivo recém-montado)."""
+        slot = self.active_slot()
+        if slot is None:
+            return
+        h = self.history(slot)
+        if h.on_computer() and self._same_as_native(slot, uri):
+            h.leave_computer_in_place(native.slot_uri(slot))
+            self._display_computer(False)
+            self._update_history_actions()
+            return
+        self._display_computer(False)
+        if h.on_computer():
+            self._expect_navigation(slot)
         self.navigate(uri)
+
+    def open_settings(self, page: str = "customize") -> None:
+        """Diálogo de personalização, já na página pedida ("customize" ou "about")."""
+        if self.computer is not None:
+            self.computer.open_settings(page)
+
+    # ───────────────────────── Voltar / Avançar ─────────────────────────
+    def history(self, slot) -> History:
+        """Histórico da aba (cada aba tem o seu, guardado no próprio slot)."""
+        h = getattr(slot, "_vitrine_history", None)
+        if h is None:
+            h = History()
+            slot._vitrine_history = h
+            uri = native.slot_uri(slot)
+            if uri:
+                h.on_location(uri)
+        return h
+
+    def _install_actions(self) -> None:
+        """Ações da Vitrine nesta janela, com o prefixo "vitrine." (menus, botões ← →,
+        atalhos)."""
+        group = Gio.SimpleActionGroup()
+
+        def add(name, cb):
+            act = Gio.SimpleAction.new(name, None)
+            act.connect("activate", lambda *_a: cb())
+            group.add_action(act)
+
+        add("customize", lambda: self.open_settings("customize"))
+        add("about", lambda: self.open_settings("about"))
+        add("back", lambda: self.go_history(-1))
+        add("forward", lambda: self.go_history(+1))
+        self.win.insert_action_group("vitrine", group)
+        self.actions = group
+
+    def _take_over_history(self) -> None:
+        """Faz todas as formas de Voltar/Avançar passarem pelo histórico da Vitrine.
+
+        Nautilus 51: ações slot.back/slot.forward (não existe win.back), atalhos
+        Alt+←/→ e teclas Back/Forward, botões 8/9 do mouse num gesto próprio da janela
+        e nenhum gesto de deslizar no touchpad. Cada ponto é trocado de forma
+        determinística (sem depender da ordem em que o GTK entrega os eventos)."""
+        n = self._take_over_buttons()
+        app = self.win.get_application()
+        if app is not None:
+            for nat, ours in (("slot.back", "vitrine.back"), ("slot.forward", "vitrine.forward")):
+                accels = app.get_accels_for_action(nat)
+                if accels:
+                    # Fica só na memória (não é salvo); reaplicado a cada janela nova.
+                    app.set_accels_for_action(ours, accels)
+                    app.set_accels_for_action(nat, [])
+            log(f"histórico: {n} botões ← →, atalhos {app.get_accels_for_action('vitrine.back')}")
+        self._take_over_mouse()
+        self._update_history_actions()
+
+    def _take_over_buttons(self) -> int:
+        """Botões ← → do cabeçalho e da barra inferior (janela estreita) passam a usar as
+        nossas ações. Bônus: o GTK ativa/desativa o botão conforme a ação, então o
+        estado deles reflete o histórico combinado sem código extra."""
+        n = 0
+        for nat, ours in (("slot.back", "vitrine.back"), ("slot.forward", "vitrine.forward")):
+            for w in walk(self.win):
+                if isinstance(w, Gtk.Button) and w is not self._native_forward_probe \
+                        and w.get_action_name() == nat:
+                    w.set_action_name(ours)
+                    n += 1
+        return n
+
+    def _take_over_mouse(self) -> None:
+        """Botões laterais do mouse. O Nautilus os trata num GestureClick (todos os
+        botões, fase de captura) na própria janela e navega direto, sem passar pela ação.
+        Desligamos só esse gesto (fase NONE, nada é salvo) e pomos o nosso no lugar.
+        Se não acharmos exatamente um, não mexemos em nada."""
+        found = []
+        controllers = self.win.observe_controllers()
+        for i in range(controllers.get_n_items()):
+            c = controllers.get_item(i)
+            if (isinstance(c, Gtk.GestureClick) and c.get_button() == 0
+                    and c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE):
+                found.append(c)
+        if len(found) != 1:
+            log(f"histórico: gesto do mouse do Nautilus não identificado ({len(found)}); "
+                "botões 8/9 ficam com o Nautilus")
+            return
+        found[0].set_propagation_phase(Gtk.PropagationPhase.NONE)
+        ours = Gtk.GestureClick.new()
+        ours.set_button(0)
+        ours.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        ours.connect("pressed", self._on_mouse_button)
+        self.win.add_controller(ours)
+        self._mouse_takeover = True
+
+    @guarded
+    def _on_mouse_button(self, gesture, _n, _x, _y) -> None:
+        prefs = self._nautilus_prefs
+        if not prefs.get_boolean("mouse-use-extra-buttons"):
+            return
+        button = gesture.get_current_button()
+        if button == prefs.get_uint("mouse-back-button"):
+            delta = -1
+        elif button == prefs.get_uint("mouse-forward-button"):
+            delta = +1
+        else:
+            return
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        self.go_history(delta)
+
+    def go_history(self, delta: int) -> None:
+        slot = self.active_slot()
+        if slot is None:
+            return
+        h = self.history(slot)
+        step = h.back() if delta < 0 else h.forward()
+        if step is None:
+            return
+        debug(f"histórico {'voltar' if delta < 0 else 'avançar'}: {h.entries} idx={h.idx} "
+              f"nativo={step.native}")
+        self._display_computer(step.show_computer)
+        if step.native:
+            self._native_step(slot, step.native)
+        self._update_history_actions()
+
+    def _native_step(self, slot, sign: int) -> None:
+        slot.activate_action("slot.back" if sign < 0 else "slot.forward", None)
+        h = self.history(slot)
+        before = h.pending
+
+        def timeout():
+            if h.pending == before and h.pending:
+                log("histórico: o Nautilus não respondeu ao Voltar/Avançar; desistindo")
+                h.cancel_pending()
+                self._update_history_actions()
+            return GLib.SOURCE_REMOVE
+
+        GLib.timeout_add(_NATIVE_STEP_TIMEOUT_MS, timeout)
+
+    def _update_history_actions(self) -> None:
+        if self.actions is None:
+            return
+        slot = self.active_slot()
+        h = self.history(slot) if slot is not None else None
+        self.actions.lookup_action("back").set_enabled(bool(h and h.can_back()))
+        self.actions.lookup_action("forward").set_enabled(bool(h and h.can_forward()))
+
+    def _check_hidden_native_back(self, slot, uri: str) -> bool:
+        """Plano B: depois de uma navegação nova o Avançar nativo fica sempre desativado.
+        Se ele estiver ativo, o Nautilus voltou sem passar por nós (ex.: menu de
+        histórico do botão ←)."""
+        probe = self._native_forward_probe
+        if (slot is self.active_slot() and probe is not None and probe.get_sensitive()
+                and native.slot_uri(slot) == uri
+                and self.history(slot).native_went_back(uri)):
+            debug(f"histórico: Voltar nativo detectado, realinhado em {uri}")
+            self._update_history_actions()
+        return GLib.SOURCE_REMOVE
 
     def preview_location(self, uri: str | None) -> None:
         if self.preview is None or not self.preview.get_visible():
@@ -326,8 +599,15 @@ class WindowController:
         slot = self.active_slot()
         if slot is None:
             return
+        # O Meu computador pertence à aba: aparece se for o lugar atual desta aba.
+        # Os botões ← → podem ter sido religados pelo Nautilus; garantimos de novo.
+        self._take_over_buttons()
+        self._update_history_actions()
+        if self.history(slot).on_computer():
+            self._display_computer(True)
+            return
         if self._computer_visible:
-            self.show_computer(False)
+            self._display_computer(False)
             return
         self._set_columns_visible(getattr(slot, "_vitrine_mode", None) == "columns")
         self._sync_active_ui(slot)
@@ -337,11 +617,25 @@ class WindowController:
         uri = native.slot_uri(slot)
         if uri is None:
             return
+        h = getattr(slot, "_vitrine_history", None)
+        if h is None:
+            self.history(slot)  # primeira vez: já registra `uri`
+            result = "new"
+        else:
+            result = h.on_location(uri)
+        if result == "step":
+            # Diferença de mais de um passo: pede o próximo depois que este terminou.
+            GLib.idle_add(self._native_step, slot, h.pending)
+            return
         self.ext.suppress()
         if slot is self.active_slot():
             if self._computer_visible:
-                self.show_computer(False)  # navegou (barra de caminho, voltar, busca…)
+                self._display_computer(False)  # navegou (barra de caminho, busca…)
             self._sync_active_ui(slot)
+            self._update_history_actions()
+            if result == "new":
+                # Dá tempo ao Nautilus de atualizar o estado do Avançar nativo.
+                GLib.timeout_add(150, self._check_hidden_native_back, slot, uri)
         GLib.idle_add(self._apply_rule_for_slot, slot, uri, priority=GLib.PRIORITY_LOW)
 
     def _sync_active_ui(self, slot) -> None:

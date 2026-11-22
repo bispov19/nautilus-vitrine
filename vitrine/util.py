@@ -14,6 +14,7 @@ gi.require_version("Gdk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, GObject, Gtk  # noqa: E402
 
+ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 LOG_DIR = os.path.join(GLib.get_user_cache_dir(), "nautilus-vitrine")
 LOG_PATH = os.path.join(LOG_DIR, "vitrine.log")
 DEBUG = os.environ.get("VITRINE_DEBUG", "") not in ("", "0")

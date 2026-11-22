@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="vitrine/assets/nautilus-vitrine-logo.svg" width="96" alt="Logo da Vitrine para Nautilus">
+</p>
+
 # Vitrine para Nautilus
 
 **Modo Colunas, painel de pré-visualização, visualização por pasta e "Meu computador" para o Arquivos (Nautilus) do GNOME, inspirados no Finder do macOS, sem perder nenhuma função nativa.**
@@ -68,7 +72,7 @@ O botão **Abrir** usa o aplicativo padrão. O botão 👁 (ou a tecla **Espaço
 - Trocou de visualização numa pasta, com **Ctrl+1** (lista), **Ctrl+2** (ícones), **Ctrl+3** (colunas), os botões ou o menu? A Vitrine **lembra a escolha para aquela pasta**. Pastas sem regra usam o seu padrão.
 - O **zoom dos ícones também é salvo por pasta**: ícones gigantes em *Imagens*, ícones normais em *Downloads*.
 - **Pastas de fotos e vídeos são detectadas automaticamente.** Se a maioria dos arquivos for imagem ou vídeo, a pasta abre em ícones grandes.
-- **Descoberta automática de pastas** (opcional, desligada por padrão): olha o tipo dos arquivos de cada pasta e escolhe a visualização. Maioria de fotos/vídeos → ícones extra grandes; maioria de documentos e outros arquivos → lista; pasta mista ou vazia → o seu padrão. Só lê o nome/extensão de até 200 itens (rápido mesmo em pastas enormes) e guarda o resultado até a pasta mudar. Uma escolha feita à mão numa pasta sempre vence a descoberta. Ligue no menu **Visualização desta pasta** ou em **Personalizar** (✎ no Meu computador).
+- **Descoberta automática de pastas** (opcional, desligada por padrão): olha o tipo dos arquivos de cada pasta e escolhe a visualização. Maioria de fotos/vídeos → ícones extra grandes; maioria de documentos e outros arquivos → lista; pasta mista ou vazia → o seu padrão. Só lê o nome/extensão de até 200 itens (rápido mesmo em pastas enormes) e guarda o resultado até a pasta mudar. Uma escolha feita à mão numa pasta sempre vence a descoberta. Ligue no menu **Visualização desta pasta** ou em **Personalizar** (menu ☰ da linha Meu computador).
 - Na primeira execução, *Imagens* e *Vídeos* já vêm configuradas para ícones grandes, **incluindo as subpastas**.
 - Navegando em colunas, as subpastas continuam em colunas.
 
@@ -95,9 +99,11 @@ Abra pela entrada **Meu computador** no topo da barra lateral, com **Ctrl+Shift+
 
 **Dispositivo novo conectado?** Assim que um pen drive, HD externo ou cartão é inserido, aparece um aviso na janela do Nautilus (*"Pen drive conectado — Abrir"*). O card dele ganha o selo **Novo**, fica destacado e já vem **selecionado** na página Meu computador.
 
-A página fecha sozinha quando você navega para qualquer lugar: barra lateral, barra de caminho, Voltar ou busca.
+A página fecha sozinha quando você navega para qualquer lugar: barra lateral, barra de caminho ou busca.
 
-**Personalizar:** o botão ✎ no topo da página (ou clique direito num item → *Personalizar…*) abre uma tela para:
+**Voltar e Avançar funcionam como num navegador.** O Meu computador entra no histórico de cada aba: Meu computador → Imagens → **Voltar** leva de volta ao Meu computador, e **Avançar** volta para Imagens. Vale para os botões ← →, **Alt+←** / **Alt+→** e os botões laterais do mouse. Se o Meu computador for o primeiro lugar da janela, o Voltar fica desativado enquanto ele estiver aberto. Cada aba tem o seu próprio histórico, e trocar de aba mostra o Meu computador se ele for o lugar atual daquela aba.
+
+**Personalizar:** o menu ☰ na linha **Meu computador** da barra lateral (ou clique direito num item → *Personalizar…*) abre uma tela para:
 
 - **Abrir o Nautilus no Meu computador**: ao abrir o Arquivos pelo menu de aplicativos ou numa janela nova (Ctrl+N), ele começa aqui. Se outro programa pedir uma pasta específica, ela é respeitada.
 - Mostrar ou esconder a entrada **Meu computador na barra lateral**.
@@ -105,6 +111,8 @@ A página fecha sozinha quando você navega para qualquer lugar: barra lateral, 
 - Escolher quais **seções** aparecem: Pastas, Dispositivos e unidades, Rede e o atalho para o Discos.
 - Escolher **item por item** o que aparece. Também dá para ocultar direto pelo clique direito → *Ocultar do Meu computador*.
 - **Mostrar tudo de novo**, com um clique.
+
+O mesmo menu ☰ tem **Sobre a Vitrine** (versão, link do repositório e créditos), que também aparece no clique direito no fundo de uma pasta.
 
 ---
 
@@ -118,7 +126,7 @@ A página fecha sozinha quando você navega para qualquer lugar: barra lateral, 
 ### Opção 1 (recomendada): clonar o repositório
 
 ```bash
-git clone https://github.com/viniciusbispo19/nautilus-vitrine.git
+git clone https://github.com/bispov19/nautilus-vitrine.git
 ```
 
 ```bash
@@ -142,7 +150,7 @@ Ele cria a pasta `~/nautilus-vitrine` com todos os arquivos e já instala. Sem `
 O pacote RPM já está pronto (`packaging/nautilus-vitrine.spec`), mas **ainda não foi publicado no COPR**. Quando estiver disponível, a instalação será:
 
 ```
-sudo dnf copr enable viniciusbispo19/nautilus-vitrine
+sudo dnf copr enable bispov19/nautilus-vitrine
 sudo dnf install nautilus-vitrine
 ```
 
@@ -168,6 +176,8 @@ O Nautilus volta exatamente ao original. Suas regras ficam guardadas; use `./uni
 | **Ctrl+1** / **Ctrl+2** | Lista / Ícones (nativos do Nautilus, agora lembrados por pasta) |
 | **Ctrl+Shift+P** | Mostrar/ocultar a pré-visualização |
 | **Ctrl+Shift+C** | Abrir/fechar o Meu computador |
+| **Alt+←** / **Alt+→** | Voltar / Avançar (incluindo o Meu computador) |
+| Botões laterais do mouse | Voltar / Avançar |
 | **Espaço** | Visualização rápida (Sushi) |
 | **Ctrl + roda do mouse** | Zoom (salvo por pasta na visualização em ícones) |
 | Clique do meio numa coluna | Abrir a pasta em nova janela |
@@ -221,6 +231,7 @@ O Nautilus não tem API pública para novas visualizações ou painéis. Assim c
 - **Nada do Nautilus é reimplementado.** A pasta atual é sempre a lista nativa, e a seleção é lida do próprio `NautilusViewModel`.
 - **Sem referências fortes.** Widgets e modelos do Nautilus nunca são mantidos vivos pela extensão; o modelo de seleção é acompanhado por *weak reference*.
 - **Operações nativas.** Mover, copiar e lixeira passam pela API D-Bus `org.gnome.Nautilus.FileOperations2`, com progresso, conflitos e Desfazer.
+- **Voltar/Avançar com o Meu computador.** O Meu computador fica *por cima* da lista do Nautilus, então o histórico nativo não sabe dele. Cada aba guarda um histórico próprio (`history.py`) em que cada entrada lembra em que ponto do histórico do Nautilus estava. Os botões ← →, os atalhos Alt+←/→ e os botões do mouse passam por esse histórico; quando o destino é uma pasta, a Vitrine pede ao Nautilus o Voltar/Avançar nativo, e quando é o Meu computador, só mostra a página.
 - **Falha segura.** Se uma versão futura do Nautilus mudar a estrutura da janela, a Vitrine simplesmente não se injeta e registra o motivo no log. Exceções em callbacks também viram log, sem derrubar o Nautilus.
 
 ### Estrutura do código
@@ -234,12 +245,16 @@ vitrine/
   preview.py            painel de pré-visualização
   imageload.py          carregamento rápido de imagens, cache e pré-carregamento
   computer.py           página Meu computador e monitor de dispositivos
+  history.py            Voltar/Avançar por aba incluindo o Meu computador (sem GTK)
+  about.py              página "Sobre" do diálogo de personalização
+  assets/               logo, ícone simbólico e CSS da página Sobre
   native.py             ponte com o Nautilus (slot, lista/grade, seleção)
   config.py             preferências e regras (JSON)
   util.py               log, varredura de widgets, operações D-Bus
   selftest.py           autoteste dentro do Nautilus real
 tools/
-  smoke_test.py         teste das colunas e do preview fora do Nautilus
+  smoke_test.py         colunas, preview e página Sobre fora do Nautilus
+  test_history.py       testes do histórico de Voltar/Avançar
   build_bootstrap.py    gera o criar-vitrine.sh
 packaging/
   nautilus-vitrine.spec receita do pacote RPM
@@ -261,11 +276,17 @@ O projeto inclui tarefas do **VS Code** (*Terminal → Run Task*):
 | Tarefa | O que faz |
 |---|---|
 | **Ctrl+Shift+B** | Instala em modo dev e reinicia o Nautilus |
-| Autoteste dentro do Nautilus | 31 verificações automáticas: injeção, colunas, preview, regras por pasta, zoom, tempo de carregamento das imagens e Meu computador (locais da barra lateral, uso de disco, aviso de dispositivo novo, personalização, abrir direto nele). Roda com regras temporárias; as suas e o zoom são restaurados no fim |
+| Autoteste dentro do Nautilus | Verificações automáticas: injeção, colunas, preview, regras por pasta, zoom, tempo de carregamento das imagens, Meu computador (locais da barra lateral, uso de disco, aviso de dispositivo novo, personalização, página Sobre, abrir direto nele) e Voltar/Avançar. Roda com regras temporárias; as suas e o zoom são restaurados no fim |
 | Rodar em modo depuração | `VITRINE_DEBUG=1 VITRINE_DUMP=1 nautilus` (inclui a árvore de widgets da janela no log) |
 | Acompanhar log | `tail -f ~/.cache/nautilus-vitrine/vitrine.log` |
-| Teste fora do Nautilus | Abre colunas e preview numa janela própria |
+| Teste fora do Nautilus | Abre colunas, preview e a página Sobre numa janela própria |
 | Gerar script único | Atualiza o `criar-vitrine.sh` |
+
+Os testes do histórico de Voltar/Avançar rodam sem o Nautilus:
+
+```bash
+python3 tools/test_history.py
+```
 
 Para rodar o autoteste pelo terminal:
 
@@ -294,10 +315,10 @@ O RPM sai em `dist/`; `make install-rpm` instala. A receita fica em `packaging/n
 O COPR gera o pacote direto deste repositório usando `.copr/Makefile`. Configuração única em [copr.fedorainfracloud.org](https://copr.fedorainfracloud.org):
 
 1. Entre com a conta Fedora e crie o projeto `nautilus-vitrine`, marcando os *chroots* `fedora-45-x86_64` e `fedora-44-x86_64` (e outros que quiser).
-2. Em **Packages → New package → SCM**: *Clone URL* `https://github.com/viniciusbispo19/nautilus-vitrine`, *Spec file* `packaging/nautilus-vitrine.spec`, *SRPM build method* **make srpm**.
+2. Em **Packages → New package → SCM**: *Clone URL* `https://github.com/bispov19/nautilus-vitrine`, *Spec file* `packaging/nautilus-vitrine.spec`, *SRPM build method* **make srpm**.
 3. Clique em **Rebuild**. Para gerar automaticamente a cada `git push`, ative o *webhook* do GitHub em **Settings → Integrations** do projeto COPR.
 
-Para lançar uma versão nova: aumente `Version` e acrescente uma entrada no `%changelog` do `.spec` (e o `VERSION` em `vitrine/main.py`), faça o commit e o push.
+Para lançar uma versão nova: aumente `Version` e acrescente uma entrada no `%changelog` do `.spec`, mude `__version__` em `vitrine/__init__.py` para o mesmo número (o `smoke_test.py` avisa se ficarem diferentes), faça o commit e o push.
 
 ---
 
@@ -313,6 +334,7 @@ Para lançar uma versão nova: aumente `Version` e acrescente uma entrada no `%c
 - Nas colunas anteriores o menu de clique direito é reduzido. Para o menu completo, use **Mostrar na lista**.
 - O zoom dos ícones é uma preferência global do Nautilus. Ao entrar numa pasta com zoom salvo, outras janelas abertas em ícones acompanham.
 - Locais especiais (Recentes, Favoritos, Lixeira, Rede, Pesquisa) mantêm o comportamento padrão do Nautilus.
+- O menu de histórico do botão ← (clique direito ou toque longo) é do Nautilus e não lista o Meu computador. Escolher um item ali funciona; a Vitrine se realinha sozinha.
 
 ## Próximos passos
 
