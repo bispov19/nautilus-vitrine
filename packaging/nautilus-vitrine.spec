@@ -1,12 +1,12 @@
 %global extdir %{_datadir}/nautilus-python/extensions
 
 Name:           nautilus-vitrine
-Version:        0.2.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Column view, preview pane and per-folder views for GNOME Files (Nautilus)
 
 License:        MIT
-URL:            https://github.com/viniciusbispo19/nautilus-vitrine
+URL:            https://github.com/bispov19/nautilus-vitrine
 Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 
 BuildArch:      noarch
@@ -41,6 +41,8 @@ Vitrine adds three Finder-inspired features to GNOME Files (Nautilus 50/51):
 install -d %{buildroot}%{extdir}/vitrine
 install -p -m 0644 nautilus-vitrine.py %{buildroot}%{extdir}/
 install -p -m 0644 vitrine/*.py %{buildroot}%{extdir}/vitrine/
+install -d %{buildroot}%{extdir}/vitrine/assets
+install -p -m 0644 vitrine/assets/* %{buildroot}%{extdir}/vitrine/assets/
 %py_byte_compile %{python3} %{buildroot}%{extdir}/vitrine
 
 %files
@@ -50,6 +52,12 @@ install -p -m 0644 vitrine/*.py %{buildroot}%{extdir}/vitrine/
 %{extdir}/vitrine/
 
 %changelog
+* Sun Nov 22 2026 Vinicius Bispo - 0.3.0-1
+- Voltar/Avançar levam de volta ao Meu computador (histórico próprio por aba)
+- Menu ☰ na linha "Meu computador" da barra lateral (Personalizar e Sobre)
+- Página "Sobre" com logo, versão, links e créditos
+- Logo e ícone simbólico da Vitrine
+
 * Wed Nov 11 2026 Vinicius Bispo - 0.2.0-1
 - Página "Meu computador" com pastas, discos e uso de espaço
 - Aviso ao conectar pen drive, HD externo ou cartão, com botão Abrir

@@ -10,6 +10,7 @@ import time
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
 
 from . import native, util
+from .about import build_about_page
 from .util import guarded, log
 
 FS_ATTRS = "filesystem::size,filesystem::free,filesystem::type,filesystem::readonly"
@@ -286,17 +287,10 @@ class ComputerPage(Gtk.ScrolledWindow):
         title.add_css_class("title-1")
         subtitle = Gtk.Label(label=f"{socket.gethostname()} · {_os_name()}", xalign=0)
         subtitle.add_css_class("dim-label")
-        head_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
-        head_text.append(title)
-        head_text.append(subtitle)
-        customize = Gtk.Button(icon_name="document-edit-symbolic", valign=Gtk.Align.CENTER,
-                               tooltip_text="Personalizar o Meu computador")
-        customize.add_css_class("flat")
-        customize.add_css_class("circular")
-        customize.connect("clicked", lambda *_: self.open_settings())
-        head = Gtk.Box(spacing=12)
-        head.append(head_text)
-        head.append(customize)
+        # A personalização fica no menu ☰ da linha "Meu computador" na barra lateral.
+        head = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+        head.append(title)
+        head.append(subtitle)
         body.append(head)
 
         # Todas as pastas da barra lateral (locais e marcadores) numa grade só.
@@ -321,9 +315,17 @@ class ComputerPage(Gtk.ScrolledWindow):
         self.disks_button.connect("clicked", lambda *_: self._launch("gnome-disks"))
         self._has_disks_app = GLib.find_program_in_path("gnome-disks") is not None
         body.append(self.disks_button)
-        self.empty_label = Gtk.Label(
-            label="Tudo oculto. Use o botão ✎ acima para escolher o que aparece aqui.")
-        self.empty_label.add_css_class("dim-label")
+        # Página vazia: o único caminho garantido para a personalização (a linha da
+        # barra lateral pode estar oculta e não sobra item para o clique direito).
+        self.empty_label = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                                   halign=Gtk.Align.CENTER)
+        empty_text = Gtk.Label(label="Tudo oculto. Escolha o que aparece aqui.")
+        empty_text.add_css_class("dim-label")
+        empty_btn = Gtk.Button(label="Personalizar…", halign=Gtk.Align.CENTER)
+        empty_btn.add_css_class("pill")
+        empty_btn.connect("clicked", lambda *_: self.ctl.open_settings("customize"))
+        self.empty_label.append(empty_text)
+        self.empty_label.append(empty_btn)
         body.append(self.empty_label)
 
         hub.on_changed(self._on_hub_changed)
@@ -666,13 +668,17 @@ class ComputerPage(Gtk.ScrolledWindow):
         self._cfg().set("computer_sections", sections)
         self.ctl.ext.refresh_computer_pages()
 
-    def open_settings(self) -> None:
-        """Escolher o que aparece no Meu computador e se o Nautilus abre direto nele."""
+    def open_settings(self, page_name: str = "customize") -> None:
+        """Escolher o que aparece no Meu computador e se o Nautilus abre direto nele.
+        `page_name`: "customize" ou "about" (abre já na página Sobre)."""
         cfg = self._cfg()
         dialog = Adw.PreferencesDialog(title="Personalizar o Meu computador")
         dialog.set_search_enabled(True)
-        page = Adw.PreferencesPage(title="Meu computador", icon_name="computer-symbolic")
+        page = Adw.PreferencesPage(title="Meu computador", icon_name="computer-symbolic",
+                                   name="customize")
         dialog.add(page)
+        about_page = build_about_page()
+        dialog.add(about_page)
 
         def switch(group, title, subtitle, active, on_change):
             row = Adw.SwitchRow(title=GLib.markup_escape_text(title),
@@ -732,7 +738,9 @@ class ComputerPage(Gtk.ScrolledWindow):
         btn.connect("clicked", do_reset)
         reset.add(btn)
         page.add(reset)
-        dialog.present(self.get_root())
+        if page_name == "about":
+            dialog.set_visible_page(about_page)
+        dialog.present(self.ctl.win)
         self._settings_dialog = dialog
 
     def _launch(self, program: str) -> None:
@@ -782,7 +790,7 @@ class ComputerPage(Gtk.ScrolledWindow):
         if hide_key:
             last = Gio.Menu()
             add(last, "Ocultar do Meu computador", "hide", lambda: self.set_item_hidden(hide_key, True))
-            add(last, "Personalizar…", "customize", self.open_settings)
+            add(last, "Personalizar…", "customize", lambda: self.ctl.open_settings("customize"))
             menu.append_section(None, last)
         child.insert_action_group("vcomp", group)
         pop = Gtk.PopoverMenu.new_from_model(menu)

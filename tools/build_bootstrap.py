@@ -13,6 +13,7 @@ INCLUDE = [
     "nautilus-vitrine.py",
     "vitrine",
     "tools/smoke_test.py",
+    "tools/test_history.py",
     "tools/build_bootstrap.py",
     "install.sh",
     "uninstall.sh",

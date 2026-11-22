@@ -13,13 +13,13 @@ gi.require_version("Adw", "1")
 gi.require_version("Nautilus", "4.1")
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Nautilus  # noqa: E402
 
-from . import discovery, native  # noqa: E402
+from . import __version__, discovery, native  # noqa: E402
 from .computer import DeviceHub  # noqa: E402
 from .config import GRID_ZOOMS, Config  # noqa: E402
-from .util import guarded, log  # noqa: E402
+from .util import ASSETS, guarded, log  # noqa: E402
 from .window import WindowController  # noqa: E402
 
-VERSION = "0.2.0"
+VERSION = __version__
 
 CSS = b"""
 .vitrine-strip { background-color: var(--view-bg-color); }
@@ -103,6 +103,9 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         provider.load_from_bytes(GLib.Bytes.new(CSS))
         Gtk.StyleContext.add_provider_for_display(
             display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        # Ícones da Vitrine (ex.: nautilus-vitrine-symbolic) achados pelo nome. O sufixo
+        # -symbolic faz o GTK recolorir o ícone com a cor do texto (tema claro/escuro).
+        Gtk.IconTheme.get_for_display(display).add_search_path(ASSETS)
         self._css_done = True
 
     def _schedule(self, win) -> None:
@@ -232,7 +235,12 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         computer = Nautilus.MenuItem(name="Vitrine::computer", label="Meu computador")
         computer.connect("activate", lambda *_a: GLib.idle_add(
             self._run, lambda c: c.show_computer(True)))
-        return [root, computer]
+        # O Nautilus põe os itens de extensões numa seção própria, antes de
+        # "Propriedades": este é o último item *da Vitrine* no menu.
+        about = Nautilus.MenuItem(name="Vitrine::about", label="Sobre a Vitrine")
+        about.connect("activate", lambda *_a: GLib.idle_add(
+            self._run, lambda c: c.open_settings("about")))
+        return [root, computer, about]
 
     def _run(self, cb) -> bool:
         ctl = self.active_controller()
