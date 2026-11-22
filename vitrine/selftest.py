@@ -82,6 +82,12 @@ def run(ctl) -> bool:
     cfg._seed_pictures_rule()
     cfg.settings["default_mode"] = "list"
     cfg.settings["start_on_computer"] = False
+    # Suas escolhas de exibição também ficam de lado durante o teste (voltam no fim):
+    # painel de pré-visualização aberto e nada oculto no Meu computador.
+    cfg.settings["computer_hidden"] = []
+    cfg.settings["computer_sections"] = {}
+    ctl.ext.refresh_computer_pages()
+    ctl.set_preview_visible(True)
     home = Gio.File.new_for_path(os.path.expanduser("~")).get_uri()
     pictures = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES)
     pictures_uri = Gio.File.new_for_path(pictures).get_uri() if pictures else None
@@ -122,7 +128,9 @@ def run(ctl) -> bool:
         check("injeção (botões e painel existem)",
               ctl.btn_columns is not None and ctl.btn_columns.get_root() is ctl.win
               and ctl.preview.get_root() is ctl.win, str(st))
-        ctl.navigate(home)
+        # A janela pode ter aberto no Meu computador com a pasta pessoal por baixo:
+        # sair dele para a mesma pasta não gera navegação, por isso este caminho.
+        ctl.leave_computer_and_open(home)
 
     @step
     def s1():
@@ -429,12 +437,12 @@ def run(ctl) -> bool:
 
     @step
     def h1():
-        app = ctl.win.get_application()
-        accels = app.get_accels_for_action("vitrine.back") if app is not None else []
         swapped = [w for w in util.walk(ctl.win) if isinstance(w, Gtk.Button)
                    and w.get_action_name() == "vitrine.back"]
-        check("Voltar: botões ← e Alt+← passam pela Vitrine",
-              swapped and "<alt>left" in [a.lower() for a in accels], f"botões={len(swapped)} atalhos={accels}")
+        check("Voltar: botões ←, Alt+← e mouse passam pela Vitrine",
+              swapped and ctl.history_shortcuts_removed >= 2 and ctl._mouse_takeover,
+              f"botões={len(swapped)} atalhos={ctl.history_shortcuts_removed} "
+              f"mouse={ctl._mouse_takeover}")
         ctl.show_computer(True)  # Pasta pessoal → Meu computador
 
     @step
@@ -477,6 +485,8 @@ def run(ctl) -> bool:
         cfg.settings.clear()
         cfg.settings.update(saved_settings)
         cfg.save()
+        ctl.set_preview_visible(bool(saved_settings.get("preview_visible")))
+        ctl.ext.refresh_computer_pages()
         ctl.ext.set_grid_zoom(saved_zoom)
         ok = sum(1 for r in results if r[1])
         log(f"SELFTEST RESUMO: {ok}/{len(results)} passaram")
