@@ -19,6 +19,13 @@ _MOD_MASK = (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
 _MEDIA_SAMPLE = 250
 _NATIVE_STEP_TIMEOUT_MS = 4000   # o Nautilus não respondeu a um Voltar/Avançar pedido
 _LEAVE_FALLBACK_MS = 1500        # saiu do Meu computador e o Nautilus não navegou
+_HISTORY_KEYS = {"<alt>left", "<alt>right", "back", "forward"}
+
+
+def _is_history_trigger(text: str) -> bool:
+    """"<Alt>Left|Back" → True; "<Alt>Up" → False (só Voltar/Avançar)."""
+    parts = [p.strip().lower() for p in (text or "").split("|") if p.strip()]
+    return bool(parts) and all(p in _HISTORY_KEYS for p in parts)
 
 
 class WindowController:
@@ -49,6 +56,7 @@ class WindowController:
         self._native_forward_probe: Gtk.Button | None = None
         self._nautilus_prefs = Gio.Settings.new("org.gnome.nautilus.preferences")
         self._mouse_takeover = False
+        self.history_shortcuts_removed = 0
         self._leave_source = 0
 
     # ───────────────────────── injeção ─────────────────────────
@@ -375,17 +383,36 @@ class WindowController:
         e nenhum gesto de deslizar no touchpad. Cada ponto é trocado de forma
         determinística (sem depender da ordem em que o GTK entrega os eventos)."""
         n = self._take_over_buttons()
-        app = self.win.get_application()
-        if app is not None:
-            for nat, ours in (("slot.back", "vitrine.back"), ("slot.forward", "vitrine.forward")):
-                accels = app.get_accels_for_action(nat)
-                if accels:
-                    # Fica só na memória (não é salvo); reaplicado a cada janela nova.
-                    app.set_accels_for_action(ours, accels)
-                    app.set_accels_for_action(nat, [])
-            log(f"histórico: {n} botões ← →, atalhos {app.get_accels_for_action('vitrine.back')}")
+        self.history_shortcuts_removed = self._take_over_shortcuts()
+        log(f"histórico: {n} botões ← →, {self.history_shortcuts_removed} atalhos de teclado")
         self._take_over_mouse()
         self._update_history_actions()
+
+    def _take_over_shortcuts(self) -> int:
+        """Alt+←/→ e as teclas Back/Forward. No Nautilus 51 elas não são atalhos do
+        aplicativo: ficam num GtkShortcutController do NautilusShortcutManager (o widget
+        que envolve todo o conteúdo da janela). Removemos só esses atalhos (na memória,
+        nada é salvo; Alt+↑ e os demais ficam) e tratamos as teclas em `_on_key`."""
+        removed = 0
+        for owner in (find_by_type_name(self.win, "NautilusShortcutManager"), self.win):
+            if owner is None:
+                continue
+            controllers = owner.observe_controllers()
+            for i in range(controllers.get_n_items()):
+                ctrl = controllers.get_item(i)
+                if not isinstance(ctrl, Gtk.ShortcutController):
+                    continue
+                doomed = []
+                for j in range(ctrl.get_n_items()):
+                    shortcut = ctrl.get_item(j)
+                    trigger = shortcut.get_trigger()
+                    if trigger is not None and _is_history_trigger(trigger.to_string()):
+                        doomed.append(shortcut)
+                for shortcut in doomed:
+                    debug(f"histórico: removendo atalho nativo {shortcut.get_trigger().to_string()}")
+                    ctrl.remove_shortcut(shortcut)
+                    removed += 1
+        return removed
 
     def _take_over_buttons(self) -> int:
         """Botões ← → do cabeçalho e da barra inferior (janela estreita) passam a usar as
@@ -557,6 +584,13 @@ class WindowController:
     @guarded
     def _on_key(self, _ctrl, keyval, _code, state) -> bool:
         mods = state & _MOD_MASK
+        # Voltar/Avançar (os atalhos nativos foram removidos em _take_over_shortcuts).
+        if mods == Gdk.ModifierType.ALT_MASK and keyval in (Gdk.KEY_Left, Gdk.KEY_Right):
+            self.go_history(-1 if keyval == Gdk.KEY_Left else +1)
+            return True
+        if not mods and keyval in (Gdk.KEY_Back, Gdk.KEY_Forward):
+            self.go_history(-1 if keyval == Gdk.KEY_Back else +1)
+            return True
         if mods == Gdk.ModifierType.CONTROL_MASK:
             if keyval in (Gdk.KEY_1, Gdk.KEY_2, Gdk.KEY_3) and self._computer_visible:
                 self.show_computer(False)

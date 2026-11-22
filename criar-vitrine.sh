@@ -3217,6 +3217,12 @@ def run(ctl) -> bool:
     cfg._seed_pictures_rule()
     cfg.settings["default_mode"] = "list"
     cfg.settings["start_on_computer"] = False
+    # Suas escolhas de exibição também ficam de lado durante o teste (voltam no fim):
+    # painel de pré-visualização aberto e nada oculto no Meu computador.
+    cfg.settings["computer_hidden"] = []
+    cfg.settings["computer_sections"] = {}
+    ctl.ext.refresh_computer_pages()
+    ctl.set_preview_visible(True)
     home = Gio.File.new_for_path(os.path.expanduser("~")).get_uri()
     pictures = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES)
     pictures_uri = Gio.File.new_for_path(pictures).get_uri() if pictures else None
@@ -3257,7 +3263,9 @@ def run(ctl) -> bool:
         check("injeção (botões e painel existem)",
               ctl.btn_columns is not None and ctl.btn_columns.get_root() is ctl.win
               and ctl.preview.get_root() is ctl.win, str(st))
-        ctl.navigate(home)
+        # A janela pode ter aberto no Meu computador com a pasta pessoal por baixo:
+        # sair dele para a mesma pasta não gera navegação, por isso este caminho.
+        ctl.leave_computer_and_open(home)
 
     @step
     def s1():
@@ -3564,12 +3572,12 @@ def run(ctl) -> bool:
 
     @step
     def h1():
-        app = ctl.win.get_application()
-        accels = app.get_accels_for_action("vitrine.back") if app is not None else []
         swapped = [w for w in util.walk(ctl.win) if isinstance(w, Gtk.Button)
                    and w.get_action_name() == "vitrine.back"]
-        check("Voltar: botões ← e Alt+← passam pela Vitrine",
-              swapped and "<alt>left" in [a.lower() for a in accels], f"botões={len(swapped)} atalhos={accels}")
+        check("Voltar: botões ←, Alt+← e mouse passam pela Vitrine",
+              swapped and ctl.history_shortcuts_removed >= 2 and ctl._mouse_takeover,
+              f"botões={len(swapped)} atalhos={ctl.history_shortcuts_removed} "
+              f"mouse={ctl._mouse_takeover}")
         ctl.show_computer(True)  # Pasta pessoal → Meu computador
 
     @step
@@ -3612,6 +3620,8 @@ def run(ctl) -> bool:
         cfg.settings.clear()
         cfg.settings.update(saved_settings)
         cfg.save()
+        ctl.set_preview_visible(bool(saved_settings.get("preview_visible")))
+        ctl.ext.refresh_computer_pages()
         ctl.ext.set_grid_zoom(saved_zoom)
         ok = sum(1 for r in results if r[1])
         log(f"SELFTEST RESUMO: {ok}/{len(results)} passaram")
@@ -3891,6 +3901,13 @@ _MOD_MASK = (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
 _MEDIA_SAMPLE = 250
 _NATIVE_STEP_TIMEOUT_MS = 4000   # o Nautilus não respondeu a um Voltar/Avançar pedido
 _LEAVE_FALLBACK_MS = 1500        # saiu do Meu computador e o Nautilus não navegou
+_HISTORY_KEYS = {"<alt>left", "<alt>right", "back", "forward"}
+
+
+def _is_history_trigger(text: str) -> bool:
+    """"<Alt>Left|Back" → True; "<Alt>Up" → False (só Voltar/Avançar)."""
+    parts = [p.strip().lower() for p in (text or "").split("|") if p.strip()]
+    return bool(parts) and all(p in _HISTORY_KEYS for p in parts)
 
 
 class WindowController:
@@ -3921,6 +3938,7 @@ class WindowController:
         self._native_forward_probe: Gtk.Button | None = None
         self._nautilus_prefs = Gio.Settings.new("org.gnome.nautilus.preferences")
         self._mouse_takeover = False
+        self.history_shortcuts_removed = 0
         self._leave_source = 0
 
     # ───────────────────────── injeção ─────────────────────────
@@ -4247,17 +4265,36 @@ class WindowController:
         e nenhum gesto de deslizar no touchpad. Cada ponto é trocado de forma
         determinística (sem depender da ordem em que o GTK entrega os eventos)."""
         n = self._take_over_buttons()
-        app = self.win.get_application()
-        if app is not None:
-            for nat, ours in (("slot.back", "vitrine.back"), ("slot.forward", "vitrine.forward")):
-                accels = app.get_accels_for_action(nat)
-                if accels:
-                    # Fica só na memória (não é salvo); reaplicado a cada janela nova.
-                    app.set_accels_for_action(ours, accels)
-                    app.set_accels_for_action(nat, [])
-            log(f"histórico: {n} botões ← →, atalhos {app.get_accels_for_action('vitrine.back')}")
+        self.history_shortcuts_removed = self._take_over_shortcuts()
+        log(f"histórico: {n} botões ← →, {self.history_shortcuts_removed} atalhos de teclado")
         self._take_over_mouse()
         self._update_history_actions()
+
+    def _take_over_shortcuts(self) -> int:
+        """Alt+←/→ e as teclas Back/Forward. No Nautilus 51 elas não são atalhos do
+        aplicativo: ficam num GtkShortcutController do NautilusShortcutManager (o widget
+        que envolve todo o conteúdo da janela). Removemos só esses atalhos (na memória,
+        nada é salvo; Alt+↑ e os demais ficam) e tratamos as teclas em `_on_key`."""
+        removed = 0
+        for owner in (find_by_type_name(self.win, "NautilusShortcutManager"), self.win):
+            if owner is None:
+                continue
+            controllers = owner.observe_controllers()
+            for i in range(controllers.get_n_items()):
+                ctrl = controllers.get_item(i)
+                if not isinstance(ctrl, Gtk.ShortcutController):
+                    continue
+                doomed = []
+                for j in range(ctrl.get_n_items()):
+                    shortcut = ctrl.get_item(j)
+                    trigger = shortcut.get_trigger()
+                    if trigger is not None and _is_history_trigger(trigger.to_string()):
+                        doomed.append(shortcut)
+                for shortcut in doomed:
+                    debug(f"histórico: removendo atalho nativo {shortcut.get_trigger().to_string()}")
+                    ctrl.remove_shortcut(shortcut)
+                    removed += 1
+        return removed
 
     def _take_over_buttons(self) -> int:
         """Botões ← → do cabeçalho e da barra inferior (janela estreita) passam a usar as
@@ -4429,6 +4466,13 @@ class WindowController:
     @guarded
     def _on_key(self, _ctrl, keyval, _code, state) -> bool:
         mods = state & _MOD_MASK
+        # Voltar/Avançar (os atalhos nativos foram removidos em _take_over_shortcuts).
+        if mods == Gdk.ModifierType.ALT_MASK and keyval in (Gdk.KEY_Left, Gdk.KEY_Right):
+            self.go_history(-1 if keyval == Gdk.KEY_Left else +1)
+            return True
+        if not mods and keyval in (Gdk.KEY_Back, Gdk.KEY_Forward):
+            self.go_history(-1 if keyval == Gdk.KEY_Back else +1)
+            return True
         if mods == Gdk.ModifierType.CONTROL_MASK:
             if keyval in (Gdk.KEY_1, Gdk.KEY_2, Gdk.KEY_3) and self._computer_visible:
                 self.show_computer(False)
