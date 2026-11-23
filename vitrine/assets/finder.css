@@ -1,0 +1,99 @@
+/* Estilo "Finder (macOS)" da Vitrine.
+ *
+ * Toda regra começa com window.vitrine-finder: sem essa classe na janela, nada daqui
+ * vale (é assim que o "Nautilus padrão" fica limpo). Cores vêm das variáveis do
+ * libadwaita (claro/escuro e cor de destaque do sistema).
+ *
+ * Sem desfoque: o GTK4 não tem backdrop-filter e o GNOME (Mutter) não desfoca janelas
+ * de aplicativos. O "vidro" é imitado com tons levemente mais claros/escuros.
+ */
+
+/* Os botões da janela (fechar, minimizar, maximizar) ficam no padrão do GNOME. */
+
+/* ── barra de título / ferramentas ── */
+window.vitrine-finder .vitrine-finder-header {
+  min-height: 52px;
+  background-color: var(--view-bg-color);
+  box-shadow: none;
+}
+window.vitrine-finder .vitrine-finder-header > windowhandle > box { padding: 6px 10px; }
+window.vitrine-finder .vitrine-finder-title {
+  font-weight: 700;
+  font-size: 1.15em;
+  margin: 0 8px 0 6px;
+}
+
+/* cápsulas: grupos de botões arredondados, como no Finder */
+window.vitrine-finder .vitrine-capsule {
+  border-radius: 99px;
+  padding: 3px;
+  background-color: color-mix(in srgb, currentColor 5%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, currentColor 7%, transparent),
+              0 1px 2px rgb(0 0 0 / 0.06);
+}
+window.vitrine-finder .vitrine-capsule button,
+window.vitrine-finder .vitrine-capsule menubutton > button {
+  min-height: 28px; min-width: 34px;
+  padding: 0 8px;
+  border-radius: 99px;
+  background: none;
+  box-shadow: none;
+}
+window.vitrine-finder .vitrine-capsule button:hover,
+window.vitrine-finder .vitrine-capsule menubutton > button:hover {
+  background-color: color-mix(in srgb, currentColor 8%, transparent);
+}
+window.vitrine-finder .vitrine-capsule button:checked {
+  background-color: color-mix(in srgb, currentColor 13%, transparent);
+}
+window.vitrine-finder .vitrine-capsule > separator {
+  margin: 6px 0;
+  background-color: color-mix(in srgb, currentColor 15%, transparent);
+}
+window.vitrine-finder .vitrine-capsule button:disabled { opacity: 0.35; }
+
+/* campo Pesquisar */
+window.vitrine-finder .vitrine-search-pill {
+  min-width: 190px; min-height: 30px;
+  padding: 0 12px;
+  border-radius: 99px;
+  background-color: color-mix(in srgb, currentColor 5%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, currentColor 7%, transparent);
+}
+window.vitrine-finder .vitrine-search-pill label {
+  color: color-mix(in srgb, currentColor 55%, transparent);
+}
+
+/* ── barra lateral ── */
+window.vitrine-finder .vitrine-finder-sidebar,
+window.vitrine-finder .vitrine-finder-sidebar-header {
+  background-color: color-mix(in srgb, var(--sidebar-bg-color) 85%, var(--view-bg-color));
+}
+window.vitrine-finder .vitrine-finder-sidebar .navigation-sidebar {
+  background: none;
+  padding: 4px 8px;
+}
+window.vitrine-finder .vitrine-finder-sidebar .navigation-sidebar > row {
+  min-height: 30px;
+  margin: 1px 0;
+  padding: 0 8px;
+  border-radius: 8px;
+}
+window.vitrine-finder .vitrine-finder-sidebar .navigation-sidebar > row:selected {
+  background-color: color-mix(in srgb, currentColor 11%, transparent);
+  color: inherit;
+}
+window.vitrine-finder .vitrine-finder-sidebar .navigation-sidebar > row:selected label {
+  font-weight: 600;
+}
+/* ícones na cor de destaque (o ⏏ e os botões da linha ficam neutros) */
+window.vitrine-finder .vitrine-finder-sidebar .navigation-sidebar > row image {
+  color: var(--accent-color);
+}
+window.vitrine-finder .vitrine-finder-sidebar .navigation-sidebar > row button image {
+  color: inherit;
+}
+
+/* ── conteúdo ── */
+window.vitrine-finder .vitrine-computer,
+window.vitrine-finder .vitrine-strip { background-color: var(--view-bg-color); }

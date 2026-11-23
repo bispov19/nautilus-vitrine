@@ -76,6 +76,8 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         self._prefs = Gio.Settings.new("org.gnome.nautilus.preferences")
         self._icon_prefs = Gio.Settings.new("org.gnome.nautilus.icon-view")
         self._icon_prefs.connect("changed::default-zoom-level", self._on_zoom_changed)
+        self.cfg.on_change(self._on_setting_changed)
+        log(f"preferências: {self.cfg.backend}")
         self.hub = DeviceHub()
         self.hub.on_new_device(self._on_new_device)
         log(f"Vitrine {VERSION} carregada")
@@ -148,6 +150,14 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         if ctl is None and self.windows:
             ctl = next(iter(self.windows.values()))
         return ctl
+
+    @guarded
+    def _on_setting_changed(self, key: str) -> None:
+        if key == "window_style":
+            for ctl in list(self.windows.values()):
+                ctl.apply_window_style()
+        elif key in ("computer_in_sidebar", "computer_hidden", "computer_sections"):
+            self.refresh_computer_pages()
 
     def refresh_computer_pages(self) -> None:
         for ctl in list(self.windows.values()):

@@ -14,6 +14,7 @@ INCLUDE = [
     "vitrine",
     "tools/smoke_test.py",
     "tools/test_history.py",
+    "tools/test_config.py",
     "tools/build_bootstrap.py",
     "install.sh",
     "uninstall.sh",
@@ -83,7 +84,7 @@ def collect() -> list[str]:
             for dirpath, dirnames, filenames in os.walk(path):
                 dirnames[:] = sorted(d for d in dirnames if d != "__pycache__")
                 for name in sorted(filenames):
-                    if name.endswith((".pyc", ".tmp")):
+                    if name.endswith((".pyc", ".tmp", ".compiled")):
                         continue
                     files.append(os.path.relpath(os.path.join(dirpath, name), ROOT))
         elif os.path.exists(path):

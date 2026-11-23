@@ -48,6 +48,14 @@ else
   echo "Arquivos copiados para $DEST"
 fi
 
+# Preferências em GSettings: o schema vem dentro da extensão e é compilado aqui
+# (a Vitrine o carrega desta pasta; não precisa de root).
+if command -v glib-compile-schemas >/dev/null; then
+  glib-compile-schemas --strict "$DEST/vitrine/schemas"
+else
+  echo "Aviso: glib-compile-schemas não encontrado; a Vitrine compila o schema na primeira execução."
+fi
+
 if [[ "$RESTART" == 1 ]]; then
   echo "Reiniciando o Nautilus (janelas abertas do Arquivos serão fechadas)…"
   nautilus -q 2>/dev/null || true

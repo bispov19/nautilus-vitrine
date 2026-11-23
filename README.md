@@ -21,6 +21,7 @@ A Vitrine é uma extensão para o **Nautilus 51** (e, em princípio, o 50). Ela 
 - 🗂️ **Modo Colunas**: navegue pelas pastas em colunas, como no Finder.
 - 🖼️ **Painel de pré-visualização**: veja imagens, textos, vídeos, PDFs e pastas ao lado da lista, sem abrir nada.
 - 📌 **Visualização por pasta**: cada pasta lembra se você prefere lista, ícones, ícones grandes ou colunas.
+- 🍎 **Estilo Finder** (padrão): barra de ferramentas em cápsulas, título da pasta, seletor de visualização e barra lateral no estilo do Finder do macOS. Dá para voltar ao **Nautilus padrão** a qualquer momento.
 - 💻 **Meu computador**: suas pastas, discos e dispositivos numa página só, com o espaço livre de cada um e aviso quando um pen drive é conectado.
 
 A diferença em relação a outras soluções é o **modo híbrido**. A pasta atual continua sendo exibida pela **própria lista do Nautilus**, então menu de contexto, renomear, arrastar e soltar, recortar e colar, Desfazer, scripts e outras extensões funcionam exatamente como antes. A Vitrine só acrescenta coisas; não substitui nada.
@@ -28,6 +29,17 @@ A diferença em relação a outras soluções é o **modo híbrido**. A pasta at
 ---
 
 ## Recursos
+
+### 🍎 Estilo da janela: Finder (macOS) ou Nautilus padrão
+
+O estilo **Finder** vem ligado de fábrica. Troque em **☰ da linha Meu computador → Personalizar → Estilo da janela**; vale na hora, em todas as janelas.
+
+- Barra de ferramentas: **← →** numa cápsula e o **nome da pasta** em negrito; à direita, **Visão em grade / Visão em lista / Colunas**, **Ordenar** (A-Z, Z-A, última e primeira modificação, tamanho, tipo), **Compartilhar** (copiar local, enviar por e-mail, Bluetooth, compartilhamento na rede), **⋯** (nova pasta, documento vazio, propriedades, renomear, comprimir, copiar, colar, mover para a lixeira, arquivos ocultos, painel de pré-visualização, pesquisar em todos os lugares) e **Pesquisar**.
+- A barra de caminho aparece ao editar o local (**Ctrl+L**) ou ao pesquisar.
+- Barra lateral com ícones na cor de destaque do sistema e seleção cinza arredondada.
+- Os nomes seguem os do GNOME (a Vitrine usa a tradução do próprio Nautilus). Os botões de fechar, minimizar e maximizar ficam no padrão do GNOME.
+- **Nautilus padrão** remove tudo o que o estilo Finder acrescentou (CSS, botões, sinais). Colunas, pré-visualização e Meu computador continuam conforme as suas opções.
+
 
 ### 🗂️ Modo Colunas
 
@@ -186,12 +198,22 @@ O Nautilus volta exatamente ao original. Suas regras ficam guardadas; use `./uni
 
 ## Configuração
 
-Tudo funciona sem configurar nada. Para ajustes finos, edite os arquivos abaixo com o Nautilus fechado (`nautilus -q`).
+Tudo funciona sem configurar nada. As preferências ficam no **GSettings** (schema `io.github.bispov19.NautilusVitrine`, que vem dentro da extensão) e valem na hora, até pelo terminal:
 
-**`~/.config/nautilus-vitrine/settings.json`**
+```bash
+gsettings --schemadir ~/.local/share/nautilus-python/extensions/vitrine/schemas list-recursively io.github.bispov19.NautilusVitrine
+```
+
+```bash
+gsettings --schemadir ~/.local/share/nautilus-python/extensions/vitrine/schemas set io.github.bispov19.NautilusVitrine window-style nautilus
+```
+
+Na primeira execução da versão com GSettings, o antigo `settings.json` é importado e guardado como `settings.json.importado`. Os nomes abaixo usam `-` no GSettings (ex.: `preview-visible`).
 
 | Chave | Padrão | Descrição |
 |---|---|---|
+| `window_style` | `"finder"` | Estilo da janela: `finder` ou `nautilus` |
+
 | `preview_visible` | `true` | Painel de pré-visualização aberto |
 | `preview_width` | `320` | Largura do painel (px), salva ao arrastar a borda |
 | `column_width` | `230` | Largura de cada coluna (px) |
@@ -245,11 +267,13 @@ vitrine/
   preview.py            painel de pré-visualização
   imageload.py          carregamento rápido de imagens, cache e pré-carregamento
   computer.py           página Meu computador e monitor de dispositivos
+  config.py             preferências (GSettings) e regras por pasta (JSON)
+  finder/               estilo Finder: aplica e remove a camada visual
+  schemas/              schema GSettings da Vitrine
   history.py            Voltar/Avançar por aba incluindo o Meu computador (sem GTK)
   about.py              página "Sobre" do diálogo de personalização
   assets/               logo, ícone simbólico e CSS da página Sobre
   native.py             ponte com o Nautilus (slot, lista/grade, seleção)
-  config.py             preferências e regras (JSON)
   util.py               log, varredura de widgets, operações D-Bus
   selftest.py           autoteste dentro do Nautilus real
 tools/
