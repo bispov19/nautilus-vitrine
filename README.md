@@ -38,6 +38,8 @@ O estilo **Finder** vem ligado de fábrica. Troque em **☰ da linha Meu computa
 - A barra de caminho aparece ao editar o local (**Ctrl+L**) ou ao pesquisar.
 - Barra lateral com ícones na cor de destaque do sistema e seleção cinza arredondada.
 - Os nomes seguem os do GNOME (a Vitrine usa a tradução do próprio Nautilus). Os botões de fechar, minimizar e maximizar ficam no padrão do GNOME.
+- **Visão em grade:** dimensões das imagens (ex.: *1.066 × 1.599*) em azul abaixo do nome, seleção cinza arredondada. O nome longo já é truncado no meio pelo próprio Nautilus.
+- **Visão em lista:** linhas alternadas suaves.
 - **Nautilus padrão** remove tudo o que o estilo Finder acrescentou (CSS, botões, sinais). Colunas, pré-visualização e Meu computador continuam conforme as suas opções.
 
 
@@ -96,6 +98,17 @@ Clique com o botão direito no **fundo de qualquer pasta** e escolha **Visualiza
 - Ligar/desligar a descoberta automática de pastas
 - Usar a visualização atual como padrão
 - Mostrar/ocultar pré-visualização
+
+### 🏷️ Etiquetas coloridas
+
+Vermelho, Laranja, Amarelo, Verde, Azul e Roxo, além das que você criar.
+
+- Gravadas no atributo estendido padrão **`user.xdg.tags`** (o mesmo de outros gerenciadores de arquivos, como o Dolphin): continuam valendo fora da Vitrine.
+- **Aplicar:** clique direito → *Etiquetas*, botão de etiqueta na barra de ferramentas (estilo Finder) ou arrastando arquivos para a etiqueta na barra lateral. Vários arquivos e várias etiquetas por arquivo.
+- **Ver:** bolinhas coloridas nos ícones (grade, lista e colunas), coluna **Etiquetas** na lista (ligue em *Colunas visíveis* do Nautilus) e a seção **Etiquetas** da barra lateral, que mostra os arquivos de cada etiqueta.
+- **Todas as etiquetas…:** criar, renomear, trocar a cor e apagar. Renomear e apagar atualizam os arquivos que a Vitrine conhece.
+- Arquivos etiquetados por outros programas aparecem depois de abertos no Nautilus, ou com *Procurar na pasta pessoal* na página da etiqueta.
+- Pen drives FAT/exFAT e alguns compartilhamentos de rede não aceitam atributos estendidos; a Vitrine avisa.
 
 ### 💻 Meu computador
 
@@ -270,6 +283,8 @@ vitrine/
   config.py             preferências (GSettings) e regras por pasta (JSON)
   finder/               estilo Finder: aplica e remove a camada visual
   schemas/              schema GSettings da Vitrine
+  tags.py               etiquetas (user.xdg.tags) e índice dos arquivos etiquetados
+  tagui.py              telas das etiquetas (barra, barra lateral, página, Todas as etiquetas…)
   history.py            Voltar/Avançar por aba incluindo o Meu computador (sem GTK)
   about.py              página "Sobre" do diálogo de personalização
   assets/               logo, ícone simbólico e CSS da página Sobre
@@ -279,6 +294,8 @@ vitrine/
 tools/
   smoke_test.py         colunas, preview e página Sobre fora do Nautilus
   test_history.py       testes do histórico de Voltar/Avançar
+  test_config.py        testes das preferências (GSettings)
+  test_tags.py          testes das etiquetas
   build_bootstrap.py    gera o criar-vitrine.sh
 packaging/
   nautilus-vitrine.spec receita do pacote RPM
@@ -358,6 +375,9 @@ Para lançar uma versão nova: aumente `Version` e acrescente uma entrada no `%c
 - Nas colunas anteriores o menu de clique direito é reduzido. Para o menu completo, use **Mostrar na lista**.
 - O zoom dos ícones é uma preferência global do Nautilus. Ao entrar numa pasta com zoom salvo, outras janelas abertas em ícones acompanham.
 - Locais especiais (Recentes, Favoritos, Lixeira, Rede, Pesquisa) mantêm o comportamento padrão do Nautilus.
+- A coluna **Etiquetas** não é ligada automaticamente: mudar as colunas padrão com a janela aberta derruba o Nautilus 51.1. Ligue em *Colunas visíveis*.
+- O menu de clique direito das extensões só aceita texto: as etiquetas aparecem num submenu (com 🔴🟠🟡…), não como a linha de bolinhas do macOS.
+- Sem desfoque de fundo ("vidro"): o GNOME não desfoca janelas de aplicativos.
 - O menu de histórico do botão ← (clique direito ou toque longo) é do Nautilus e não lista o Meu computador. Escolher um item ali funciona; a Vitrine se realinha sozinha.
 
 ## Próximos passos

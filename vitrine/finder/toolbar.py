@@ -15,6 +15,7 @@ import gettext
 from gi.repository import Gio, GLib, Gtk, Pango
 
 from .. import native, util
+from ..tagui import TagMenuButton
 from ..util import guarded, log
 
 
@@ -84,7 +85,8 @@ class FinderToolbar:
         later(lambda: win.insert_action_group("vfinder", None))
 
         start = [self._nav(), self.title]
-        end = [self._search(), self._more(), self._share(), self._sort(), self._views()]
+        end = [self._search(), self._more(), _capsule(TagMenuButton(self.ctl)), self._share(),
+               self._sort(), self._views()]
         for w in start:
             header.pack_start(w)
             later(lambda w=w: header.remove(w))
@@ -224,7 +226,7 @@ class FinderToolbar:
     def sync(self) -> None:
         self._syncing = True
         try:
-            computer = self.ctl.computer_visible()
+            computer = self.ctl.computer_visible() or bool(self.ctl.tag_visible())
             slot = self.ctl.active_slot()
             # O modo pedido pela Vitrine vale antes do Nautilus terminar de trocar a visão.
             mode = "columns" if self.ctl.columns_on else (
@@ -247,6 +249,8 @@ class FinderToolbar:
         self.title.set_label(self._title_text())
 
     def _title_text(self) -> str:
+        if self.ctl.tag_visible():
+            return self.ctl.tag_visible()
         if self.ctl.computer_visible():
             return "Meu computador"
         slot = self.ctl.active_slot()

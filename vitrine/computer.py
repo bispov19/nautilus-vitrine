@@ -710,6 +710,18 @@ class ComputerPage(Gtk.ScrolledWindow):
             style.add(row)
         page.add(style)
 
+        finder = Adw.PreferencesGroup(title="Estilo Finder")
+        switch(finder, "Seção Etiquetas na barra lateral",
+               "Vermelho, Laranja, Amarelo… Clique para ver os arquivos; arraste arquivos para etiquetar",
+               bool(cfg.get("tags_in_sidebar")), lambda v: cfg.set("tags_in_sidebar", v))
+        switch(finder, "Dimensões das imagens",
+               "Largura × altura abaixo do nome, na visão em grade",
+               bool(cfg.get("image_dimensions")), lambda v: cfg.set("image_dimensions", v))
+        manage = Adw.ButtonRow(title="Todas as etiquetas…")
+        manage.connect("activated", lambda *_a: _open_manager(self.ctl))
+        finder.add(manage)
+        page.add(finder)
+
         general = Adw.PreferencesGroup(title="Geral")
         switch(general, "Abrir o Nautilus no Meu computador",
                "Ao abrir o Arquivos pelo menu de aplicativos (ou uma janela nova), começar aqui",
@@ -824,3 +836,8 @@ class ComputerPage(Gtk.ScrolledWindow):
         pop.set_pointing_to(rect)
         pop.connect("closed", lambda p: GLib.idle_add(p.unparent))
         pop.popup()
+
+
+def _open_manager(ctl) -> None:
+    from .tagui import open_manager
+    open_manager(ctl)
