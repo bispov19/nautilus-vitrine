@@ -9,6 +9,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 from . import discovery, native
 from .columns import ColumnStrip
 from .computer import ComputerPage
+from .finder import FinderStyle
 from .history import History
 from .preview import PreviewPane
 from .util import (ancestor, debug, dump_tree, find_by_type_name, find_first, gtype_name, guarded,
@@ -58,6 +59,7 @@ class WindowController:
         self._mouse_takeover = False
         self.history_shortcuts_removed = 0
         self._leave_source = 0
+        self.style: FinderStyle | None = None
 
     # ───────────────────────── injeção ─────────────────────────
     def inject(self) -> bool:
@@ -124,6 +126,8 @@ class WindowController:
         self._inject_sidebar_row()
         self._install_keys()
         self._take_over_history()
+        self.style = FinderStyle(self)
+        self.apply_window_style()
 
         tv.connect("notify::selected-page", self._on_tab_switched)
         tv.connect("page-attached", lambda _tv, page, _pos: self._watch_slot(page.get_child()))
@@ -152,6 +156,20 @@ class WindowController:
             self._update_history_actions()
             log("janela aberta direto no Meu computador")
         return GLib.SOURCE_REMOVE
+
+    def apply_window_style(self) -> None:
+        """Estilo da janela: "finder" aplica o visual do Finder; "nautilus" remove tudo
+        o que ele acrescentou (vale na hora, em todas as janelas)."""
+        if self.style is None:
+            return
+        if self.cfg.get("window_style") == "finder":
+            self.style.apply()
+        else:
+            self.style.remove()
+
+    def _style_sync(self) -> None:
+        if self.style is not None and self.style.active:
+            self.style.sync()
 
     def should_start_on_computer(self, uri: str | None) -> bool:
         """Só quando a janela abriu na pasta pessoal (menu de aplicativos, Ctrl+N).
@@ -314,6 +332,7 @@ class WindowController:
             if native_lb is not None:
                 native_lb.unselect_all()
             self.computer.grab_focus()
+            self._style_sync()
         else:
             if self.sidebar_list is not None:
                 self.sidebar_list.unselect_all()
@@ -684,6 +703,7 @@ class WindowController:
             self.preview.set_folder(uri if regular else None)
             self.preview.show_uris([])
         self._rebind_model_soon()
+        self._style_sync()
 
     def _rebind_model_soon(self) -> None:
         for delay in (0, 250, 900):
@@ -928,6 +948,7 @@ class WindowController:
                 self.btn_preview.set_active(self.preview.get_visible())
         finally:
             self._syncing_buttons = False
+        self._style_sync()
 
     @guarded
     def _on_btn_columns(self, btn) -> None:
@@ -966,6 +987,8 @@ class WindowController:
 
     @guarded
     def _on_destroy(self, *_a) -> None:
+        if self.style is not None:
+            self.style.remove()
         self.model_watch.unbind()
         if self.strip is not None:
             self.strip.teardown()

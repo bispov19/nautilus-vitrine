@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Preferências da Vitrine para Nautilus.
+
+  O schema fica dentro da própria extensão e é carregado com
+  Gio.SettingsSchemaSource.new_from_directory (não precisa de root). Para usar no
+  terminal, aponte para esta pasta:
+
+    gsettings &#45;&#45;schemadir ~/.local/share/nautilus-python/extensions/vitrine/schemas \
+      set io.github.bispov19.NautilusVitrine window-style nautilus
+
+  As regras por pasta continuam em ~/.config/nautilus-vitrine/folders.json (são dados,
+  não preferências).
+-->
+<schemalist gettext-domain="nautilus-vitrine">
+  <enum id="io.github.bispov19.NautilusVitrine.WindowStyle">
+    <value nick="finder" value="0"/>
+    <value nick="nautilus" value="1"/>
+  </enum>
+
+  <schema id="io.github.bispov19.NautilusVitrine" path="/io/github/bispov19/NautilusVitrine/">
+    <key name="window-style" enum="io.github.bispov19.NautilusVitrine.WindowStyle">
+      <default>'finder'</default>
+      <summary>Estilo da janela</summary>
+      <description>finder: visual e ferramentas inspirados no Finder do macOS. nautilus: o Nautilus padrão.</description>
+    </key>
+
+    <key name="preview-visible" type="b">
+      <default>true</default>
+      <summary>Painel de pré-visualização aberto</summary>
+    </key>
+    <key name="preview-width" type="i">
+      <range min="180" max="1200"/>
+      <default>320</default>
+      <summary>Largura do painel de pré-visualização (px)</summary>
+    </key>
+    <key name="column-width" type="i">
+      <range min="120" max="600"/>
+      <default>230</default>
+      <summary>Largura de cada coluna no modo Colunas (px)</summary>
+    </key>
+    <key name="max-visible-columns" type="i">
+      <range min="1" max="10"/>
+      <default>3</default>
+      <summary>Colunas visíveis antes de começar a rolar</summary>
+    </key>
+
+    <key name="remember-per-folder" type="b">
+      <default>true</default>
+      <summary>Lembrar a visualização escolhida em cada pasta</summary>
+    </key>
+    <key name="auto-media-grid" type="b">
+      <default>true</default>
+      <summary>Abrir pastas de fotos e vídeos em ícones grandes</summary>
+    </key>
+    <key name="auto-media-zoom" type="s">
+      <choices>
+        <choice value="small"/><choice value="small-plus"/><choice value="medium"/>
+        <choice value="large"/><choice value="extra-large"/>
+      </choices>
+      <default>'extra-large'</default>
+      <summary>Zoom usado nas pastas de fotos e vídeos</summary>
+    </key>
+    <key name="auto-media-ratio" type="d">
+      <range min="0.0" max="1.0"/>
+      <default>0.6</default>
+      <summary>Proporção mínima de mídia para considerar "pasta de fotos"</summary>
+    </key>
+    <key name="folder-discovery" type="b">
+      <default>false</default>
+      <summary>Descoberta automática de pastas</summary>
+    </key>
+    <key name="default-mode" type="s">
+      <default>''</default>
+      <summary>Visualização das pastas sem regra (list, grid, columns; vazio = do Nautilus)</summary>
+    </key>
+    <key name="default-grid-zoom" type="s">
+      <default>''</default>
+      <summary>Zoom padrão dos ícones (vazio = do Nautilus)</summary>
+    </key>
+
+    <key name="start-on-computer" type="b">
+      <default>false</default>
+      <summary>Abrir o Nautilus no Meu computador</summary>
+    </key>
+    <key name="computer-in-sidebar" type="b">
+      <default>true</default>
+      <summary>Entrada Meu computador na barra lateral</summary>
+    </key>
+    <key name="computer-sections" type="a{sb}">
+      <default>{}</default>
+      <summary>Seções do Meu computador ligadas/desligadas</summary>
+    </key>
+    <key name="computer-hidden" type="as">
+      <default>[]</default>
+      <summary>Itens ocultos do Meu computador</summary>
+    </key>
+    <key name="notify-new-devices" type="b">
+      <default>true</default>
+      <summary>Avisar quando um dispositivo for conectado</summary>
+    </key>
+
+    <key name="json-migrated" type="b">
+      <default>false</default>
+      <summary>As preferências antigas (settings.json) já foram importadas</summary>
+    </key>
+  </schema>
+</schemalist>

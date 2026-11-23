@@ -15,7 +15,7 @@ import time
 from gi.repository import Gio, GLib, Gtk
 
 from . import discovery, imageload, native, util
-from .util import log
+from .util import gtype_name, log
 
 STEP_MS = 1500
 
@@ -475,6 +475,82 @@ def run(ctl) -> bool:
               and same(state()["uri"], home), str(state()))
         ctl.navigate(home)
 
+    # ── estilo Finder ↔ Nautilus padrão ──
+    from . import finder as finder_mod
+
+    shots = os.environ.get("VITRINE_SNAPSHOT_DIR", "")
+
+    def shot(name):
+        if shots:
+            os.makedirs(shots, exist_ok=True)
+            util.snapshot_png(ctl.win, os.path.join(shots, f"{name}.png"))
+
+    def finder_widgets():
+        return [w for w in util.walk(ctl.win)
+                if any(c.startswith(("vitrine-capsule", "vitrine-finder", "vitrine-search"))
+                       for c in w.get_css_classes()) and w is not ctl.win]
+
+    style_state = {}
+
+    @step
+    def f0():
+        ctl.cfg.set("window_style", "nautilus")
+
+    @step
+    def f1():
+        st = ctl.style
+        style_state["layouts"] = (st.header and st.header.get_decoration_layout(),)
+        style_state["n_native"] = sum(1 for _ in util.walk(ctl.win))
+        shot("nautilus-padrao")
+        ctl.cfg.set("window_style", "finder")
+
+    @step
+    def f2():
+        st = ctl.style
+        views = st.toolbar.view_buttons if st.toolbar else {}
+        check("estilo Finder: aplicado na hora (classe, CSS, barra de ferramentas)",
+              st.active and ctl.win.has_css_class("vitrine-finder") and finder_mod.css_loaded()
+              and set(views) == {"grid", "list", "columns"},
+              finder_mod.describe(ctl.win))
+        check("estilo Finder: botões da janela ficam no padrão do GNOME",
+              (st.header.get_decoration_layout(),) == style_state["layouts"]
+              and not any(c.startswith("vitrine") for w in util.walk(ctl.win)
+                          if gtype_name(w) == "GtkWindowControls" for c in w.get_css_classes()),
+              str(st.header.get_decoration_layout()))
+        active = [m for m, b in views.items() if b.get_active()]
+        check("estilo Finder: seletor de visualização mostra o modo atual",
+              len(active) == 1, str(active))
+        style_state["n_widgets"] = len(finder_widgets())
+        shot("finder")
+        ctl.cfg.set("window_style", "nautilus")
+
+    @step
+    def f3():
+        st = ctl.style
+        leftovers = finder_widgets()
+        check("Nautilus padrão: nada da camada Finder sobra (CSS, classe, widgets)",
+              not st.active and not ctl.win.has_css_class("vitrine-finder")
+              and not finder_mod.css_loaded() and not leftovers
+              and sum(1 for _ in util.walk(ctl.win)) == style_state["n_native"],
+              f"{finder_mod.describe(ctl.win)} sobras={[w.get_css_classes() for w in leftovers]} "
+              f"widgets={sum(1 for _ in util.walk(ctl.win))}/{style_state['n_native']}")
+        ctl.cfg.set("window_style", "finder")
+
+    @step
+    def f4():
+        check("Finder de novo: restaurado sem duplicar nada",
+              ctl.style.active and len(finder_widgets()) == style_state["n_widgets"],
+              f"{len(finder_widgets())} vs {style_state['n_widgets']}")
+        ctl.show_computer(True)
+
+    @step
+    def f5():
+        tb = ctl.style.toolbar
+        check("Finder: título mostra Meu computador e ← volta para a pasta",
+              tb is not None and tb.title.get_label() == "Meu computador", tb.title.get_label())
+        shot("finder-meu-computador")
+        ctl.win.activate_action("vitrine.back", None)
+
     @step
     def s11():
         st = state()
@@ -487,6 +563,7 @@ def run(ctl) -> bool:
         cfg.save()
         ctl.set_preview_visible(bool(saved_settings.get("preview_visible")))
         ctl.ext.refresh_computer_pages()
+        ctl.apply_window_style()
         ctl.ext.set_grid_zoom(saved_zoom)
         ok = sum(1 for r in results if r[1])
         log(f"SELFTEST RESUMO: {ok}/{len(results)} passaram")

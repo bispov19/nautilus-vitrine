@@ -234,3 +234,20 @@ def format_time(dt: GLib.DateTime | None) -> str:
     if dt is None:
         return "—"
     return dt.to_local().format("%d/%m/%Y %H:%M")
+
+
+def snapshot_png(widget: Gtk.Widget, path: str) -> bool:
+    """Salva o widget (ex.: a janela inteira) como PNG. Usado pelo autoteste."""
+    gi.require_version("Graphene", "1.0")
+    from gi.repository import Graphene
+
+    w, h = widget.get_width(), widget.get_height()
+    paintable = Gtk.WidgetPaintable.new(widget).get_current_image()
+    snap = Gtk.Snapshot()
+    paintable.snapshot(snap, w, h)
+    node = snap.to_node()
+    native = widget.get_native()
+    if node is None or native is None or w <= 0 or h <= 0:
+        return False
+    tex = native.get_renderer().render_texture(node, Graphene.Rect().init(0, 0, w, h))
+    return bool(tex.save_to_png(path))

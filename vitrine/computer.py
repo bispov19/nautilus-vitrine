@@ -687,6 +687,29 @@ class ComputerPage(Gtk.ScrolledWindow):
             group.add(row)
             return row
 
+        style = Adw.PreferencesGroup(
+            title="Estilo da janela",
+            description="Vale na hora, em todas as janelas abertas")
+        first = None
+        for value, title, subtitle in (
+                ("finder", "Finder (macOS)",
+                 "Botões da janela à esquerda, barra de ferramentas em cápsulas, "
+                 "barra lateral no estilo do Finder"),
+                ("nautilus", "Nautilus padrão",
+                 "O visual original do Nautilus. Colunas, pré-visualização e Meu computador "
+                 "continuam conforme as opções abaixo")):
+            check = Gtk.CheckButton(valign=Gtk.Align.CENTER,
+                                    active=cfg.get("window_style") == value)
+            if first is None:
+                first = check
+            else:
+                check.set_group(first)
+            check.connect("toggled", lambda c, v=value: c.get_active() and cfg.set("window_style", v))
+            row = Adw.ActionRow(title=title, subtitle=subtitle, activatable_widget=check)
+            row.add_prefix(check)
+            style.add(row)
+        page.add(style)
+
         general = Adw.PreferencesGroup(title="Geral")
         switch(general, "Abrir o Nautilus no Meu computador",
                "Ao abrir o Arquivos pelo menu de aplicativos (ou uma janela nova), começar aqui",

@@ -11,6 +11,7 @@ Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 
 BuildArch:      noarch
 BuildRequires:  python3-devel
+BuildRequires:  glib2
 
 Requires:       nautilus >= 50
 Requires:       nautilus-python >= 4
@@ -43,6 +44,9 @@ install -p -m 0644 nautilus-vitrine.py %{buildroot}%{extdir}/
 install -p -m 0644 vitrine/*.py %{buildroot}%{extdir}/vitrine/
 install -d %{buildroot}%{extdir}/vitrine/assets
 install -p -m 0644 vitrine/assets/* %{buildroot}%{extdir}/vitrine/assets/
+install -d %{buildroot}%{extdir}/vitrine/schemas
+install -p -m 0644 vitrine/schemas/*.gschema.xml %{buildroot}%{extdir}/vitrine/schemas/
+glib-compile-schemas --strict %{buildroot}%{extdir}/vitrine/schemas
 %py_byte_compile %{python3} %{buildroot}%{extdir}/vitrine
 
 %files

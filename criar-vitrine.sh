@@ -1311,6 +1311,29 @@ class ComputerPage(Gtk.ScrolledWindow):
             group.add(row)
             return row
 
+        style = Adw.PreferencesGroup(
+            title="Estilo da janela",
+            description="Vale na hora, em todas as janelas abertas")
+        first = None
+        for value, title, subtitle in (
+                ("finder", "Finder (macOS)",
+                 "Botões da janela à esquerda, barra de ferramentas em cápsulas, "
+                 "barra lateral no estilo do Finder"),
+                ("nautilus", "Nautilus padrão",
+                 "O visual original do Nautilus. Colunas, pré-visualização e Meu computador "
+                 "continuam conforme as opções abaixo")):
+            check = Gtk.CheckButton(valign=Gtk.Align.CENTER,
+                                    active=cfg.get("window_style") == value)
+            if first is None:
+                first = check
+            else:
+                check.set_group(first)
+            check.connect("toggled", lambda c, v=value: c.get_active() and cfg.set("window_style", v))
+            row = Adw.ActionRow(title=title, subtitle=subtitle, activatable_widget=check)
+            row.add_prefix(check)
+            style.add(row)
+        page.add(style)
+
         general = Adw.PreferencesGroup(title="Geral")
         switch(general, "Abrir o Nautilus no Meu computador",
                "Ao abrir o Arquivos pelo menu de aplicativos (ou uma janela nova), começar aqui",
@@ -1428,16 +1451,26 @@ class ComputerPage(Gtk.ScrolledWindow):
 __VITRINE_ARQUIVO_4__
 mkdir -p "vitrine"
 cat > 'vitrine/config.py' <<'__VITRINE_ARQUIVO_5__'
-"""Preferências e regras de visualização por pasta (JSON em ~/.config/nautilus-vitrine)."""
+"""Preferências (GSettings) e regras de visualização por pasta (JSON).
+
+Preferências: schema io.github.bispov19.NautilusVitrine, que vem dentro da extensão
+(vitrine/schemas) e é carregado com SettingsSchemaSource.new_from_directory, sem root.
+Na primeira vez, o antigo settings.json é importado (e guardado como .importado).
+Se o schema não puder ser carregado, cai no JSON de antes e registra no log.
+
+Regras por pasta: ~/.config/nautilus-vitrine/folders.json (são dados, não preferências).
+"""
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 
 from gi.repository import Gio, GLib
 
-from .util import log
+from .util import debug, log
 
 CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "nautilus-vitrine")
 SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
@@ -1446,7 +1479,13 @@ FOLDERS_PATH = os.path.join(CONFIG_DIR, "folders.json")
 MODES = ("list", "grid", "columns")
 GRID_ZOOMS = ("small", "small-plus", "medium", "large", "extra-large")
 
+SCHEMA_ID = "io.github.bispov19.NautilusVitrine"
+SCHEMA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schemas")
+WINDOW_STYLES = ("finder", "nautilus")
+
 DEFAULT_SETTINGS = {
+    # Estilo da janela: "finder" (visual do Finder do macOS) ou "nautilus" (padrão).
+    "window_style": "finder",
     # Painel de pré-visualização à direita (Ctrl+Shift+P).
     "preview_visible": True,
     "preview_width": 320,
@@ -1491,18 +1530,156 @@ def _load_json(path: str, fallback):
         return fallback
 
 
+# Tipo GVariant de cada chave (o nome no GSettings troca "_" por "-").
+_GS_TYPES = {
+    "window_style": "enum",
+    "preview_visible": "b", "preview_width": "i", "column_width": "i",
+    "max_visible_columns": "i", "remember_per_folder": "b", "auto_media_grid": "b",
+    "auto_media_zoom": "s", "auto_media_ratio": "d", "folder_discovery": "b",
+    "start_on_computer": "b", "computer_in_sidebar": "b", "computer_sections": "a{sb}",
+    "computer_hidden": "as", "notify_new_devices": "b",
+    "default_mode": "s?", "default_grid_zoom": "s?",  # "" no GSettings = None aqui
+}
+
+
+def _gs_key(key: str) -> str:
+    return key.replace("_", "-")
+
+
+def _schema_source() -> Gio.SettingsSchemaSource | None:
+    """Fonte com o schema da Vitrine: o compilado que vem com a extensão; se faltar
+    (ex.: cópia feita sem o install.sh), compila agora em ~/.cache."""
+    default = Gio.SettingsSchemaSource.get_default()
+    candidates = [SCHEMA_DIR]
+    if not os.path.exists(os.path.join(SCHEMA_DIR, "gschemas.compiled")):
+        cache = os.path.join(GLib.get_user_cache_dir(), "nautilus-vitrine", "schemas")
+        tool = shutil.which("glib-compile-schemas")
+        if tool:
+            try:
+                os.makedirs(cache, exist_ok=True)
+                subprocess.run([tool, "--targetdir", cache, SCHEMA_DIR], check=True,
+                               capture_output=True, timeout=10)
+                candidates = [cache]
+            except (OSError, subprocess.SubprocessError) as err:
+                log(f"config: não foi possível compilar o schema ({err})")
+    for path in candidates:
+        try:
+            return Gio.SettingsSchemaSource.new_from_directory(path, default, False)
+        except GLib.Error as err:
+            log(f"config: schema em {path} ilegível ({err.message})")
+    return None
+
+
+def open_gsettings() -> Gio.Settings | None:
+    try:
+        source = _schema_source()
+        schema = source.lookup(SCHEMA_ID, False) if source is not None else None
+        if schema is None:
+            log("config: schema da Vitrine não encontrado; usando settings.json")
+            return None
+        return Gio.Settings.new_full(schema, None, None)
+    except Exception as err:  # noqa: BLE001
+        log(f"config: GSettings indisponível ({err}); usando settings.json")
+        return None
+
+
+def _gs_read(gs: Gio.Settings, key: str):
+    kind = _GS_TYPES[key]
+    if kind == "enum":
+        return gs.get_string(_gs_key(key))
+    value = gs.get_value(_gs_key(key)).unpack()
+    if kind == "s?":
+        return value or None
+    return value
+
+
+def _gs_write(gs: Gio.Settings, key: str, value) -> None:
+    kind = _GS_TYPES[key]
+    if kind == "enum":
+        gs.set_string(_gs_key(key), str(value))
+    elif kind == "s?":
+        gs.set_value(_gs_key(key), GLib.Variant("s", value or ""))
+    elif kind == "a{sb}":
+        gs.set_value(_gs_key(key), GLib.Variant(kind, {str(k): bool(v)
+                                                      for k, v in (value or {}).items()}))
+    elif kind == "as":
+        gs.set_value(_gs_key(key), GLib.Variant(kind, [str(v) for v in (value or [])]))
+    elif kind == "d":
+        gs.set_value(_gs_key(key), GLib.Variant(kind, float(value)))
+    elif kind == "i":
+        gs.set_value(_gs_key(key), GLib.Variant(kind, int(value)))
+    else:
+        gs.set_value(_gs_key(key), GLib.Variant(kind, value))
+
+
 def _norm(uri: str) -> str:
     return Gio.File.new_for_uri(uri).get_uri()
 
 
 class Config:
-    def __init__(self) -> None:
+    def __init__(self, gsettings: Gio.Settings | None = None, *, use_gsettings: bool = True) -> None:
         self.settings = dict(DEFAULT_SETTINGS)
-        self.settings.update(_load_json(SETTINGS_PATH, {}))
+        self._listeners: list = []
+        self.gs = gsettings if gsettings is not None else (open_gsettings() if use_gsettings else None)
+        if self.gs is not None:
+            self._import_json_once()
+            for key in _GS_TYPES:
+                self.settings[key] = _gs_read(self.gs, key)
+            # Mudanças vindas de fora (gsettings no terminal, outra cópia) valem na hora.
+            self.gs.connect("changed", self._on_gs_changed)
+        else:
+            self.settings.update(_load_json(SETTINGS_PATH, {}))
         raw = _load_json(FOLDERS_PATH, {})
         self.folders: dict[str, dict] = {k: v for k, v in raw.items() if isinstance(v, dict)}
         self._save_id = 0
         self._seed_defaults()
+
+    @property
+    def backend(self) -> str:
+        return "gsettings" if self.gs is not None else "json"
+
+    def _import_json_once(self) -> None:
+        gs = self.gs
+        if gs.get_boolean("json-migrated"):
+            return
+        old = _load_json(SETTINGS_PATH, None)
+        if isinstance(old, dict):
+            imported = []
+            for key, value in old.items():
+                if key in _GS_TYPES and value is not None:
+                    try:
+                        _gs_write(gs, key, value)
+                        imported.append(key)
+                    except (TypeError, ValueError) as err:
+                        log(f"config: não importei {key}={value!r} ({err})")
+            try:
+                os.replace(SETTINGS_PATH, SETTINGS_PATH + ".importado")
+            except OSError:
+                pass
+            log(f"config: settings.json importado para o GSettings ({len(imported)} chaves)")
+        gs.set_boolean("json-migrated", True)
+
+    # ── avisos de mudança ──
+    def on_change(self, callback) -> None:
+        """callback(chave) quando uma preferência muda (aqui ou fora do Nautilus)."""
+        self._listeners.append(callback)
+
+    def _notify(self, key: str) -> None:
+        for cb in list(self._listeners):
+            try:
+                cb(key)
+            except Exception as err:  # noqa: BLE001
+                log(f"config: ouvinte de {key}: {err}")
+
+    def _on_gs_changed(self, gs, gs_key: str) -> None:
+        key = gs_key.replace("-", "_")
+        if key not in _GS_TYPES:
+            return
+        value = _gs_read(gs, key)
+        if self.settings.get(key) != value:
+            debug(f"config: {key} mudou fora da Vitrine -> {value!r}")
+            self.settings[key] = value
+            self._notify(key)
 
     def _seed_defaults(self) -> None:
         changed = False
@@ -1543,8 +1720,11 @@ class Config:
         return self.settings.get(key, DEFAULT_SETTINGS.get(key))
 
     def set(self, key: str, value) -> None:
+        changed = self.settings.get(key) != value
         self.settings[key] = value
         self.save()
+        if changed:
+            self._notify(key)
 
     def rule_for(self, uri: str) -> tuple[dict | None, bool]:
         """Regra que vale para `uri`: (regra, é_exata). Sobe pelas pastas-pai
@@ -1591,9 +1771,19 @@ class Config:
 
     def _flush(self) -> bool:
         self._save_id = 0
+        files = [(FOLDERS_PATH, self.folders)]
+        if self.gs is not None:
+            for key in _GS_TYPES:
+                try:
+                    if _gs_read(self.gs, key) != self.settings.get(key):
+                        _gs_write(self.gs, key, self.settings.get(key))
+                except (TypeError, ValueError) as err:
+                    log(f"config: valor inválido para {key}: {self.settings.get(key)!r} ({err})")
+        else:
+            files.insert(0, (SETTINGS_PATH, self.settings))
         try:
             os.makedirs(CONFIG_DIR, exist_ok=True)
-            for path, data in ((SETTINGS_PATH, self.settings), (FOLDERS_PATH, self.folders)):
+            for path, data in files:
                 tmp = path + ".tmp"
                 with open(tmp, "w", encoding="utf-8") as fh:
                     json.dump(data, fh, indent=2, ensure_ascii=False)
@@ -2147,6 +2337,8 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         self._prefs = Gio.Settings.new("org.gnome.nautilus.preferences")
         self._icon_prefs = Gio.Settings.new("org.gnome.nautilus.icon-view")
         self._icon_prefs.connect("changed::default-zoom-level", self._on_zoom_changed)
+        self.cfg.on_change(self._on_setting_changed)
+        log(f"preferências: {self.cfg.backend}")
         self.hub = DeviceHub()
         self.hub.on_new_device(self._on_new_device)
         log(f"Vitrine {VERSION} carregada")
@@ -2219,6 +2411,14 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         if ctl is None and self.windows:
             ctl = next(iter(self.windows.values()))
         return ctl
+
+    @guarded
+    def _on_setting_changed(self, key: str) -> None:
+        if key == "window_style":
+            for ctl in list(self.windows.values()):
+                ctl.apply_window_style()
+        elif key in ("computer_in_sidebar", "computer_hidden", "computer_sections"):
+            self.refresh_computer_pages()
 
     def refresh_computer_pages(self) -> None:
         for ctl in list(self.windows.values()):
@@ -3150,7 +3350,7 @@ import time
 from gi.repository import Gio, GLib, Gtk
 
 from . import discovery, imageload, native, util
-from .util import log
+from .util import gtype_name, log
 
 STEP_MS = 1500
 
@@ -3610,6 +3810,82 @@ def run(ctl) -> bool:
               and same(state()["uri"], home), str(state()))
         ctl.navigate(home)
 
+    # ── estilo Finder ↔ Nautilus padrão ──
+    from . import finder as finder_mod
+
+    shots = os.environ.get("VITRINE_SNAPSHOT_DIR", "")
+
+    def shot(name):
+        if shots:
+            os.makedirs(shots, exist_ok=True)
+            util.snapshot_png(ctl.win, os.path.join(shots, f"{name}.png"))
+
+    def finder_widgets():
+        return [w for w in util.walk(ctl.win)
+                if any(c.startswith(("vitrine-capsule", "vitrine-finder", "vitrine-search"))
+                       for c in w.get_css_classes()) and w is not ctl.win]
+
+    style_state = {}
+
+    @step
+    def f0():
+        ctl.cfg.set("window_style", "nautilus")
+
+    @step
+    def f1():
+        st = ctl.style
+        style_state["layouts"] = (st.header and st.header.get_decoration_layout(),)
+        style_state["n_native"] = sum(1 for _ in util.walk(ctl.win))
+        shot("nautilus-padrao")
+        ctl.cfg.set("window_style", "finder")
+
+    @step
+    def f2():
+        st = ctl.style
+        views = st.toolbar.view_buttons if st.toolbar else {}
+        check("estilo Finder: aplicado na hora (classe, CSS, barra de ferramentas)",
+              st.active and ctl.win.has_css_class("vitrine-finder") and finder_mod.css_loaded()
+              and set(views) == {"grid", "list", "columns"},
+              finder_mod.describe(ctl.win))
+        check("estilo Finder: botões da janela ficam no padrão do GNOME",
+              (st.header.get_decoration_layout(),) == style_state["layouts"]
+              and not any(c.startswith("vitrine") for w in util.walk(ctl.win)
+                          if gtype_name(w) == "GtkWindowControls" for c in w.get_css_classes()),
+              str(st.header.get_decoration_layout()))
+        active = [m for m, b in views.items() if b.get_active()]
+        check("estilo Finder: seletor de visualização mostra o modo atual",
+              len(active) == 1, str(active))
+        style_state["n_widgets"] = len(finder_widgets())
+        shot("finder")
+        ctl.cfg.set("window_style", "nautilus")
+
+    @step
+    def f3():
+        st = ctl.style
+        leftovers = finder_widgets()
+        check("Nautilus padrão: nada da camada Finder sobra (CSS, classe, widgets)",
+              not st.active and not ctl.win.has_css_class("vitrine-finder")
+              and not finder_mod.css_loaded() and not leftovers
+              and sum(1 for _ in util.walk(ctl.win)) == style_state["n_native"],
+              f"{finder_mod.describe(ctl.win)} sobras={[w.get_css_classes() for w in leftovers]} "
+              f"widgets={sum(1 for _ in util.walk(ctl.win))}/{style_state['n_native']}")
+        ctl.cfg.set("window_style", "finder")
+
+    @step
+    def f4():
+        check("Finder de novo: restaurado sem duplicar nada",
+              ctl.style.active and len(finder_widgets()) == style_state["n_widgets"],
+              f"{len(finder_widgets())} vs {style_state['n_widgets']}")
+        ctl.show_computer(True)
+
+    @step
+    def f5():
+        tb = ctl.style.toolbar
+        check("Finder: título mostra Meu computador e ← volta para a pasta",
+              tb is not None and tb.title.get_label() == "Meu computador", tb.title.get_label())
+        shot("finder-meu-computador")
+        ctl.win.activate_action("vitrine.back", None)
+
     @step
     def s11():
         st = state()
@@ -3622,6 +3898,7 @@ def run(ctl) -> bool:
         cfg.save()
         ctl.set_preview_visible(bool(saved_settings.get("preview_visible")))
         ctl.ext.refresh_computer_pages()
+        ctl.apply_window_style()
         ctl.ext.set_grid_zoom(saved_zoom)
         ok = sum(1 for r in results if r[1])
         log(f"SELFTEST RESUMO: {ok}/{len(results)} passaram")
@@ -3877,6 +4154,23 @@ def format_time(dt: GLib.DateTime | None) -> str:
     if dt is None:
         return "—"
     return dt.to_local().format("%d/%m/%Y %H:%M")
+
+
+def snapshot_png(widget: Gtk.Widget, path: str) -> bool:
+    """Salva o widget (ex.: a janela inteira) como PNG. Usado pelo autoteste."""
+    gi.require_version("Graphene", "1.0")
+    from gi.repository import Graphene
+
+    w, h = widget.get_width(), widget.get_height()
+    paintable = Gtk.WidgetPaintable.new(widget).get_current_image()
+    snap = Gtk.Snapshot()
+    paintable.snapshot(snap, w, h)
+    node = snap.to_node()
+    native = widget.get_native()
+    if node is None or native is None or w <= 0 or h <= 0:
+        return False
+    tex = native.get_renderer().render_texture(node, Graphene.Rect().init(0, 0, w, h))
+    return bool(tex.save_to_png(path))
 __VITRINE_ARQUIVO_13__
 mkdir -p "vitrine"
 cat > 'vitrine/window.py' <<'__VITRINE_ARQUIVO_14__'
@@ -3891,6 +4185,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 from . import discovery, native
 from .columns import ColumnStrip
 from .computer import ComputerPage
+from .finder import FinderStyle
 from .history import History
 from .preview import PreviewPane
 from .util import (ancestor, debug, dump_tree, find_by_type_name, find_first, gtype_name, guarded,
@@ -3940,6 +4235,7 @@ class WindowController:
         self._mouse_takeover = False
         self.history_shortcuts_removed = 0
         self._leave_source = 0
+        self.style: FinderStyle | None = None
 
     # ───────────────────────── injeção ─────────────────────────
     def inject(self) -> bool:
@@ -4006,6 +4302,8 @@ class WindowController:
         self._inject_sidebar_row()
         self._install_keys()
         self._take_over_history()
+        self.style = FinderStyle(self)
+        self.apply_window_style()
 
         tv.connect("notify::selected-page", self._on_tab_switched)
         tv.connect("page-attached", lambda _tv, page, _pos: self._watch_slot(page.get_child()))
@@ -4034,6 +4332,20 @@ class WindowController:
             self._update_history_actions()
             log("janela aberta direto no Meu computador")
         return GLib.SOURCE_REMOVE
+
+    def apply_window_style(self) -> None:
+        """Estilo da janela: "finder" aplica o visual do Finder; "nautilus" remove tudo
+        o que ele acrescentou (vale na hora, em todas as janelas)."""
+        if self.style is None:
+            return
+        if self.cfg.get("window_style") == "finder":
+            self.style.apply()
+        else:
+            self.style.remove()
+
+    def _style_sync(self) -> None:
+        if self.style is not None and self.style.active:
+            self.style.sync()
 
     def should_start_on_computer(self, uri: str | None) -> bool:
         """Só quando a janela abriu na pasta pessoal (menu de aplicativos, Ctrl+N).
@@ -4196,6 +4508,7 @@ class WindowController:
             if native_lb is not None:
                 native_lb.unselect_all()
             self.computer.grab_focus()
+            self._style_sync()
         else:
             if self.sidebar_list is not None:
                 self.sidebar_list.unselect_all()
@@ -4566,6 +4879,7 @@ class WindowController:
             self.preview.set_folder(uri if regular else None)
             self.preview.show_uris([])
         self._rebind_model_soon()
+        self._style_sync()
 
     def _rebind_model_soon(self) -> None:
         for delay in (0, 250, 900):
@@ -4810,6 +5124,7 @@ class WindowController:
                 self.btn_preview.set_active(self.preview.get_visible())
         finally:
             self._syncing_buttons = False
+        self._style_sync()
 
     @guarded
     def _on_btn_columns(self, btn) -> None:
@@ -4848,6 +5163,8 @@ class WindowController:
 
     @guarded
     def _on_destroy(self, *_a) -> None:
+        if self.style is not None:
+            self.style.remove()
         self.model_watch.unbind()
         if self.strip is not None:
             self.strip.teardown()
@@ -4866,7 +5183,109 @@ cat > 'vitrine/assets/about.css' <<'__VITRINE_ARQUIVO_15__'
 }
 __VITRINE_ARQUIVO_15__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/nautilus-vitrine-logo.svg' <<'__VITRINE_ARQUIVO_16__'
+cat > 'vitrine/assets/finder.css' <<'__VITRINE_ARQUIVO_16__'
+/* Estilo "Finder (macOS)" da Vitrine.
+ *
+ * Toda regra começa com window.vitrine-finder: sem essa classe na janela, nada daqui
+ * vale (é assim que o "Nautilus padrão" fica limpo). Cores vêm das variáveis do
+ * libadwaita (claro/escuro e cor de destaque do sistema).
+ *
+ * Sem desfoque: o GTK4 não tem backdrop-filter e o GNOME (Mutter) não desfoca janelas
+ * de aplicativos. O "vidro" é imitado com tons levemente mais claros/escuros.
+ */
+
+/* Os botões da janela (fechar, minimizar, maximizar) ficam no padrão do GNOME. */
+
+/* ── barra de título / ferramentas ── */
+window.vitrine-finder .vitrine-finder-header {
+  min-height: 52px;
+  background-color: var(--view-bg-color);
+  box-shadow: none;
+}
+window.vitrine-finder .vitrine-finder-header > windowhandle > box { padding: 6px 10px; }
+window.vitrine-finder .vitrine-finder-title {
+  font-weight: 700;
+  font-size: 1.15em;
+  margin: 0 8px 0 6px;
+}
+
+/* cápsulas: grupos de botões arredondados, como no Finder */
+window.vitrine-finder .vitrine-capsule {
+  border-radius: 99px;
+  padding: 3px;
+  background-color: color-mix(in srgb, currentColor 5%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, currentColor 7%, transparent),
+              0 1px 2px rgb(0 0 0 / 0.06);
+}
+window.vitrine-finder .vitrine-capsule button,
+window.vitrine-finder .vitrine-capsule menubutton > button {
+  min-height: 28px; min-width: 34px;
+  padding: 0 8px;
+  border-radius: 99px;
+  background: none;
+  box-shadow: none;
+}
+window.vitrine-finder .vitrine-capsule button:hover,
+window.vitrine-finder .vitrine-capsule menubutton > button:hover {
+  background-color: color-mix(in srgb, currentColor 8%, transparent);
+}
+window.vitrine-finder .vitrine-capsule button:checked {
+  background-color: color-mix(in srgb, currentColor 13%, transparent);
+}
+window.vitrine-finder .vitrine-capsule > separator {
+  margin: 6px 0;
+  background-color: color-mix(in srgb, currentColor 15%, transparent);
+}
+window.vitrine-finder .vitrine-capsule button:disabled { opacity: 0.35; }
+
+/* campo Pesquisar */
+window.vitrine-finder .vitrine-search-pill {
+  min-width: 190px; min-height: 30px;
+  padding: 0 12px;
+  border-radius: 99px;
+  background-color: color-mix(in srgb, currentColor 5%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, currentColor 7%, transparent);
+}
+window.vitrine-finder .vitrine-search-pill label {
+  color: color-mix(in srgb, currentColor 55%, transparent);
+}
+
+/* ── barra lateral ── */
+window.vitrine-finder .vitrine-finder-sidebar,
+window.vitrine-finder .vitrine-finder-sidebar-header {
+  background-color: color-mix(in srgb, var(--sidebar-bg-color) 85%, var(--view-bg-color));
+}
+window.vitrine-finder .vitrine-finder-sidebar .navigation-sidebar {
+  background: none;
+  padding: 4px 8px;
+}
+window.vitrine-finder .vitrine-finder-sidebar .navigation-sidebar > row {
+  min-height: 30px;
+  margin: 1px 0;
+  padding: 0 8px;
+  border-radius: 8px;
+}
+window.vitrine-finder .vitrine-finder-sidebar .navigation-sidebar > row:selected {
+  background-color: color-mix(in srgb, currentColor 11%, transparent);
+  color: inherit;
+}
+window.vitrine-finder .vitrine-finder-sidebar .navigation-sidebar > row:selected label {
+  font-weight: 600;
+}
+/* ícones na cor de destaque (o ⏏ e os botões da linha ficam neutros) */
+window.vitrine-finder .vitrine-finder-sidebar .navigation-sidebar > row image {
+  color: var(--accent-color);
+}
+window.vitrine-finder .vitrine-finder-sidebar .navigation-sidebar > row button image {
+  color: inherit;
+}
+
+/* ── conteúdo ── */
+window.vitrine-finder .vitrine-computer,
+window.vitrine-finder .vitrine-strip { background-color: var(--view-bg-color); }
+__VITRINE_ARQUIVO_16__
+mkdir -p "vitrine/assets"
+cat > 'vitrine/assets/nautilus-vitrine-logo.svg' <<'__VITRINE_ARQUIVO_17__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
@@ -4887,9 +5306,9 @@ cat > 'vitrine/assets/nautilus-vitrine-logo.svg' <<'__VITRINE_ARQUIVO_16__'
   <path d="M58 98 a18 18 0 0 1 18-18 h30 l14 16 h60 a18 18 0 0 1 18 18 v60 a18 18 0 0 1 -18 18 H76 a18 18 0 0 1 -18-18 Z" fill="none" stroke="url(#glass)" stroke-width="15" stroke-linejoin="round"/>
   <path d="M128 120 Q131.5 136.5 148 140 Q131.5 143.5 128 160 Q124.5 143.5 108 140 Q124.5 136.5 128 120 Z" fill="#ffd166"/>
 </svg>
-__VITRINE_ARQUIVO_16__
+__VITRINE_ARQUIVO_17__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/nautilus-vitrine-mark.svg' <<'__VITRINE_ARQUIVO_17__'
+cat > 'vitrine/assets/nautilus-vitrine-mark.svg' <<'__VITRINE_ARQUIVO_18__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
   <defs>
     <linearGradient id="glass" x1="0" y1="0" x2="1" y2="1">
@@ -4900,9 +5319,9 @@ cat > 'vitrine/assets/nautilus-vitrine-mark.svg' <<'__VITRINE_ARQUIVO_17__'
   <path d="M40 90 a22 22 0 0 1 22-22 h38 l18 20 h76 a22 22 0 0 1 22 22 v74 a22 22 0 0 1 -22 22 H62 a22 22 0 0 1 -22-22 Z" fill="none" stroke="url(#glass)" stroke-width="16" stroke-linejoin="round"/>
   <path d="M128 112 Q132.5 133.5 154 138 Q132.5 142.5 128 164 Q123.5 142.5 102 138 Q123.5 133.5 128 112 Z" fill="#ffd166"/>
 </svg>
-__VITRINE_ARQUIVO_17__
+__VITRINE_ARQUIVO_18__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/nautilus-vitrine-symbolic.svg' <<'__VITRINE_ARQUIVO_18__'
+cat > 'vitrine/assets/nautilus-vitrine-symbolic.svg' <<'__VITRINE_ARQUIVO_19__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Ícones simbólicos do GTK são recoloridos forçando `fill`: por isso o contorno
        da pasta é um caminho preenchido (borda externa menos borda interna, evenodd)
@@ -4910,9 +5329,603 @@ cat > 'vitrine/assets/nautilus-vitrine-symbolic.svg' <<'__VITRINE_ARQUIVO_18__'
   <path fill="currentColor" fill-rule="evenodd" d="M1.2 4.6 A2.2 2.2 0 0 1 3.4 2.4 H6.2 A0.8 0.8 0 0 1 6.807 2.679 L7.768 3.8 H12.6 A2.2 2.2 0 0 1 14.8 6 V12.4 A2.2 2.2 0 0 1 12.6 14.6 H3.4 A2.2 2.2 0 0 1 1.2 12.4 Z M2.8 4.6 A0.6 0.6 0 0 1 3.4 4 H5.832 L6.793 5.121 A0.8 0.8 0 0 0 7.4 5.4 H12.6 A0.6 0.6 0 0 1 13.2 6 V12.4 A0.6 0.6 0 0 1 12.6 13 H3.4 A0.6 0.6 0 0 1 2.8 12.4 Z"/>
   <path fill="currentColor" d="M8 6.1 Q8.35 8.15 10.4 8.5 Q8.35 8.85 8 10.9 Q7.65 8.85 5.6 8.5 Q7.65 8.15 8 6.1 Z"/>
 </svg>
-__VITRINE_ARQUIVO_18__
+__VITRINE_ARQUIVO_19__
+mkdir -p "vitrine/finder"
+cat > 'vitrine/finder/__init__.py' <<'__VITRINE_ARQUIVO_20__'
+"""Estilo "Finder (macOS)": visual e ferramentas inspirados no Finder, por cima do
+Nautilus, e removível a qualquer momento.
+
+Como a volta ao "Nautilus padrão" fica limpa:
+  * todo o CSS é de um único arquivo (assets/finder.css), com regras presas à classe
+    `.vitrine-finder` da janela, e o provedor sai do display quando nenhuma janela usa;
+  * cada mudança feita na janela (widget acrescentado, widget escondido, propriedade
+    trocada, sinal conectado) registra a sua própria desfeita numa pilha (`_undo`);
+    `remove()` desfaz tudo na ordem inversa.
+Se algo falhar ao aplicar, desfazemos o que já foi feito e a janela fica no padrão.
+"""
+
+from __future__ import annotations
+
+import os
+
+from gi.repository import Adw, Gdk, Gtk
+
+from ..util import ASSETS, ancestor, find_by_type_name, find_first, gtype_name, log, walk
+from .toolbar import FinderToolbar
+
+_css = {"provider": None, "users": 0}
+
+
+def _css_acquire() -> None:
+    display = Gdk.Display.get_default()
+    if display is None:
+        return
+    if _css["provider"] is None:
+        provider = Gtk.CssProvider()
+        provider.load_from_path(os.path.join(ASSETS, "finder.css"))
+        Gtk.StyleContext.add_provider_for_display(
+            display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        _css["provider"] = provider
+    _css["users"] += 1
+
+
+def _css_release() -> None:
+    _css["users"] = max(0, _css["users"] - 1)
+    display = Gdk.Display.get_default()
+    if _css["users"] == 0 and _css["provider"] is not None and display is not None:
+        Gtk.StyleContext.remove_provider_for_display(display, _css["provider"])
+        _css["provider"] = None
+
+
+def css_loaded() -> bool:
+    return _css["provider"] is not None
+
+
+class FinderStyle:
+    """Aplica/remove o estilo Finder numa janela (um por WindowController)."""
+
+    def __init__(self, ctl) -> None:
+        self.ctl = ctl
+        self.win = ctl.win
+        self.active = False
+        self._undo: list = []
+        self.toolbar: FinderToolbar | None = None
+        self.header: Adw.HeaderBar | None = None
+        self.sidebar_header: Adw.HeaderBar | None = None
+        self.split: Adw.OverlaySplitView | None = None
+
+    # ── registro de desfeitas ──
+    def _later(self, fn) -> None:
+        self._undo.append(fn)
+
+    def _class(self, widget, name: str) -> None:
+        if widget is None or widget.has_css_class(name):
+            return
+        widget.add_css_class(name)
+        self._later(lambda: widget.remove_css_class(name))
+
+    def _connect(self, obj, signal: str, cb) -> None:
+        hid = obj.connect(signal, cb)
+        self._later(lambda: obj.disconnect(hid))
+
+    def _prop(self, obj, name: str, value) -> None:
+        old = obj.get_property(name)
+        obj.set_property(name, value)
+        self._later(lambda: obj.set_property(name, old))
+
+    def _hide(self, widget, restore=None) -> None:
+        """Esconde um widget do Nautilus e o mantém escondido, mesmo que o Nautilus
+        tente mostrá-lo de novo (alguns têm `visible` ligado a uma propriedade).
+        `restore()` diz qual deve ser a visibilidade ao desfazer."""
+        if widget is None:
+            return
+        was = widget.get_visible()
+        widget.set_visible(False)
+
+        def keep(w, _p):
+            if self.active and w.get_visible():
+                w.set_visible(False)
+
+        hid = widget.connect("notify::visible", keep)
+
+        def undo():
+            widget.disconnect(hid)
+            widget.set_visible(restore() if restore is not None else was)
+
+        self._later(undo)
+
+    # ── aplicar / remover ──
+    def apply(self) -> bool:
+        if self.active:
+            return True
+        try:
+            self.active = True
+            _css_acquire()
+            self._later(_css_release)
+            self._class(self.win, "vitrine-finder")
+            self._find_bars()
+            self._sidebar()
+            self._toolbar()
+            self.sync()
+            log("estilo Finder aplicado")
+            return True
+        except Exception as err:  # noqa: BLE001
+            log(f"estilo Finder: falhou ao aplicar ({err!r}); voltando ao padrão")
+            self.remove()
+            return False
+
+    def remove(self) -> None:
+        was_active = self.active
+        self.active = False
+        while self._undo:
+            fn = self._undo.pop()
+            try:
+                fn()
+            except Exception as err:  # noqa: BLE001
+                log(f"estilo Finder: falha ao desfazer ({err!r})")
+        self.toolbar = None
+        if was_active:
+            log("estilo Finder removido (Nautilus padrão)")
+
+    # ── partes ──
+    def _find_bars(self) -> None:
+        """Localiza as barras de título do Nautilus. Os botões da janela (fechar,
+        minimizar, maximizar) não são tocados: ficam como o GNOME desenha."""
+        self.split = find_first(self.win, lambda w: isinstance(w, Adw.OverlaySplitView))
+        toolbar = find_by_type_name(self.win, "NautilusToolbar")
+        self.header = find_first(toolbar, lambda w: isinstance(w, Adw.HeaderBar)) if toolbar else None
+        sidebar = self.split.get_sidebar() if self.split is not None else None
+        self.sidebar_header = find_first(sidebar, lambda w: isinstance(w, Adw.HeaderBar)) \
+            if sidebar is not None else None
+        if self.header is None or self.sidebar_header is None:
+            raise RuntimeError("barras de título do Nautilus não encontradas")
+        self._class(self.header, "vitrine-finder-header")
+        self._class(self.sidebar_header, "vitrine-finder-sidebar-header")
+
+    def _sidebar(self) -> None:
+        """Cabeçalho da barra lateral sem o título "Arquivos" e sem a lupa (a pesquisa
+        fica na barra de ferramentas); os botões da janela continuam os do GNOME."""
+        bar = self.sidebar_header
+        title = bar.get_title_widget()
+        if title is not None:
+            self._hide(title)
+        for w in walk(bar):
+            if isinstance(w, Gtk.ToggleButton) and w.get_action_name() == "slot.search-global":
+                self._hide(w)  # "Buscar em todos os lugares" fica no menu ⋯ e na pesquisa
+        sidebar = find_by_type_name(self.win, "NautilusSidebar")
+        pane = ancestor(sidebar, lambda w: isinstance(w, Adw.ToolbarView)) if sidebar else None
+        self._class(pane, "vitrine-finder-sidebar")
+
+    def _toolbar(self) -> None:
+        header = self.header
+        toolbar = find_by_type_name(self.win, "NautilusToolbar")
+        # ← → do Nautilus (cabeçalho) e controles de visualização nativos: o Finder
+        # tem os seus. O `visible` deles segue propriedades do NautilusToolbar.
+        stack = find_first(header, lambda w: isinstance(w, Gtk.Stack)
+                           and find_by_type_name(w, "NautilusHistoryControls") is not None)
+        self._hide(stack, lambda: bool(toolbar.get_property("show-history-controls")))
+        controls = find_by_type_name(header, "NautilusViewControls")
+        self._hide(controls, lambda: bool(toolbar.get_property("show-view-controls")))
+        # Botões Colunas/Pré-visualização da Vitrine: viram parte da barra do Finder.
+        if self.ctl.btn_columns is not None:
+            self._hide(self.ctl.btn_columns.get_parent())
+        # Barra de caminho: no Finder, só o nome da pasta (a barra volta ao editar o
+        # local com Ctrl+L ou ao pesquisar).
+        switcher = find_first(header, lambda w: isinstance(w, Gtk.Stack)
+                              and w.get_child_by_name("pathbar") is not None)
+        search_toggle = None
+        for w in walk(header):
+            if isinstance(w, Gtk.ToggleButton) and w.get_action_name() == "slot.search-visible":
+                search_toggle = w
+        if search_toggle is not None:
+            self._hide(search_toggle.get_parent() if isinstance(search_toggle.get_parent(), Gtk.Stack)
+                       else search_toggle)
+
+        self.toolbar = FinderToolbar(self.ctl, switcher)
+        self.toolbar.attach(header, self._later)
+        if switcher is not None:
+            self._connect(switcher, "notify::visible-child-name",
+                          lambda *_a: self.toolbar and self.toolbar.sync_title())
+            self._later(lambda s=switcher: s.set_visible(True))
+
+    # ── estado ──
+    def sync(self) -> None:
+        """Chamado pelo WindowController quando muda pasta, aba, modo ou Meu computador."""
+        if self.active and self.toolbar is not None:
+            self.toolbar.sync()
+
+
+def describe(win) -> str:
+    """Resumo para o log/autoteste."""
+    return (f"classe={win.has_css_class('vitrine-finder')} css={css_loaded()} "
+            f"janela={gtype_name(win)}")
+
+__VITRINE_ARQUIVO_20__
+mkdir -p "vitrine/finder"
+cat > 'vitrine/finder/toolbar.py' <<'__VITRINE_ARQUIVO_21__'
+"""Barra de ferramentas do estilo Finder, montada dentro do AdwHeaderBar do Nautilus:
+
+    [← | →]  Título da pasta          [▦ ☰ ▥] [⇅ ⌄] [⇪] [⋯] [🔍 Pesquisar]
+
+Os botões chamam as ações do próprio Nautilus (view.sort, view.new-folder,
+view.properties…) sempre que existem: nada de arquivo é reimplementado aqui. Os rótulos
+vêm da tradução oficial do Nautilus (gettext, domínio "nautilus"), para seguir os nomes
+do GNOME no idioma do sistema.
+"""
+
+from __future__ import annotations
+
+import gettext
+
+from gi.repository import Gio, GLib, Gtk, Pango
+
+from .. import native, util
+from ..util import guarded, log
+
+
+def nt(msgid: str, fallback: str | None = None) -> str:
+    """Texto da tradução do Nautilus, sem o sublinhado de atalho. Se o Nautilus não
+    tiver esse texto traduzido, usa `fallback` (em português)."""
+    text = gettext.dgettext("nautilus", msgid)
+    if text == msgid and fallback is not None:
+        text = fallback
+    return text.replace("_", "")
+
+
+# (rótulo, atributo, invertido) para a ação nativa view.sort, que recebe "(sb)".
+SORTS = (
+    (lambda: "A-Z", "name", False),
+    (lambda: "Z-A", "name", True),
+    (lambda: nt("Last Modified", "Última modificação"), "date_modified", True),
+    (lambda: nt("First Modified", "Primeira modificação"), "date_modified", False),
+    (lambda: nt("Size", "Tamanho"), "size", True),
+    (lambda: nt("Type", "Tipo"), "type", False),
+)
+
+VIEWS = (
+    ("grid", "view-grid-symbolic", lambda: nt("Grid View", "Ícones"), "Ctrl+2"),
+    ("list", "view-list-symbolic", lambda: nt("List View", "Lista"), "Ctrl+1"),
+    ("columns", "view-dual-symbolic", lambda: "Colunas", "Ctrl+3"),
+)
+
+
+def _capsule(*children) -> Gtk.Box:
+    box = Gtk.Box(valign=Gtk.Align.CENTER)
+    box.add_css_class("vitrine-capsule")
+    for c in children:
+        box.append(c)
+    return box
+
+
+def _menu_button(icon: str, tooltip: str, menu: Gio.Menu, *, arrow: bool = False) -> Gtk.MenuButton:
+    btn = Gtk.MenuButton(menu_model=menu, tooltip_text=tooltip, valign=Gtk.Align.CENTER)
+    if arrow:
+        content = Gtk.Box(spacing=4)
+        content.append(Gtk.Image.new_from_icon_name(icon))
+        content.append(Gtk.Image.new_from_icon_name("pan-down-symbolic"))
+        btn.set_child(content)
+    else:
+        btn.set_icon_name(icon)
+    btn.add_css_class("flat")
+    return btn
+
+
+class FinderToolbar:
+    def __init__(self, ctl, switcher: Gtk.Stack | None) -> None:
+        self.ctl = ctl
+        self.switcher = switcher
+        self.view_buttons: dict[str, Gtk.ToggleButton] = {}
+        self._syncing = False
+        self.title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=28,
+                               valign=Gtk.Align.CENTER)
+        self.title.add_css_class("vitrine-finder-title")
+        self.actions = Gio.SimpleActionGroup()
+
+    # ── montagem ──
+    def attach(self, header, later) -> None:
+        win = self.ctl.win
+        self._install_actions()
+        win.insert_action_group("vfinder", self.actions)
+        later(lambda: win.insert_action_group("vfinder", None))
+
+        start = [self._nav(), self.title]
+        end = [self._search(), self._more(), self._share(), self._sort(), self._views()]
+        for w in start:
+            header.pack_start(w)
+            later(lambda w=w: header.remove(w))
+        for w in end:  # pack_end: o primeiro fica mais à direita
+            header.pack_end(w)
+            later(lambda w=w: header.remove(w))
+
+    def _nav(self) -> Gtk.Widget:
+        back = Gtk.Button(icon_name="go-previous-symbolic", action_name="vitrine.back",
+                          tooltip_text=nt("Back", "Voltar"))
+        fwd = Gtk.Button(icon_name="go-next-symbolic", action_name="vitrine.forward",
+                         tooltip_text=nt("Forward", "Avançar"))
+        box = _capsule(back, Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), fwd)
+        box.add_css_class("vitrine-nav")
+        return box
+
+    def _views(self) -> Gtk.Widget:
+        box = _capsule()
+        box.add_css_class("vitrine-views")
+        first = None
+        for mode, icon, label, accel in VIEWS:
+            btn = Gtk.ToggleButton(icon_name=icon, tooltip_text=f"{label()} ({accel})")
+            if first is None:
+                first = btn
+            else:
+                btn.set_group(first)
+            btn.connect("toggled", self._on_view_toggled, mode)
+            self.view_buttons[mode] = btn
+            box.append(btn)
+        return box
+
+    def _sort(self) -> Gtk.Widget:
+        menu = Gio.Menu()
+        section = Gio.Menu()
+        for label, attr, reverse in SORTS:
+            item = Gio.MenuItem.new(label(), None)
+            item.set_action_and_target_value("view.sort", GLib.Variant("(sb)", (attr, reverse)))
+            section.append_item(item)
+        menu.append_section("Ordenar por", section)
+        return _capsule(_menu_button("view-sort-descending-symbolic", "Ordenar", menu, arrow=True))
+
+    def _share(self) -> Gtk.Widget:
+        menu = Gio.Menu()
+        menu.append(nt("_Copy Location", "Copiar local"), "vfinder.copy-location")
+        menu.append("Enviar por e-mail…", "view.send-email")
+        if GLib.find_program_in_path("bluetooth-sendto"):
+            menu.append("Enviar por Bluetooth…", "vfinder.send-bluetooth")
+        if GLib.find_program_in_path("gnome-control-center"):
+            menu.append("Compartilhamento na rede…", "vfinder.sharing-settings")
+        return _capsule(_menu_button("send-to-symbolic", "Compartilhar", menu))
+
+    def _more(self) -> Gtk.Widget:
+        menu = Gio.Menu()
+        new = Gio.Menu()
+        new.append(nt("New _Folder…", "Nova pasta…"), "view.new-folder")
+        new.append("Novo documento vazio", "view.template-empty")
+        menu.append_section(None, new)
+        files = Gio.Menu()
+        files.append(nt("P_roperties", "Propriedades"), "view.properties")
+        files.append(nt("Rena_me…", "Renomear…"), "view.rename")
+        files.append(nt("C_ompress…", "Comprimir…"), "view.compress")
+        files.append(nt("_Copy", "Copiar"), "view.copy")
+        files.append(nt("_Paste", "Colar"), "view.paste")
+        files.append(nt("Mo_ve to Trash", "Mover para a lixeira"), "view.move-to-trash")
+        menu.append_section(None, files)
+        view = Gio.Menu()
+        view.append(nt("Show _Hidden Files", "Mostrar arquivos ocultos"), "view.show-hidden-files")
+        view.append("Painel de pré-visualização", "vfinder.preview")
+        view.append(nt("Search Everywhere", "Pesquisar em todos os lugares"), "slot.search-global")
+        menu.append_section(None, view)
+        btn = _menu_button("view-more-horizontal-symbolic", "Mais ações", menu)
+        return _capsule(btn)
+
+    def _search(self) -> Gtk.Widget:
+        content = Gtk.Box(spacing=6)
+        content.append(Gtk.Image.new_from_icon_name("system-search-symbolic"))
+        label = Gtk.Label(label="Pesquisar", xalign=0, hexpand=True)
+        content.append(label)
+        btn = Gtk.Button(child=content, valign=Gtk.Align.CENTER,
+                         tooltip_text=f"{nt('Search Current Folder', 'Pesquisar pasta atual')} (Ctrl+F)")
+        btn.add_css_class("vitrine-search-pill")
+        btn.connect("clicked", lambda *_a: self._start_search())
+        return btn
+
+    # ── ações próprias ──
+    def _install_actions(self) -> None:
+        def add(name, cb):
+            act = Gio.SimpleAction.new(name, None)
+            act.connect("activate", lambda *_a: guarded(cb)())
+            self.actions.add_action(act)
+
+        add("copy-location", self._copy_location)
+        add("send-bluetooth", self._send_bluetooth)
+        add("sharing-settings", lambda: _spawn(["gnome-control-center", "sharing"]))
+        preview = Gio.SimpleAction.new_stateful(
+            "preview", None, GLib.Variant("b", bool(self.ctl.cfg.get("preview_visible"))))
+        preview.connect("activate", lambda a, _p: self.ctl.set_preview_visible(
+            not self.ctl.preview.get_visible()))
+        self.actions.add_action(preview)
+
+    def _selection_or_folder(self) -> list[str]:
+        slot = self.ctl.active_slot()
+        uris = native.selected_uris(self.ctl.model_watch.get())
+        if not uris and slot is not None:
+            uri = native.slot_uri(slot)
+            uris = [uri] if uri else []
+        return uris
+
+    def _copy_location(self) -> None:
+        uris = self._selection_or_folder()
+        paths = [Gio.File.new_for_uri(u).get_path() or u for u in uris]
+        if paths:
+            util.copy_text_to_clipboard(self.ctl.win, "\n".join(paths))
+
+    def _send_bluetooth(self) -> None:
+        paths = [p for p in (Gio.File.new_for_uri(u).get_path()
+                             for u in native.selected_uris(self.ctl.model_watch.get())) if p]
+        if not paths:
+            self.ctl.toast("Selecione os arquivos para enviar por Bluetooth")
+            return
+        _spawn(["bluetooth-sendto", *paths])
+
+    def _start_search(self) -> None:
+        slot = self.ctl.active_slot()
+        if slot is not None:
+            slot.activate_action("slot.search-visible", None)
+
+    # ── estado ──
+    @guarded
+    def _on_view_toggled(self, btn, mode: str) -> None:
+        if self._syncing or not btn.get_active():
+            return
+        if self.ctl.computer_visible():
+            self.ctl.show_computer(False)
+        self.ctl.user_set_mode(mode)
+
+    def sync(self) -> None:
+        self._syncing = True
+        try:
+            computer = self.ctl.computer_visible()
+            slot = self.ctl.active_slot()
+            # O modo pedido pela Vitrine vale antes do Nautilus terminar de trocar a visão.
+            mode = "columns" if self.ctl.columns_on else (
+                getattr(slot, "_vitrine_mode", None) or native.view_mode(slot) if slot else None)
+            for name, btn in self.view_buttons.items():
+                btn.set_active(name == mode and not computer)
+            act = self.actions.lookup_action("preview")
+            if act is not None and self.ctl.preview is not None:
+                act.set_state(GLib.Variant("b", self.ctl.preview.get_visible()))
+        finally:
+            self._syncing = False
+        self.sync_title()
+
+    def sync_title(self) -> None:
+        page = self.switcher.get_visible_child_name() if self.switcher is not None else "pathbar"
+        editing = page in ("location", "search")
+        if self.switcher is not None:
+            self.switcher.set_visible(editing)
+        self.title.set_visible(not editing)
+        self.title.set_label(self._title_text())
+
+    def _title_text(self) -> str:
+        if self.ctl.computer_visible():
+            return "Meu computador"
+        slot = self.ctl.active_slot()
+        if slot is None:
+            return ""
+        try:
+            title = slot.get_property("title")
+        except TypeError:
+            title = None
+        if title:
+            return title
+        uri = native.slot_uri(slot)
+        return Gio.File.new_for_uri(uri).get_basename() if uri else ""
+
+
+def _spawn(argv: list[str]) -> None:
+    try:
+        Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE)
+    except GLib.Error as err:
+        log(f"não foi possível abrir {argv[0]}: {err.message}")
+__VITRINE_ARQUIVO_21__
+mkdir -p "vitrine/schemas"
+cat > 'vitrine/schemas/io.github.bispov19.NautilusVitrine.gschema.xml' <<'__VITRINE_ARQUIVO_22__'
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Preferências da Vitrine para Nautilus.
+
+  O schema fica dentro da própria extensão e é carregado com
+  Gio.SettingsSchemaSource.new_from_directory (não precisa de root). Para usar no
+  terminal, aponte para esta pasta:
+
+    gsettings &#45;&#45;schemadir ~/.local/share/nautilus-python/extensions/vitrine/schemas \
+      set io.github.bispov19.NautilusVitrine window-style nautilus
+
+  As regras por pasta continuam em ~/.config/nautilus-vitrine/folders.json (são dados,
+  não preferências).
+-->
+<schemalist gettext-domain="nautilus-vitrine">
+  <enum id="io.github.bispov19.NautilusVitrine.WindowStyle">
+    <value nick="finder" value="0"/>
+    <value nick="nautilus" value="1"/>
+  </enum>
+
+  <schema id="io.github.bispov19.NautilusVitrine" path="/io/github/bispov19/NautilusVitrine/">
+    <key name="window-style" enum="io.github.bispov19.NautilusVitrine.WindowStyle">
+      <default>'finder'</default>
+      <summary>Estilo da janela</summary>
+      <description>finder: visual e ferramentas inspirados no Finder do macOS. nautilus: o Nautilus padrão.</description>
+    </key>
+
+    <key name="preview-visible" type="b">
+      <default>true</default>
+      <summary>Painel de pré-visualização aberto</summary>
+    </key>
+    <key name="preview-width" type="i">
+      <range min="180" max="1200"/>
+      <default>320</default>
+      <summary>Largura do painel de pré-visualização (px)</summary>
+    </key>
+    <key name="column-width" type="i">
+      <range min="120" max="600"/>
+      <default>230</default>
+      <summary>Largura de cada coluna no modo Colunas (px)</summary>
+    </key>
+    <key name="max-visible-columns" type="i">
+      <range min="1" max="10"/>
+      <default>3</default>
+      <summary>Colunas visíveis antes de começar a rolar</summary>
+    </key>
+
+    <key name="remember-per-folder" type="b">
+      <default>true</default>
+      <summary>Lembrar a visualização escolhida em cada pasta</summary>
+    </key>
+    <key name="auto-media-grid" type="b">
+      <default>true</default>
+      <summary>Abrir pastas de fotos e vídeos em ícones grandes</summary>
+    </key>
+    <key name="auto-media-zoom" type="s">
+      <choices>
+        <choice value="small"/><choice value="small-plus"/><choice value="medium"/>
+        <choice value="large"/><choice value="extra-large"/>
+      </choices>
+      <default>'extra-large'</default>
+      <summary>Zoom usado nas pastas de fotos e vídeos</summary>
+    </key>
+    <key name="auto-media-ratio" type="d">
+      <range min="0.0" max="1.0"/>
+      <default>0.6</default>
+      <summary>Proporção mínima de mídia para considerar "pasta de fotos"</summary>
+    </key>
+    <key name="folder-discovery" type="b">
+      <default>false</default>
+      <summary>Descoberta automática de pastas</summary>
+    </key>
+    <key name="default-mode" type="s">
+      <default>''</default>
+      <summary>Visualização das pastas sem regra (list, grid, columns; vazio = do Nautilus)</summary>
+    </key>
+    <key name="default-grid-zoom" type="s">
+      <default>''</default>
+      <summary>Zoom padrão dos ícones (vazio = do Nautilus)</summary>
+    </key>
+
+    <key name="start-on-computer" type="b">
+      <default>false</default>
+      <summary>Abrir o Nautilus no Meu computador</summary>
+    </key>
+    <key name="computer-in-sidebar" type="b">
+      <default>true</default>
+      <summary>Entrada Meu computador na barra lateral</summary>
+    </key>
+    <key name="computer-sections" type="a{sb}">
+      <default>{}</default>
+      <summary>Seções do Meu computador ligadas/desligadas</summary>
+    </key>
+    <key name="computer-hidden" type="as">
+      <default>[]</default>
+      <summary>Itens ocultos do Meu computador</summary>
+    </key>
+    <key name="notify-new-devices" type="b">
+      <default>true</default>
+      <summary>Avisar quando um dispositivo for conectado</summary>
+    </key>
+
+    <key name="json-migrated" type="b">
+      <default>false</default>
+      <summary>As preferências antigas (settings.json) já foram importadas</summary>
+    </key>
+  </schema>
+</schemalist>
+__VITRINE_ARQUIVO_22__
 mkdir -p "tools"
-cat > 'tools/smoke_test.py' <<'__VITRINE_ARQUIVO_19__'
+cat > 'tools/smoke_test.py' <<'__VITRINE_ARQUIVO_23__'
 """Teste rápido FORA do Nautilus: abre as colunas e o painel de preview numa janela
 própria e salva uma captura em PNG; monta a página "Sobre" nos temas claro e escuro
 (saida-sobre-claro.png / saida-sobre-escuro.png) e confere se a versão do .spec é a
@@ -5048,9 +6061,9 @@ app.run([])
 if failures:
     print("FALHAS:", failures)
     sys.exit(1)
-__VITRINE_ARQUIVO_19__
+__VITRINE_ARQUIVO_23__
 mkdir -p "tools"
-cat > 'tools/test_history.py' <<'__VITRINE_ARQUIVO_20__'
+cat > 'tools/test_history.py' <<'__VITRINE_ARQUIVO_24__'
 """Testes do histórico de Voltar/Avançar com o Meu computador (sem GTK, sem Nautilus).
 
     python3 tools/test_history.py
@@ -5253,9 +6266,105 @@ def run() -> bool:
 
 if __name__ == "__main__":
     sys.exit(0 if run() else 1)
-__VITRINE_ARQUIVO_20__
+__VITRINE_ARQUIVO_24__
 mkdir -p "tools"
-cat > 'tools/build_bootstrap.py' <<'__VITRINE_ARQUIVO_21__'
+cat > 'tools/test_config.py' <<'__VITRINE_ARQUIVO_25__'
+"""Testes das preferências em GSettings (sem tocar nas suas preferências reais).
+
+    python3 tools/test_config.py
+
+Usa o backend de memória do GSettings e um settings.json falso numa pasta temporária.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Gio  # noqa: E402
+
+from vitrine import config  # noqa: E402
+
+results = []
+
+
+def check(name, ok, detail=""):
+    results.append(bool(ok))
+    print(f"{'PASSOU' if ok else 'FALHOU'}: {name}" + (f"  ({detail})" if not ok and detail else ""))
+
+
+def memory_settings(schema_dir):
+    source = Gio.SettingsSchemaSource.new_from_directory(
+        schema_dir, Gio.SettingsSchemaSource.get_default(), False)
+    schema = source.lookup(config.SCHEMA_ID, False)
+    return Gio.Settings.new_full(schema, Gio.memory_settings_backend_new(), None)
+
+
+def main() -> int:
+    tmp = tempfile.mkdtemp(prefix="vitrine-config-")
+    schema_dir = os.path.join(tmp, "schemas")
+    os.makedirs(schema_dir)
+    subprocess.run(["glib-compile-schemas", "--strict", "--targetdir", schema_dir,
+                    config.SCHEMA_DIR], check=True)
+    # Arquivos falsos no lugar dos de verdade.
+    config.CONFIG_DIR = tmp
+    config.SETTINGS_PATH = os.path.join(tmp, "settings.json")
+    config.FOLDERS_PATH = os.path.join(tmp, "folders.json")
+    with open(config.SETTINGS_PATH, "w", encoding="utf-8") as fh:
+        json.dump({"preview_visible": False, "computer_hidden": ["trash:///"],
+                   "computer_sections": {"network": False}, "auto_media_ratio": 0.7,
+                   "default_mode": "grid", "chave_desconhecida": 1}, fh)
+
+    gs = memory_settings(schema_dir)
+    cfg = config.Config(gs)
+    check("backend é GSettings", cfg.backend == "gsettings")
+    check("estilo padrão de fábrica é Finder", cfg.get("window_style") == "finder")
+    check("settings.json importado (bool, lista, dicionário, número, texto)",
+          cfg.get("preview_visible") is False and cfg.get("computer_hidden") == ["trash:///"]
+          and cfg.get("computer_sections") == {"network": False}
+          and abs(cfg.get("auto_media_ratio") - 0.7) < 1e-9 and cfg.get("default_mode") == "grid",
+          str(cfg.settings))
+    check("settings.json antigo guardado como .importado",
+          not os.path.exists(config.SETTINGS_PATH)
+          and os.path.exists(config.SETTINGS_PATH + ".importado"))
+    check("importação acontece uma vez só", gs.get_boolean("json-migrated"))
+
+    seen = []
+    cfg.on_change(seen.append)
+    cfg.set("window_style", "nautilus")
+    cfg._flush()
+    check("set() grava no GSettings e avisa", gs.get_string("window-style") == "nautilus"
+          and seen == ["window_style"], f"{gs.get_string('window-style')} {seen}")
+
+    seen.clear()
+    gs.set_string("window-style", "finder")  # como `gsettings set` no terminal
+    check("mudança feita fora da Vitrine vale na hora", cfg.get("window_style") == "finder"
+          and seen == ["window_style"], str(seen))
+
+    cfg.set("default_mode", None)
+    cfg._flush()
+    check("None vira texto vazio e volta como None",
+          gs.get_string("default-mode") == "" and config.Config(gs).get("default_mode") is not None)
+
+    cfg2 = config.Config(use_gsettings=False)
+    check("sem schema: cai no JSON", cfg2.backend == "json")
+
+    print(f"\n{sum(results)}/{len(results)} verificações passaram")
+    return 0 if all(results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+__VITRINE_ARQUIVO_25__
+mkdir -p "tools"
+cat > 'tools/build_bootstrap.py' <<'__VITRINE_ARQUIVO_26__'
 """Gera `criar-vitrine.sh`: um único script bash que recria o projeto inteiro
 (todos os arquivos) numa pasta e, se você quiser, já instala no Nautilus.
 
@@ -5272,6 +6381,7 @@ INCLUDE = [
     "vitrine",
     "tools/smoke_test.py",
     "tools/test_history.py",
+    "tools/test_config.py",
     "tools/build_bootstrap.py",
     "install.sh",
     "uninstall.sh",
@@ -5341,7 +6451,7 @@ def collect() -> list[str]:
             for dirpath, dirnames, filenames in os.walk(path):
                 dirnames[:] = sorted(d for d in dirnames if d != "__pycache__")
                 for name in sorted(filenames):
-                    if name.endswith((".pyc", ".tmp")):
+                    if name.endswith((".pyc", ".tmp", ".compiled")):
                         continue
                     files.append(os.path.relpath(os.path.join(dirpath, name), ROOT))
         elif os.path.exists(path):
@@ -5371,8 +6481,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-__VITRINE_ARQUIVO_21__
-cat > 'install.sh' <<'__VITRINE_ARQUIVO_22__'
+__VITRINE_ARQUIVO_26__
+cat > 'install.sh' <<'__VITRINE_ARQUIVO_27__'
 #!/usr/bin/env bash
 # Instala a Vitrine para o seu usuário (não precisa de root, exceto para o nautilus-python).
 #
@@ -5423,6 +6533,14 @@ else
   echo "Arquivos copiados para $DEST"
 fi
 
+# Preferências em GSettings: o schema vem dentro da extensão e é compilado aqui
+# (a Vitrine o carrega desta pasta; não precisa de root).
+if command -v glib-compile-schemas >/dev/null; then
+  glib-compile-schemas --strict "$DEST/vitrine/schemas"
+else
+  echo "Aviso: glib-compile-schemas não encontrado; a Vitrine compila o schema na primeira execução."
+fi
+
 if [[ "$RESTART" == 1 ]]; then
   echo "Reiniciando o Nautilus (janelas abertas do Arquivos serão fechadas)…"
   nautilus -q 2>/dev/null || true
@@ -5430,8 +6548,8 @@ if [[ "$RESTART" == 1 ]]; then
   (setsid nautilus >/dev/null 2>&1 &)
 fi
 echo "Pronto. Log: ${XDG_CACHE_HOME:-$HOME/.cache}/nautilus-vitrine/vitrine.log"
-__VITRINE_ARQUIVO_22__
-cat > 'uninstall.sh' <<'__VITRINE_ARQUIVO_23__'
+__VITRINE_ARQUIVO_27__
+cat > 'uninstall.sh' <<'__VITRINE_ARQUIVO_28__'
 #!/usr/bin/env bash
 # Remove a Vitrine. Suas regras por pasta ficam em ~/.config/nautilus-vitrine
 # (use --purge para apagá-las também).
@@ -5443,15 +6561,15 @@ if [[ "${1:-}" == "--purge" ]]; then
 fi
 nautilus -q 2>/dev/null || true
 echo "Vitrine removida. Abra o Arquivos de novo para voltar ao Nautilus original."
-__VITRINE_ARQUIVO_23__
+__VITRINE_ARQUIVO_28__
 mkdir -p ".vscode"
-cat > '.vscode/extensions.json' <<'__VITRINE_ARQUIVO_24__'
+cat > '.vscode/extensions.json' <<'__VITRINE_ARQUIVO_29__'
 {
   "recommendations": ["ms-python.python", "ms-python.vscode-pylance"]
 }
-__VITRINE_ARQUIVO_24__
+__VITRINE_ARQUIVO_29__
 mkdir -p ".vscode"
-cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_25__'
+cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_30__'
 {
   "python.defaultInterpreterPath": "/usr/bin/python3",
   "python.analysis.extraPaths": ["${workspaceFolder}"],
@@ -5459,9 +6577,9 @@ cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_25__'
   "editor.rulers": [100],
   "[python]": { "editor.tabSize": 4 }
 }
-__VITRINE_ARQUIVO_25__
+__VITRINE_ARQUIVO_30__
 mkdir -p ".vscode"
-cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_26__'
+cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_31__'
 {
   // Ctrl+Shift+P → "Tasks: Run Task" para ver estas tarefas.
   // Ctrl+Shift+B roda a tarefa padrão (instalar em modo dev + reiniciar o Nautilus).
@@ -5532,8 +6650,8 @@ cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_26__'
     }
   ]
 }
-__VITRINE_ARQUIVO_26__
-cat > 'README.md' <<'__VITRINE_ARQUIVO_27__'
+__VITRINE_ARQUIVO_31__
+cat > 'README.md' <<'__VITRINE_ARQUIVO_32__'
 <p align="center">
   <img src="vitrine/assets/nautilus-vitrine-logo.svg" width="96" alt="Logo da Vitrine para Nautilus">
 </p>
@@ -5557,6 +6675,7 @@ A Vitrine é uma extensão para o **Nautilus 51** (e, em princípio, o 50). Ela 
 - 🗂️ **Modo Colunas**: navegue pelas pastas em colunas, como no Finder.
 - 🖼️ **Painel de pré-visualização**: veja imagens, textos, vídeos, PDFs e pastas ao lado da lista, sem abrir nada.
 - 📌 **Visualização por pasta**: cada pasta lembra se você prefere lista, ícones, ícones grandes ou colunas.
+- 🍎 **Estilo Finder** (padrão): barra de ferramentas em cápsulas, título da pasta, seletor de visualização e barra lateral no estilo do Finder do macOS. Dá para voltar ao **Nautilus padrão** a qualquer momento.
 - 💻 **Meu computador**: suas pastas, discos e dispositivos numa página só, com o espaço livre de cada um e aviso quando um pen drive é conectado.
 
 A diferença em relação a outras soluções é o **modo híbrido**. A pasta atual continua sendo exibida pela **própria lista do Nautilus**, então menu de contexto, renomear, arrastar e soltar, recortar e colar, Desfazer, scripts e outras extensões funcionam exatamente como antes. A Vitrine só acrescenta coisas; não substitui nada.
@@ -5564,6 +6683,17 @@ A diferença em relação a outras soluções é o **modo híbrido**. A pasta at
 ---
 
 ## Recursos
+
+### 🍎 Estilo da janela: Finder (macOS) ou Nautilus padrão
+
+O estilo **Finder** vem ligado de fábrica. Troque em **☰ da linha Meu computador → Personalizar → Estilo da janela**; vale na hora, em todas as janelas.
+
+- Barra de ferramentas: **← →** numa cápsula e o **nome da pasta** em negrito; à direita, **Visão em grade / Visão em lista / Colunas**, **Ordenar** (A-Z, Z-A, última e primeira modificação, tamanho, tipo), **Compartilhar** (copiar local, enviar por e-mail, Bluetooth, compartilhamento na rede), **⋯** (nova pasta, documento vazio, propriedades, renomear, comprimir, copiar, colar, mover para a lixeira, arquivos ocultos, painel de pré-visualização, pesquisar em todos os lugares) e **Pesquisar**.
+- A barra de caminho aparece ao editar o local (**Ctrl+L**) ou ao pesquisar.
+- Barra lateral com ícones na cor de destaque do sistema e seleção cinza arredondada.
+- Os nomes seguem os do GNOME (a Vitrine usa a tradução do próprio Nautilus). Os botões de fechar, minimizar e maximizar ficam no padrão do GNOME.
+- **Nautilus padrão** remove tudo o que o estilo Finder acrescentou (CSS, botões, sinais). Colunas, pré-visualização e Meu computador continuam conforme as suas opções.
+
 
 ### 🗂️ Modo Colunas
 
@@ -5722,12 +6852,22 @@ O Nautilus volta exatamente ao original. Suas regras ficam guardadas; use `./uni
 
 ## Configuração
 
-Tudo funciona sem configurar nada. Para ajustes finos, edite os arquivos abaixo com o Nautilus fechado (`nautilus -q`).
+Tudo funciona sem configurar nada. As preferências ficam no **GSettings** (schema `io.github.bispov19.NautilusVitrine`, que vem dentro da extensão) e valem na hora, até pelo terminal:
 
-**`~/.config/nautilus-vitrine/settings.json`**
+```bash
+gsettings --schemadir ~/.local/share/nautilus-python/extensions/vitrine/schemas list-recursively io.github.bispov19.NautilusVitrine
+```
+
+```bash
+gsettings --schemadir ~/.local/share/nautilus-python/extensions/vitrine/schemas set io.github.bispov19.NautilusVitrine window-style nautilus
+```
+
+Na primeira execução da versão com GSettings, o antigo `settings.json` é importado e guardado como `settings.json.importado`. Os nomes abaixo usam `-` no GSettings (ex.: `preview-visible`).
 
 | Chave | Padrão | Descrição |
 |---|---|---|
+| `window_style` | `"finder"` | Estilo da janela: `finder` ou `nautilus` |
+
 | `preview_visible` | `true` | Painel de pré-visualização aberto |
 | `preview_width` | `320` | Largura do painel (px), salva ao arrastar a borda |
 | `column_width` | `230` | Largura de cada coluna (px) |
@@ -5781,11 +6921,13 @@ vitrine/
   preview.py            painel de pré-visualização
   imageload.py          carregamento rápido de imagens, cache e pré-carregamento
   computer.py           página Meu computador e monitor de dispositivos
+  config.py             preferências (GSettings) e regras por pasta (JSON)
+  finder/               estilo Finder: aplica e remove a camada visual
+  schemas/              schema GSettings da Vitrine
   history.py            Voltar/Avançar por aba incluindo o Meu computador (sem GTK)
   about.py              página "Sobre" do diálogo de personalização
   assets/               logo, ícone simbólico e CSS da página Sobre
   native.py             ponte com o Nautilus (slot, lista/grade, seleção)
-  config.py             preferências e regras (JSON)
   util.py               log, varredura de widgets, operações D-Bus
   selftest.py           autoteste dentro do Nautilus real
 tools/
@@ -5891,8 +7033,8 @@ A técnica de injeção na janela foi inspirada no projeto **[My Computer for Na
 ## Licença
 
 [MIT](LICENSE)
-__VITRINE_ARQUIVO_27__
-cat > 'LICENSE' <<'__VITRINE_ARQUIVO_28__'
+__VITRINE_ARQUIVO_32__
+cat > 'LICENSE' <<'__VITRINE_ARQUIVO_33__'
 MIT License
 
 Copyright (c) 2026 Vitrine para Nautilus contributors
@@ -5918,15 +7060,16 @@ SOFTWARE.
 ---
 Inspired by "My Computer for Nautilus" (https://github.com/yannmasoch/nautilus-my-computer),
 Copyright (c) 2026 Yann Masoch, MIT License.
-__VITRINE_ARQUIVO_28__
-cat > '.gitignore' <<'__VITRINE_ARQUIVO_29__'
+__VITRINE_ARQUIVO_33__
+cat > '.gitignore' <<'__VITRINE_ARQUIVO_34__'
 __pycache__/
 *.pyc
 *.tmp
 dist/
 dist-build.log
-__VITRINE_ARQUIVO_29__
-cat > 'Makefile' <<'__VITRINE_ARQUIVO_30__'
+gschemas.compiled
+__VITRINE_ARQUIVO_34__
+cat > 'Makefile' <<'__VITRINE_ARQUIVO_35__'
 # Empacotamento local.  Requer: sudo dnf install make rpm-build python3-devel
 #
 #   make rpm        gera o RPM em dist/
@@ -5960,9 +7103,9 @@ install-rpm:
 
 clean:
 	rm -rf $(DIST)
-__VITRINE_ARQUIVO_30__
+__VITRINE_ARQUIVO_35__
 mkdir -p "packaging"
-cat > 'packaging/nautilus-vitrine.spec' <<'__VITRINE_ARQUIVO_31__'
+cat > 'packaging/nautilus-vitrine.spec' <<'__VITRINE_ARQUIVO_36__'
 %global extdir %{_datadir}/nautilus-python/extensions
 
 Name:           nautilus-vitrine
@@ -5976,6 +7119,7 @@ Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 
 BuildArch:      noarch
 BuildRequires:  python3-devel
+BuildRequires:  glib2
 
 Requires:       nautilus >= 50
 Requires:       nautilus-python >= 4
@@ -6008,6 +7152,9 @@ install -p -m 0644 nautilus-vitrine.py %{buildroot}%{extdir}/
 install -p -m 0644 vitrine/*.py %{buildroot}%{extdir}/vitrine/
 install -d %{buildroot}%{extdir}/vitrine/assets
 install -p -m 0644 vitrine/assets/* %{buildroot}%{extdir}/vitrine/assets/
+install -d %{buildroot}%{extdir}/vitrine/schemas
+install -p -m 0644 vitrine/schemas/*.gschema.xml %{buildroot}%{extdir}/vitrine/schemas/
+glib-compile-schemas --strict %{buildroot}%{extdir}/vitrine/schemas
 %py_byte_compile %{python3} %{buildroot}%{extdir}/vitrine
 
 %files
@@ -6031,9 +7178,9 @@ install -p -m 0644 vitrine/assets/* %{buildroot}%{extdir}/vitrine/assets/
 
 * Wed Nov 11 2026 Vinicius Bispo - 0.1.0-1
 - Primeira versão: modo Colunas, painel de pré-visualização e visualização por pasta
-__VITRINE_ARQUIVO_31__
+__VITRINE_ARQUIVO_36__
 mkdir -p ".copr"
-cat > '.copr/Makefile' <<'__VITRINE_ARQUIVO_32__'
+cat > '.copr/Makefile' <<'__VITRINE_ARQUIVO_37__'
 # Usado pelo COPR (método "make srpm"): gera o SRPM direto do repositório git.
 # O COPR chama:  make -f .copr/Makefile srpm outdir=<pasta> spec=<arquivo .spec>
 SPEC := packaging/nautilus-vitrine.spec
@@ -6048,7 +7195,7 @@ srpm:
 	rpmbuild -bs $(SPEC) \
 		--define "_sourcedir $(outdir)" \
 		--define "_srcrpmdir $(outdir)"
-__VITRINE_ARQUIVO_32__
+__VITRINE_ARQUIVO_37__
 
 chmod +x install.sh uninstall.sh
 echo "Projeto criado em $TARGET"
