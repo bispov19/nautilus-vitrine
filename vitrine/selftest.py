@@ -487,7 +487,7 @@ def run(ctl) -> bool:
 
     def finder_widgets():
         return [w for w in util.walk(ctl.win)
-                if any(c.startswith(("vitrine-capsule", "vitrine-finder", "vitrine-search"))
+                if any(c.startswith(("vitrine-capsule", "vitrine-finder", "vitrine-search", "vitrine-tags"))
                        for c in w.get_css_classes()) and w is not ctl.win]
 
     style_state = {}
@@ -531,7 +531,9 @@ def run(ctl) -> bool:
         check("Nautilus padrão: nada da camada Finder sobra (CSS, classe, widgets)",
               not st.active and not ctl.win.has_css_class("vitrine-finder")
               and not finder_mod.css_loaded() and not leftovers
-              and sum(1 for _ in util.walk(ctl.win)) == style_state["n_native"],
+              and sum(1 for _ in util.walk(ctl.win)) == style_state["n_native"]
+              and "vitrine_dimensions" not in Gio.Settings.new("org.gnome.nautilus.icon-view").get_strv("captions")
+              and "Vitrine::tags" not in Gio.Settings.new("org.gnome.nautilus.list-view").get_strv("default-visible-columns"),
               f"{finder_mod.describe(ctl.win)} sobras={[w.get_css_classes() for w in leftovers]} "
               f"widgets={sum(1 for _ in util.walk(ctl.win))}/{style_state['n_native']}")
         ctl.cfg.set("window_style", "finder")
@@ -550,6 +552,101 @@ def run(ctl) -> bool:
               tb is not None and tb.title.get_label() == "Meu computador", tb.title.get_label())
         shot("finder-meu-computador")
         ctl.win.activate_action("vitrine.back", None)
+
+    # ── etiquetas e dimensões ──
+    tagdir = {}
+
+    def icons_named(name):
+        out = []
+        for w in util.walk(ctl.win):
+            if not isinstance(w, Gtk.Image) or not w.get_mapped():
+                continue
+            gicon = w.get_gicon()
+            names = list(gicon.get_names()) if isinstance(gicon, Gio.ThemedIcon) else []
+            if w.get_icon_name() == name or name in names:
+                out.append(w)
+        return out
+
+    @step
+    def t0():
+        gi_require = __import__("gi")
+        gi_require.require_version("GdkPixbuf", "2.0")
+        from gi.repository import GdkPixbuf
+        root = tempfile.mkdtemp(prefix="vitrine-selftest-tags-")
+        png = os.path.join(root, "foto.png")
+        GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, 300, 200).savev(png, "png", [], [])
+        txt = os.path.join(root, "nota.txt")
+        open(txt, "w").close()
+        tagdir.update(root=root, png=Gio.File.new_for_path(png).get_uri(),
+                      txt=Gio.File.new_for_path(txt).get_uri())
+        ctl.navigate(Gio.File.new_for_path(root).get_uri())
+
+    @step
+    def t1():
+        ctl.user_set_mode("grid", "large")
+        ctl.ext.tags.toggle([tagdir["png"], tagdir["txt"]], "Vermelho")
+
+    @step
+    def t2():
+        from .tags import read_tags, uri_to_path
+        check("etiquetas: grava user.xdg.tags nos arquivos",
+              read_tags(uri_to_path(tagdir["png"])) == ["Vermelho"])
+        dots = [w for w in icons_named("vitrine-tag-red")
+                if util.ancestor(w, lambda a: gtype_name(a) == "NautilusGridCell") is not None]
+        check("etiquetas: o Nautilus mostra a bolinha (emblema) nos arquivos",
+              len(dots) >= 2, f"emblemas={len(dots)}")
+        dims = [w for w in util.walk(ctl.win) if isinstance(w, Gtk.Label)
+                and w.get_label() == "300 × 200" and w.get_mapped()]
+        blue = dims and dims[0].get_color().blue > max(dims[0].get_color().red, dims[0].get_color().green)
+        check("ícones: dimensões da imagem abaixo do nome, em azul", len(dims) == 1 and blue,
+              f"legendas={len(dims)} cor={dims[0].get_color().to_string() if dims else '-'}")
+        cell = next((w for w in util.walk(ctl.win) if gtype_name(w) == "NautilusGridCell"), None)
+        if cell is not None and dims:
+            chain, w = [], dims[0]
+            while w is not None:
+                chain.append(f"{gtype_name(w)}{w.get_css_classes()}")
+                w = w.get_parent()
+            log(f"legenda: cor={dims[0].get_color().to_string()} ancestrais={' < '.join(chain[:9])}")
+        shot("finder-icones-etiquetas")
+        ctl.show_tag("Vermelho")
+
+    @step
+    def t3():
+        page = ctl.tag_page
+        n = 0
+        child = page.flow.get_first_child()
+        while child is not None:
+            n += 1
+            child = child.get_next_sibling()
+        check("etiquetas: clicar na etiqueta mostra os arquivos com ela",
+              ctl.content_stack.get_visible_child_name() == "tag" and n == 2
+              and ctl.style.toolbar.title.get_label() == "Vermelho", f"itens={n}")
+        check("etiquetas: seção Etiquetas na barra lateral",
+              ctl.tag_sidebar is not None and ctl.tag_sidebar.get_mapped())
+        shot("finder-etiqueta-vermelho")
+        ctl.leave_tag_and_open(Gio.File.new_for_path(tagdir["root"]).get_uri())
+
+    @step
+    def t4():
+        check("etiquetas: navegar fecha a página da etiqueta",
+              ctl.tag_visible() is None and ctl.content_stack.get_visible_child_name() == "tabs")
+        ctl.ext.tags.clear([tagdir["png"], tagdir["txt"]])
+        discovery.forget_manual(Gio.File.new_for_path(tagdir["root"]).get_uri())
+        cfg.forget(Gio.File.new_for_path(tagdir["root"]).get_uri())
+        ctl.navigate(home)
+
+    @step
+    def t5():
+        shutil.rmtree(tagdir["root"], ignore_errors=True)
+        ctl.cfg.set("tags_in_sidebar", False)
+
+    @step
+    def t6():
+        off = ctl.tag_sidebar is None and not any(
+            "vitrine-tags-section" in w.get_css_classes() for w in util.walk(ctl.win))
+        ctl.cfg.set("tags_in_sidebar", True)
+        check("opção Seção Etiquetas vale na hora (desliga e liga)",
+              off and ctl.tag_sidebar is not None and ctl.style.active)
 
     @step
     def s11():

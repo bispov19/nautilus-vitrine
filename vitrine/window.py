@@ -12,6 +12,7 @@ from .computer import ComputerPage
 from .finder import FinderStyle
 from .history import History
 from .preview import PreviewPane
+from .tagui import TagPage
 from .util import (ancestor, debug, dump_tree, find_by_type_name, find_first, gtype_name, guarded,
                    log, walk)
 
@@ -60,6 +61,9 @@ class WindowController:
         self.history_shortcuts_removed = 0
         self._leave_source = 0
         self.style: FinderStyle | None = None
+        self.tag_page: TagPage | None = None
+        self._tag_visible: str | None = None
+        self.tag_sidebar = None  # seção Etiquetas (só no estilo Finder)
 
     # ───────────────────────── injeção ─────────────────────────
     def inject(self) -> bool:
@@ -100,6 +104,8 @@ class WindowController:
         self.content_stack.set_transition_duration(120)
         self.content_stack.add_named(tv, "tabs")
         self.content_stack.add_named(self.computer, "computer")
+        self.tag_page = TagPage(self)
+        self.content_stack.add_named(self.tag_page, "tag")
         self.content_stack.set_visible_child_name("tabs")
         inner.append(self.strip)
         inner.append(self.content_stack)
@@ -303,6 +309,7 @@ class WindowController:
         slot = self.active_slot()
         if slot is None:
             return
+        self.hide_tag()
         h = self.history(slot)
         if on:
             h.open_computer()
@@ -343,6 +350,66 @@ class WindowController:
 
     def computer_visible(self) -> bool:
         return self._computer_visible
+
+    # ───────────────────────── página de uma etiqueta ─────────────────────────
+    def show_tag(self, name: str) -> None:
+        """Arquivos com a etiqueta `name` (clique na barra lateral). Fica por cima da
+        lista, como o Meu computador, mas não entra no histórico de Voltar/Avançar."""
+        if self.content_stack is None or self.tag_page is None:
+            return
+        self._tag_visible = name
+        self.tag_page.show(name)
+        self.content_stack.set_visible_child_name("tag")
+        if self.strip is not None:
+            self.strip.set_visible(False)
+        if self.preview is not None:
+            self.preview.set_folder(None)
+            self.preview.show_uris([])
+        if self.sidebar_list is not None:
+            self.sidebar_list.unselect_all()
+        sidebar = find_by_type_name(self.win, "NautilusSidebar")
+        native_lb = find_first(sidebar, lambda w: isinstance(w, Gtk.ListBox)) if sidebar else None
+        if native_lb is not None:
+            native_lb.unselect_all()
+        if self.tag_sidebar is not None:
+            self.tag_sidebar.select(name)
+        self._style_sync()
+
+    def tag_visible(self) -> str | None:
+        return self._tag_visible
+
+    def hide_tag(self) -> None:
+        if self._tag_visible is None:
+            return
+        self._tag_visible = None
+        if self.tag_sidebar is not None:
+            self.tag_sidebar.select(None)
+        if self.content_stack is not None:
+            self.content_stack.set_visible_child_name("computer" if self._computer_visible else "tabs")
+        if self._computer_visible:
+            if self.sidebar_list is not None:
+                self.sidebar_list.select_row(self.sidebar_list.get_row_at_index(0))
+        else:
+            slot = self.active_slot()
+            if slot is not None:
+                self._set_columns_visible(getattr(slot, "_vitrine_mode", None) == "columns")
+                self._sync_active_ui(slot)
+        self._style_sync()
+
+    def leave_tag_and_open(self, uri: str) -> None:
+        self.hide_tag()
+        if self._computer_visible:
+            self.leave_computer_and_open(uri)
+        else:
+            self.navigate(uri)
+
+    def leave_tag_and_reveal(self, uri: str) -> None:
+        self.hide_tag()
+        if self._computer_visible:
+            self.show_computer(False)
+        parent = Gio.File.new_for_uri(uri).get_parent()
+        if parent is not None:
+            self.reveal(parent.get_uri(), uri)
 
     def leave_computer_and_open(self, uri: str) -> None:
         """Abrir um item da página (pasta, disco, dispositivo recém-montado)."""
@@ -493,6 +560,7 @@ class WindowController:
         step = h.back() if delta < 0 else h.forward()
         if step is None:
             return
+        self.hide_tag()
         debug(f"histórico {'voltar' if delta < 0 else 'avançar'}: {h.entries} idx={h.idx} "
               f"nativo={step.native}")
         self._display_computer(step.show_computer)
@@ -656,6 +724,7 @@ class WindowController:
         # Os botões ← → podem ter sido religados pelo Nautilus; garantimos de novo.
         self._take_over_buttons()
         self._update_history_actions()
+        self.hide_tag()
         if self.history(slot).on_computer():
             self._display_computer(True)
             return
@@ -682,6 +751,7 @@ class WindowController:
             return
         self.ext.suppress()
         if slot is self.active_slot():
+            self.hide_tag()  # navegou: a página da etiqueta fecha
             if self._computer_visible:
                 self._display_computer(False)  # navegou (barra de caminho, busca…)
             self._sync_active_ui(slot)

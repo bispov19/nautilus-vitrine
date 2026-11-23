@@ -1334,6 +1334,18 @@ class ComputerPage(Gtk.ScrolledWindow):
             style.add(row)
         page.add(style)
 
+        finder = Adw.PreferencesGroup(title="Estilo Finder")
+        switch(finder, "Seção Etiquetas na barra lateral",
+               "Vermelho, Laranja, Amarelo… Clique para ver os arquivos; arraste arquivos para etiquetar",
+               bool(cfg.get("tags_in_sidebar")), lambda v: cfg.set("tags_in_sidebar", v))
+        switch(finder, "Dimensões das imagens",
+               "Largura × altura abaixo do nome, na visão em grade",
+               bool(cfg.get("image_dimensions")), lambda v: cfg.set("image_dimensions", v))
+        manage = Adw.ButtonRow(title="Todas as etiquetas…")
+        manage.connect("activated", lambda *_a: _open_manager(self.ctl))
+        finder.add(manage)
+        page.add(finder)
+
         general = Adw.PreferencesGroup(title="Geral")
         switch(general, "Abrir o Nautilus no Meu computador",
                "Ao abrir o Arquivos pelo menu de aplicativos (ou uma janela nova), começar aqui",
@@ -1448,6 +1460,11 @@ class ComputerPage(Gtk.ScrolledWindow):
         pop.set_pointing_to(rect)
         pop.connect("closed", lambda p: GLib.idle_add(p.unparent))
         pop.popup()
+
+
+def _open_manager(ctl) -> None:
+    from .tagui import open_manager
+    open_manager(ctl)
 __VITRINE_ARQUIVO_4__
 mkdir -p "vitrine"
 cat > 'vitrine/config.py' <<'__VITRINE_ARQUIVO_5__'
@@ -1486,6 +1503,12 @@ WINDOW_STYLES = ("finder", "nautilus")
 DEFAULT_SETTINGS = {
     # Estilo da janela: "finder" (visual do Finder do macOS) ou "nautilus" (padrão).
     "window_style": "finder",
+    # Etiquetas: (nome, cor). Os nomes ficam gravados nos arquivos (user.xdg.tags).
+    "tags": [("Vermelho", "red"), ("Laranja", "orange"), ("Amarelo", "yellow"),
+             ("Verde", "green"), ("Azul", "blue"), ("Roxo", "purple")],
+    "tags_in_sidebar": True,
+    "tags_section_expanded": True,
+    "image_dimensions": True,
     # Painel de pré-visualização à direita (Ctrl+Shift+P).
     "preview_visible": True,
     "preview_width": 320,
@@ -1539,6 +1562,8 @@ _GS_TYPES = {
     "start_on_computer": "b", "computer_in_sidebar": "b", "computer_sections": "a{sb}",
     "computer_hidden": "as", "notify_new_devices": "b",
     "default_mode": "s?", "default_grid_zoom": "s?",  # "" no GSettings = None aqui
+    "tags": "a(ss)", "tags_in_sidebar": "b", "tags_section_expanded": "b",
+    "image_dimensions": "b",
 }
 
 
@@ -1604,6 +1629,8 @@ def _gs_write(gs: Gio.Settings, key: str, value) -> None:
                                                       for k, v in (value or {}).items()}))
     elif kind == "as":
         gs.set_value(_gs_key(key), GLib.Variant(kind, [str(v) for v in (value or [])]))
+    elif kind == "a(ss)":
+        gs.set_value(_gs_key(key), GLib.Variant(kind, [(str(n), str(c)) for n, c in (value or [])]))
     elif kind == "d":
         gs.set_value(_gs_key(key), GLib.Variant(kind, float(value)))
     elif kind == "i":
@@ -2274,9 +2301,10 @@ gi.require_version("Adw", "1")
 gi.require_version("Nautilus", "4.1")
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Nautilus  # noqa: E402
 
-from . import __version__, discovery, native  # noqa: E402
+from . import __version__, discovery, imageload, native  # noqa: E402
 from .computer import DeviceHub  # noqa: E402
 from .config import GRID_ZOOMS, Config  # noqa: E402
+from .tags import PALETTE, TagError, TagStore, read_tags, uri_to_path  # noqa: E402
 from .util import ASSETS, guarded, log  # noqa: E402
 from .window import WindowController  # noqa: E402
 
@@ -2316,7 +2344,8 @@ levelbar.vitrine-usage block.vitrine-full { background-color: var(--error-bg-col
 _ACTIVE_INSTANCE = None
 
 
-class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
+class VitrineExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.InfoProvider,
+                       Nautilus.ColumnProvider):
     def __init__(self) -> None:
         global _ACTIVE_INSTANCE
         super().__init__()
@@ -2337,6 +2366,7 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         self._prefs = Gio.Settings.new("org.gnome.nautilus.preferences")
         self._icon_prefs = Gio.Settings.new("org.gnome.nautilus.icon-view")
         self._icon_prefs.connect("changed::default-zoom-level", self._on_zoom_changed)
+        self.tags = TagStore(self.cfg, on_files_changed=self._invalidate_files)
         self.cfg.on_change(self._on_setting_changed)
         log(f"preferências: {self.cfg.backend}")
         self.hub = DeviceHub()
@@ -2417,6 +2447,12 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         if key == "window_style":
             for ctl in list(self.windows.values()):
                 ctl.apply_window_style()
+        elif key in ("tags_in_sidebar", "image_dimensions"):
+            # Opções da camada Finder: reaplica para valer na hora.
+            for ctl in list(self.windows.values()):
+                if ctl.style is not None and ctl.style.active:
+                    ctl.style.remove()
+                    ctl.style.apply()
         elif key in ("computer_in_sidebar", "computer_hidden", "computer_sections"):
             self.refresh_computer_pages()
 
@@ -2457,9 +2493,94 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         if ctl is not None:
             ctl.record_zoom(settings.get_string(key))
 
-    # ── menu de contexto no fundo da pasta (API oficial do Nautilus) ──
+    # ── etiquetas e dimensões (API oficial: InfoProvider / ColumnProvider) ──
+    def update_file_info(self, file):
+        """Chamado pelo Nautilus para cada arquivo mostrado. Bolinhas das etiquetas como
+        emblemas, texto para a coluna "Etiquetas" e dimensões das imagens."""
+        if self._inert or file.get_uri_scheme() != "file":
+            return Nautilus.OperationResult.COMPLETE
+        try:
+            uri = file.get_uri()
+            path = uri_to_path(uri)
+            names = read_tags(path) if path else []
+            for name in names:
+                file.add_emblem(f"vitrine-tag-{self.tags.color_of(name)}")
+            file.add_string_attribute("vitrine_tags", ", ".join(names))
+            self.tags.seen(uri, names)
+            if path and self.cfg.get("image_dimensions"):
+                mime = file.get_mime_type() or ""
+                if mime in ("image/jpeg", "image/png"):
+                    p = imageload.probe(path, mime)
+                    if p.width and p.height:
+                        w, h = (p.height, p.width) if p.orientation in (5, 6, 7, 8) else (p.width, p.height)
+                        file.add_string_attribute("vitrine_dimensions", f"{_thousands(w)} × {_thousands(h)}")
+        except Exception as err:  # noqa: BLE001
+            log(f"update_file_info: {err!r}")
+        return Nautilus.OperationResult.COMPLETE
+
+    def get_columns(self):
+        if self._inert:
+            return []
+        return [
+            Nautilus.Column(name="Vitrine::tags", attribute="vitrine_tags", label="Etiquetas",
+                            description="Etiquetas coloridas (user.xdg.tags)"),
+            Nautilus.Column(name="Vitrine::dimensions", attribute="vitrine_dimensions",
+                            label="Dimensões", description="Largura × altura das imagens"),
+        ]
+
+    def _invalidate_files(self, uris) -> None:
+        """Etiquetas mudaram: o Nautilus pergunta de novo (emblemas, coluna)."""
+        for uri in uris:
+            try:
+                info = Nautilus.FileInfo.create_for_uri(uri)
+                if info is not None:
+                    info.invalidate_extension_info()
+            except Exception as err:  # noqa: BLE001
+                log(f"etiquetas: não consegui atualizar {uri}: {err!r}")
+
+    # ── menu de contexto dos arquivos: Etiquetas ──
+    @guarded
     def get_file_items(self, *args):
-        return []
+        files = args[-1] if args else None
+        if self._inert or not files:
+            return []
+        uris = [f.get_uri() for f in files if f.get_uri_scheme() == "file"]
+        if not uris:
+            return []
+        current = [set(read_tags(uri_to_path(u))) for u in uris]
+        root = Nautilus.MenuItem(name="Vitrine::tags", label="Etiquetas")
+        sub = Nautilus.Menu()
+        root.set_submenu(sub)
+        for name, color in self.tags.definitions():
+            has = all(name in c for c in current)
+            emoji = PALETTE.get(color, PALETTE["gray"])[1]
+            item = Nautilus.MenuItem(name=f"Vitrine::tag::{name}",
+                                     label=f"{emoji}  {name}{'  ✓' if has else ''}")
+            item.connect("activate", lambda *_a, n=name: GLib.idle_add(
+                self._tag_action, lambda: self.tags.toggle(uris, n)))
+            sub.append_item(item)
+        if any(current):
+            clear = Nautilus.MenuItem(name="Vitrine::tag-clear", label="Remover etiquetas")
+            clear.connect("activate", lambda *_a: GLib.idle_add(
+                self._tag_action, lambda: self.tags.clear(uris)))
+            sub.append_item(clear)
+        manage = Nautilus.MenuItem(name="Vitrine::tag-manage", label="Todas as etiquetas…")
+        manage.connect("activate", lambda *_a: GLib.idle_add(self._run, _open_tag_manager))
+        sub.append_item(manage)
+        return [root]
+
+    def _tag_action(self, fn) -> bool:
+        try:
+            fn()
+        except TagError as err:
+            ctl = self.active_controller()
+            if ctl is not None:
+                ctl.toast(f"Não foi possível etiquetar: {err}")
+            else:
+                log(f"etiquetas: {err}")
+        return GLib.SOURCE_REMOVE
+
+    # ── menu de contexto no fundo da pasta (API oficial do Nautilus) ──
 
     @guarded
     def get_background_items(self, *args):
@@ -2546,6 +2667,16 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider):
         if mode == "grid":
             self.cfg.set("default_grid_zoom", self.current_grid_zoom())
         log(f"novo padrão: {mode}")
+
+
+def _thousands(n: int) -> str:
+    """1066 → "1.066" (separador de milhar do português)."""
+    return f"{n:,}".replace(",", ".")
+
+
+def _open_tag_manager(ctl) -> None:
+    from .tagui import open_manager
+    open_manager(ctl)
 __VITRINE_ARQUIVO_9__
 mkdir -p "vitrine"
 cat > 'vitrine/native.py' <<'__VITRINE_ARQUIVO_10__'
@@ -3822,7 +3953,7 @@ def run(ctl) -> bool:
 
     def finder_widgets():
         return [w for w in util.walk(ctl.win)
-                if any(c.startswith(("vitrine-capsule", "vitrine-finder", "vitrine-search"))
+                if any(c.startswith(("vitrine-capsule", "vitrine-finder", "vitrine-search", "vitrine-tags"))
                        for c in w.get_css_classes()) and w is not ctl.win]
 
     style_state = {}
@@ -3866,7 +3997,9 @@ def run(ctl) -> bool:
         check("Nautilus padrão: nada da camada Finder sobra (CSS, classe, widgets)",
               not st.active and not ctl.win.has_css_class("vitrine-finder")
               and not finder_mod.css_loaded() and not leftovers
-              and sum(1 for _ in util.walk(ctl.win)) == style_state["n_native"],
+              and sum(1 for _ in util.walk(ctl.win)) == style_state["n_native"]
+              and "vitrine_dimensions" not in Gio.Settings.new("org.gnome.nautilus.icon-view").get_strv("captions")
+              and "Vitrine::tags" not in Gio.Settings.new("org.gnome.nautilus.list-view").get_strv("default-visible-columns"),
               f"{finder_mod.describe(ctl.win)} sobras={[w.get_css_classes() for w in leftovers]} "
               f"widgets={sum(1 for _ in util.walk(ctl.win))}/{style_state['n_native']}")
         ctl.cfg.set("window_style", "finder")
@@ -3885,6 +4018,101 @@ def run(ctl) -> bool:
               tb is not None and tb.title.get_label() == "Meu computador", tb.title.get_label())
         shot("finder-meu-computador")
         ctl.win.activate_action("vitrine.back", None)
+
+    # ── etiquetas e dimensões ──
+    tagdir = {}
+
+    def icons_named(name):
+        out = []
+        for w in util.walk(ctl.win):
+            if not isinstance(w, Gtk.Image) or not w.get_mapped():
+                continue
+            gicon = w.get_gicon()
+            names = list(gicon.get_names()) if isinstance(gicon, Gio.ThemedIcon) else []
+            if w.get_icon_name() == name or name in names:
+                out.append(w)
+        return out
+
+    @step
+    def t0():
+        gi_require = __import__("gi")
+        gi_require.require_version("GdkPixbuf", "2.0")
+        from gi.repository import GdkPixbuf
+        root = tempfile.mkdtemp(prefix="vitrine-selftest-tags-")
+        png = os.path.join(root, "foto.png")
+        GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, 300, 200).savev(png, "png", [], [])
+        txt = os.path.join(root, "nota.txt")
+        open(txt, "w").close()
+        tagdir.update(root=root, png=Gio.File.new_for_path(png).get_uri(),
+                      txt=Gio.File.new_for_path(txt).get_uri())
+        ctl.navigate(Gio.File.new_for_path(root).get_uri())
+
+    @step
+    def t1():
+        ctl.user_set_mode("grid", "large")
+        ctl.ext.tags.toggle([tagdir["png"], tagdir["txt"]], "Vermelho")
+
+    @step
+    def t2():
+        from .tags import read_tags, uri_to_path
+        check("etiquetas: grava user.xdg.tags nos arquivos",
+              read_tags(uri_to_path(tagdir["png"])) == ["Vermelho"])
+        dots = [w for w in icons_named("vitrine-tag-red")
+                if util.ancestor(w, lambda a: gtype_name(a) == "NautilusGridCell") is not None]
+        check("etiquetas: o Nautilus mostra a bolinha (emblema) nos arquivos",
+              len(dots) >= 2, f"emblemas={len(dots)}")
+        dims = [w for w in util.walk(ctl.win) if isinstance(w, Gtk.Label)
+                and w.get_label() == "300 × 200" and w.get_mapped()]
+        blue = dims and dims[0].get_color().blue > max(dims[0].get_color().red, dims[0].get_color().green)
+        check("ícones: dimensões da imagem abaixo do nome, em azul", len(dims) == 1 and blue,
+              f"legendas={len(dims)} cor={dims[0].get_color().to_string() if dims else '-'}")
+        cell = next((w for w in util.walk(ctl.win) if gtype_name(w) == "NautilusGridCell"), None)
+        if cell is not None and dims:
+            chain, w = [], dims[0]
+            while w is not None:
+                chain.append(f"{gtype_name(w)}{w.get_css_classes()}")
+                w = w.get_parent()
+            log(f"legenda: cor={dims[0].get_color().to_string()} ancestrais={' < '.join(chain[:9])}")
+        shot("finder-icones-etiquetas")
+        ctl.show_tag("Vermelho")
+
+    @step
+    def t3():
+        page = ctl.tag_page
+        n = 0
+        child = page.flow.get_first_child()
+        while child is not None:
+            n += 1
+            child = child.get_next_sibling()
+        check("etiquetas: clicar na etiqueta mostra os arquivos com ela",
+              ctl.content_stack.get_visible_child_name() == "tag" and n == 2
+              and ctl.style.toolbar.title.get_label() == "Vermelho", f"itens={n}")
+        check("etiquetas: seção Etiquetas na barra lateral",
+              ctl.tag_sidebar is not None and ctl.tag_sidebar.get_mapped())
+        shot("finder-etiqueta-vermelho")
+        ctl.leave_tag_and_open(Gio.File.new_for_path(tagdir["root"]).get_uri())
+
+    @step
+    def t4():
+        check("etiquetas: navegar fecha a página da etiqueta",
+              ctl.tag_visible() is None and ctl.content_stack.get_visible_child_name() == "tabs")
+        ctl.ext.tags.clear([tagdir["png"], tagdir["txt"]])
+        discovery.forget_manual(Gio.File.new_for_path(tagdir["root"]).get_uri())
+        cfg.forget(Gio.File.new_for_path(tagdir["root"]).get_uri())
+        ctl.navigate(home)
+
+    @step
+    def t5():
+        shutil.rmtree(tagdir["root"], ignore_errors=True)
+        ctl.cfg.set("tags_in_sidebar", False)
+
+    @step
+    def t6():
+        off = ctl.tag_sidebar is None and not any(
+            "vitrine-tags-section" in w.get_css_classes() for w in util.walk(ctl.win))
+        ctl.cfg.set("tags_in_sidebar", True)
+        check("opção Seção Etiquetas vale na hora (desliga e liga)",
+              off and ctl.tag_sidebar is not None and ctl.style.active)
 
     @step
     def s11():
@@ -3917,7 +4145,743 @@ def run(ctl) -> bool:
     return GLib.SOURCE_REMOVE
 __VITRINE_ARQUIVO_12__
 mkdir -p "vitrine"
-cat > 'vitrine/util.py' <<'__VITRINE_ARQUIVO_13__'
+cat > 'vitrine/tags.py' <<'__VITRINE_ARQUIVO_13__'
+"""Etiquetas coloridas, guardadas no atributo estendido padrão `user.xdg.tags`.
+
+O atributo guarda os *nomes* das etiquetas separados por vírgula (o mesmo formato do
+Dolphin/KDE e de outros gerenciadores), então as etiquetas continuam valendo fora da
+Vitrine. A cor de cada nome fica nas preferências (GSettings, chave `tags`).
+
+O sistema de arquivos não tem um jeito rápido de achar "todos os arquivos com a
+etiqueta X", então a Vitrine mantém um índice (~/.local/share/nautilus-vitrine/
+tags.json) com os arquivos que ela etiquetou ou que o Nautilus mostrou com etiqueta;
+`scan()` procura numa pasta (ex.: a pasta pessoal) quando o usuário pede.
+
+Python puro (sem GTK): testado em tools/test_tags.py.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+from urllib.parse import unquote, urlparse
+
+from .util import log
+
+XATTR = "user.xdg.tags"
+INDEX_DIR = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
+                         "nautilus-vitrine")
+
+# cor → (hex, emoji para menus de texto, nome padrão)
+PALETTE = {
+    "red": ("#ff453a", "🔴", "Vermelho"),
+    "orange": ("#ff9f0a", "🟠", "Laranja"),
+    "yellow": ("#ffd60a", "🟡", "Amarelo"),
+    "green": ("#30d158", "🟢", "Verde"),
+    "blue": ("#0a84ff", "🔵", "Azul"),
+    "purple": ("#bf5af2", "🟣", "Roxo"),
+    "gray": ("#98989d", "⚪", "Cinza"),
+}
+DEFAULT_TAGS = [(PALETTE[c][2], c) for c in ("red", "orange", "yellow", "green", "blue", "purple")]
+
+
+class TagError(Exception):
+    """Não foi possível gravar a etiqueta (ex.: pen drive FAT, sem permissão)."""
+
+
+def uri_to_path(uri: str) -> str | None:
+    p = urlparse(uri)
+    return unquote(p.path) if p.scheme == "file" else None
+
+
+def path_to_uri(path: str) -> str:
+    from urllib.parse import quote
+    return "file://" + quote(os.path.abspath(path))
+
+
+def read_tags(path: str) -> list[str]:
+    try:
+        raw = os.getxattr(path, XATTR, follow_symlinks=True)
+    except OSError:
+        return []
+    names = []
+    for part in raw.decode("utf-8", "replace").split(","):
+        part = part.strip()
+        if part and part not in names:
+            names.append(part)
+    return names
+
+
+def write_tags(path: str, names: list[str]) -> None:
+    try:
+        if names:
+            os.setxattr(path, XATTR, ",".join(names).encode("utf-8"), follow_symlinks=True)
+        else:
+            try:
+                os.removexattr(path, XATTR, follow_symlinks=True)
+            except OSError as err:
+                if err.errno not in (61, 95):  # ENODATA / ENOTSUP: já não tinha
+                    raise
+    except OSError as err:
+        raise TagError(f"{os.path.basename(path)}: {err.strerror}") from err
+
+
+class TagStore:
+    """Definições (nome, cor), leitura/escrita nos arquivos e o índice."""
+
+    def __init__(self, cfg, index_path: str | None = None, on_files_changed=None) -> None:
+        self.cfg = cfg
+        self.index_path = index_path or os.path.join(INDEX_DIR, "tags.json")
+        self.on_files_changed = on_files_changed   # callback(uris) → avisar o Nautilus
+        self._listeners: list = []
+        self._lock = threading.Lock()
+        self.index: dict[str, list[str]] = self._load_index()
+
+    # ── definições ──
+    def definitions(self) -> list[tuple[str, str]]:
+        raw = self.cfg.get("tags")
+        out = []
+        for item in raw or DEFAULT_TAGS:
+            try:
+                name, color = item
+            except (TypeError, ValueError):
+                continue
+            if name and name not in (n for n, _c in out):
+                out.append((str(name), color if color in PALETTE else "gray"))
+        return out
+
+    def names(self) -> list[str]:
+        return [n for n, _c in self.definitions()]
+
+    def color_of(self, name: str) -> str:
+        return dict(self.definitions()).get(name, "gray")
+
+    def _save_definitions(self, defs) -> None:
+        self.cfg.set("tags", [(n, c) for n, c in defs])
+        self._notify()
+
+    def create(self, name: str, color: str = "gray") -> bool:
+        name = _clean(name)
+        if not name or name in self.names():
+            return False
+        self._save_definitions(self.definitions() + [(name, color)])
+        return True
+
+    def recolor(self, name: str, color: str) -> None:
+        self._save_definitions([(n, color if n == name else c) for n, c in self.definitions()])
+
+    def rename(self, old: str, new: str) -> bool:
+        new = _clean(new)
+        if not new or new == old or new in self.names():
+            return False
+        self._save_definitions([(new if n == old else n, c) for n, c in self.definitions()])
+        self._rewrite(old, lambda names: [new if n == old else n for n in names])
+        return True
+
+    def delete(self, name: str) -> None:
+        self._save_definitions([(n, c) for n, c in self.definitions() if n != name])
+        self._rewrite(name, lambda names: [n for n in names if n != name])
+
+    def _rewrite(self, name: str, fn) -> None:
+        """Atualiza os arquivos conhecidos (índice) que têm a etiqueta `name`."""
+        changed = []
+        for uri in self.files_with(name):
+            path = uri_to_path(uri)
+            try:
+                new = fn(read_tags(path))
+                write_tags(path, new)
+                self.remember(uri, new)
+                changed.append(uri)
+            except TagError as err:
+                log(f"etiquetas: {err}")
+        self._files_changed(changed)
+
+    # ── arquivos ──
+    def tags_of(self, uri: str) -> list[str]:
+        path = uri_to_path(uri)
+        return read_tags(path) if path else []
+
+    def set_tags(self, uris: list[str], names: list[str]) -> None:
+        done = []
+        for uri in uris:
+            path = uri_to_path(uri)
+            if path is None:
+                continue
+            write_tags(path, names)
+            self.remember(uri, names)
+            done.append(uri)
+        self._files_changed(done)
+
+    def toggle(self, uris: list[str], name: str) -> bool:
+        """Se todos já têm a etiqueta, tira de todos; senão, põe em todos.
+        Retorna True se a etiqueta foi aplicada."""
+        local = [u for u in uris if uri_to_path(u)]
+        apply = not local or not all(name in self.tags_of(u) for u in local)
+        self._change(local, lambda names: (names + [name]) if apply and name not in names
+                     else ([n for n in names if n != name] if not apply else names))
+        return apply
+
+    def add(self, uris: list[str], name: str) -> None:
+        self._change([u for u in uris if uri_to_path(u)],
+                     lambda names: names if name in names else names + [name])
+
+    def clear(self, uris: list[str]) -> None:
+        self._change([u for u in uris if uri_to_path(u)], lambda _names: [])
+
+    def _change(self, uris, fn) -> None:
+        done, errors = [], []
+        for uri in uris:
+            path = uri_to_path(uri)
+            try:
+                new = fn(read_tags(path))
+                write_tags(path, new)
+                self.remember(uri, new)
+                done.append(uri)
+            except TagError as err:
+                errors.append(str(err))
+        self._files_changed(done)
+        if errors:
+            raise TagError("; ".join(errors[:3]))
+
+    def _files_changed(self, uris) -> None:
+        if uris:
+            self._save_index()
+            if self.on_files_changed is not None:
+                self.on_files_changed(uris)
+            self._notify()
+
+    # ── índice ──
+    def _load_index(self) -> dict[str, list[str]]:
+        try:
+            with open(self.index_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            return {k: list(v) for k, v in data.items() if isinstance(v, list)}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_index(self) -> None:
+        with self._lock:
+            data = dict(self.index)
+        try:
+            os.makedirs(os.path.dirname(self.index_path), exist_ok=True)
+            tmp = self.index_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False)
+            os.replace(tmp, self.index_path)
+        except OSError as err:
+            log(f"etiquetas: falha ao salvar o índice ({err})")
+
+    def remember(self, uri: str, names: list[str]) -> bool:
+        """Anota no índice (sem gravar em disco). True se mudou."""
+        with self._lock:
+            old = self.index.get(uri)
+            if names:
+                if old == names:
+                    return False
+                self.index[uri] = list(names)
+            elif old is None:
+                return False
+            else:
+                del self.index[uri]
+        return True
+
+    def seen(self, uri: str, names: list[str]) -> None:
+        """O Nautilus mostrou este arquivo (provedor de informações)."""
+        if self.remember(uri, names):
+            self._save_index()
+
+    def files_with(self, name: str) -> list[str]:
+        """Arquivos do índice que *ainda* têm a etiqueta (confere no disco)."""
+        out, stale = [], []
+        with self._lock:
+            items = list(self.index.items())
+        for uri, names in items:
+            if name not in names:
+                continue
+            path = uri_to_path(uri)
+            if path is None or not os.path.exists(path):
+                stale.append(uri)
+                continue
+            current = read_tags(path)
+            if current != names:
+                self.remember(uri, current)
+            if name in current:
+                out.append(uri)
+        for uri in stale:
+            self.remember(uri, [])
+        if stale:
+            self._save_index()
+        return sorted(out, key=lambda u: os.path.basename(uri_to_path(u) or u).lower())
+
+    def scan(self, root: str, *, max_files: int = 200_000, stop=None) -> int:
+        """Procura arquivos etiquetados em `root` (pula pastas ocultas). Devolve quantos
+        achou. Feito para rodar numa thread."""
+        found = seen = 0
+        for dirpath, dirnames, filenames in os.walk(root):
+            if stop is not None and stop():
+                break
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for name in dirnames + filenames:
+                seen += 1
+                path = os.path.join(dirpath, name)
+                names = read_tags(path)
+                if names:
+                    found += 1
+                    self.remember(path_to_uri(path), names)
+            if seen > max_files:
+                log(f"etiquetas: busca parada em {max_files} itens")
+                break
+        self._save_index()
+        return found
+
+    # ── avisos ──
+    def on_change(self, cb) -> None:
+        self._listeners.append(cb)
+
+    def off_change(self, cb) -> None:
+        if cb in self._listeners:
+            self._listeners.remove(cb)
+
+    def _notify(self) -> None:
+        for cb in list(self._listeners):
+            try:
+                cb()
+            except Exception as err:  # noqa: BLE001
+                log(f"etiquetas: ouvinte: {err}")
+
+
+def _clean(name: str) -> str:
+    return (name or "").replace(",", " ").strip()[:60]
+__VITRINE_ARQUIVO_13__
+mkdir -p "vitrine"
+cat > 'vitrine/tagui.py' <<'__VITRINE_ARQUIVO_14__'
+"""Telas das etiquetas: botão da barra de ferramentas, seção da barra lateral, página
+com os arquivos de uma etiqueta e a tela "Todas as etiquetas…".
+
+As bolinhas coloridas são os próprios ícones de emblema (assets/vitrine-tag-<cor>.svg),
+então a cor é a mesma no Nautilus, nos menus e aqui.
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
+
+from . import native, util
+from .tags import PALETTE, TagError, uri_to_path
+from .util import guarded, log
+
+
+def dot(color: str, size: int = 12) -> Gtk.Image:
+    img = Gtk.Image.new_from_icon_name(f"vitrine-tag-{color}")
+    img.set_pixel_size(size)
+    return img
+
+
+def _apply(ctl, fn) -> None:
+    try:
+        fn()
+    except TagError as err:
+        ctl.toast(f"Não foi possível etiquetar: {err}")
+
+
+# ───────────────────────── botão da barra de ferramentas ─────────────────────────
+class TagMenuButton(Gtk.MenuButton):
+    """Aplica/remove etiquetas nos itens selecionados."""
+
+    def __init__(self, ctl) -> None:
+        super().__init__(icon_name="vitrine-tag-symbolic", tooltip_text="Etiquetas",
+                         valign=Gtk.Align.CENTER)
+        self.add_css_class("flat")
+        self.ctl = ctl
+        self.list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.list.add_css_class("navigation-sidebar")
+        self.list.connect("row-activated", self._on_row)
+        pop = Gtk.Popover(child=self.list)
+        pop.connect("show", lambda *_a: self.refresh())
+        self.set_popover(pop)
+
+    def _uris(self) -> list[str]:
+        return [u for u in native.selected_uris(self.ctl.model_watch.get()) if uri_to_path(u)]
+
+    def refresh(self) -> None:
+        self.list.remove_all()
+        uris = self._uris()
+        store = self.ctl.ext.tags
+        current = [set(store.tags_of(u)) for u in uris]
+        for name, color in store.definitions():
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(spacing=10)
+            box.append(dot(color))
+            box.append(Gtk.Label(label=name, xalign=0, hexpand=True))
+            check = Gtk.Image.new_from_icon_name("object-select-symbolic")
+            check.set_visible(bool(current) and all(name in c for c in current))
+            box.append(check)
+            row.set_child(box)
+            row.set_sensitive(bool(uris))
+            row._vitrine_tag = name
+            self.list.append(row)
+        for label, action in (("Remover etiquetas", "clear"), ("Todas as etiquetas…", "manage")):
+            row = Gtk.ListBoxRow()
+            row.set_child(Gtk.Label(label=label, xalign=0))
+            row._vitrine_action = action
+            row.set_sensitive(action == "manage" or any(current))
+            self.list.append(row)
+
+    @guarded
+    def _on_row(self, _lb, row) -> None:
+        store = self.ctl.ext.tags
+        uris = self._uris()
+        name = getattr(row, "_vitrine_tag", None)
+        action = getattr(row, "_vitrine_action", None)
+        if name:
+            _apply(self.ctl, lambda: store.toggle(uris, name))
+            self.refresh()
+            return
+        self.get_popover().popdown()
+        if action == "clear":
+            _apply(self.ctl, lambda: store.clear(uris))
+        elif action == "manage":
+            open_manager(self.ctl)
+
+
+# ───────────────────────── seção da barra lateral ─────────────────────────
+class TagSidebar(Gtk.Box):
+    """Seção "Etiquetas" recolhível, logo abaixo dos locais nativos."""
+
+    def __init__(self, ctl) -> None:
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.add_css_class("vitrine-tags-section")
+        self.ctl = ctl
+        cfg = ctl.cfg
+        self.arrow = Gtk.Image()
+        head = Gtk.Box(spacing=6)
+        title = Gtk.Label(label="Etiquetas", xalign=0, hexpand=True)
+        title.add_css_class("vitrine-sidebar-heading")
+        head.append(title)
+        head.append(self.arrow)
+        self.header = Gtk.Button(child=head)
+        self.header.add_css_class("flat")
+        self.header.add_css_class("vitrine-tags-header")
+        self.header.connect("clicked", lambda *_a: self.set_expanded(not self.revealer.get_reveal_child()))
+        self.append(self.header)
+        self.list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+        self.list.add_css_class("navigation-sidebar")
+        self.list.connect("row-activated", self._on_row)
+        self.revealer = Gtk.Revealer(child=self.list,
+                                     transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN)
+        self.append(self.revealer)
+        self.set_expanded(bool(cfg.get("tags_section_expanded")), save=False)
+        self.listener = self.refresh   # FinderStyle desconecta ao remover a seção
+        ctl.ext.tags.on_change(self.listener)
+        self.refresh()
+
+    def set_expanded(self, on: bool, save: bool = True) -> None:
+        self.revealer.set_reveal_child(on)
+        self.arrow.set_from_icon_name("pan-down-symbolic" if on else "pan-end-symbolic")
+        if save:
+            self.ctl.cfg.set("tags_section_expanded", on)
+
+    def refresh(self) -> None:
+        self.list.remove_all()
+        for name, color in self.ctl.ext.tags.definitions():
+            self.list.append(self._row(dot(color, 14), name, name))
+        self.list.append(self._row(Gtk.Image.new_from_icon_name("view-more-horizontal-symbolic"),
+                                   "Todas as etiquetas…", None))
+
+    def _row(self, icon, label, tag) -> Gtk.ListBoxRow:
+        row = Gtk.ListBoxRow()
+        box = Gtk.Box(spacing=12)
+        box.append(icon)
+        box.append(Gtk.Label(label=label, xalign=0, hexpand=True,
+                             ellipsize=Pango.EllipsizeMode.END))
+        row.set_child(box)
+        row._vitrine_tag = tag
+        if tag:
+            drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+            drop.connect("drop", self._on_drop, tag)
+            row.add_controller(drop)
+        return row
+
+    @guarded
+    def _on_row(self, _lb, row) -> None:
+        tag = getattr(row, "_vitrine_tag", None)
+        if tag:
+            self.ctl.show_tag(tag)
+        else:
+            self.list.unselect_all()
+            open_manager(self.ctl)
+
+    @guarded
+    def _on_drop(self, _target, value, _x, _y, tag) -> bool:
+        uris = [f.get_uri() for f in value.get_files()]
+        _apply(self.ctl, lambda: self.ctl.ext.tags.add(uris, tag))
+        n = len(uris)
+        self.ctl.toast(f"Etiqueta {tag} aplicada a {n} {'item' if n == 1 else 'itens'}")
+        return True
+
+    def select(self, tag: str | None) -> None:
+        row = self.list.get_first_child()
+        while row is not None:
+            if tag is not None and getattr(row, "_vitrine_tag", None) == tag:
+                self.list.select_row(row)
+                return
+            row = row.get_next_sibling()
+        self.list.unselect_all()
+
+
+# ───────────────────────── página de uma etiqueta ─────────────────────────
+class TagPage(Gtk.ScrolledWindow):
+    __gtype_name__ = "VitrineTagPage"
+
+    def __init__(self, ctl) -> None:
+        super().__init__(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.add_css_class("vitrine-computer")
+        self.ctl = ctl
+        self.tag: str | None = None
+        self._scanning = False
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(body, f"set_margin_{side}")(24 if side in ("top", "bottom") else 18)
+        clamp = Adw.Clamp(maximum_size=1100, tightening_threshold=700, child=body)
+        self.set_child(clamp)
+        head = Gtk.Box(spacing=12)
+        self.head_dot = Gtk.Image()
+        self.head_dot.set_pixel_size(22)
+        self.title = Gtk.Label(xalign=0)
+        self.title.add_css_class("title-1")
+        self.count = Gtk.Label(xalign=0, hexpand=True, valign=Gtk.Align.BASELINE_FILL)
+        self.count.add_css_class("dim-label")
+        self.scan_btn = Gtk.Button(label="Procurar na pasta pessoal", valign=Gtk.Align.CENTER,
+                                   tooltip_text="Acha arquivos etiquetados por outros programas")
+        self.scan_btn.connect("clicked", lambda *_a: self.scan())
+        for w in (self.head_dot, self.title, self.count, self.scan_btn):
+            head.append(w)
+        body.append(head)
+        self.flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.SINGLE, homogeneous=True,
+                                max_children_per_line=8, min_children_per_line=2,
+                                column_spacing=6, row_spacing=6, valign=Gtk.Align.START)
+        self.flow.add_css_class("vitrine-folders")
+        self.flow.connect("child-activated", self._on_activated)
+        body.append(self.flow)
+        self.empty = Gtk.Label(wrap=True, xalign=0, label=(
+            "Nenhum arquivo com esta etiqueta. Arquivos etiquetados por outros programas "
+            "aparecem depois de abertos no Nautilus, ou com “Procurar na pasta pessoal”."))
+        self.empty.add_css_class("dim-label")
+        body.append(self.empty)
+        ctl.ext.tags.on_change(lambda: self.get_mapped() and self.refresh())
+
+    def show(self, tag: str) -> None:
+        self.tag = tag
+        self.refresh()
+
+    def refresh(self) -> None:
+        store = self.ctl.ext.tags
+        tag = self.tag
+        if tag is None:
+            return
+        self.head_dot.set_from_icon_name(f"vitrine-tag-{store.color_of(tag)}")
+        self.title.set_label(tag)
+        self.flow.remove_all()
+        uris = store.files_with(tag)
+        for uri in uris:
+            self.flow.append(self._tile(uri, store))
+        n = len(uris)
+        self.count.set_label(f"{n} {'item' if n == 1 else 'itens'}")
+        self.empty.set_visible(n == 0)
+
+    def _tile(self, uri: str, store) -> Gtk.FlowBoxChild:
+        gfile = Gio.File.new_for_uri(uri)
+        try:
+            info = gfile.query_info("standard::icon,standard::display-name,standard::type,"
+                                    "thumbnail::path", Gio.FileQueryInfoFlags.NONE, None)
+        except GLib.Error:
+            info = None
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.add_css_class("vitrine-tile")
+        thumb = info.get_attribute_byte_string("thumbnail::path") if info else None
+        if thumb and os.path.exists(thumb):
+            pic = Gtk.Picture.new_for_filename(thumb)
+            pic.set_content_fit(Gtk.ContentFit.CONTAIN)
+            pic.set_size_request(64, 64)
+            pic.add_css_class("vitrine-thumb")
+            box.append(pic)
+        else:
+            img = Gtk.Image.new_from_gicon(info.get_icon()) if info and info.get_icon() \
+                else Gtk.Image.new_from_icon_name("text-x-generic")
+            img.set_pixel_size(64)
+            box.append(img)
+        name = info.get_display_name() if info else gfile.get_basename()
+        box.append(Gtk.Label(label=name, ellipsize=Pango.EllipsizeMode.MIDDLE, lines=2, wrap=True,
+                             justify=Gtk.Justification.CENTER, max_width_chars=14))
+        dots = Gtk.Box(spacing=2, halign=Gtk.Align.CENTER)
+        for t in store.tags_of(uri):
+            dots.append(dot(store.color_of(t), 10))
+        box.append(dots)
+        child = Gtk.FlowBoxChild(child=box)
+        child.set_tooltip_text(uri_to_path(uri) or uri)
+        child._vitrine_uri = uri
+        child._vitrine_dir = bool(info and info.get_file_type() == Gio.FileType.DIRECTORY)
+        menu = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        menu.connect("pressed", self._on_menu, child)
+        child.add_controller(menu)
+        return child
+
+    @guarded
+    def _on_activated(self, _fb, child) -> None:
+        if child._vitrine_dir:
+            self.ctl.leave_tag_and_open(child._vitrine_uri)
+        else:
+            util.open_uri(child._vitrine_uri)
+
+    @guarded
+    def _on_menu(self, gesture, _n, x, y, child) -> None:
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        uri = child._vitrine_uri
+        group = Gio.SimpleActionGroup()
+        menu = Gio.Menu()
+
+        def add(label, name, fn):
+            act = Gio.SimpleAction.new(name, None)
+            act.connect("activate", lambda *_a: fn())
+            group.add_action(act)
+            menu.append(label, f"vtag.{name}")
+
+        add("Abrir", "open", lambda: self._on_activated(None, child))
+        add("Mostrar na pasta", "reveal", lambda: self.ctl.leave_tag_and_reveal(uri))
+        add(f"Remover a etiqueta {self.tag}", "untag",
+            lambda: _apply(self.ctl, lambda: self.ctl.ext.tags.toggle([uri], self.tag)))
+        child.insert_action_group("vtag", group)
+        pop = Gtk.PopoverMenu.new_from_model(menu)
+        pop.set_parent(child)
+        pop.set_has_arrow(False)
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        pop.set_pointing_to(rect)
+        pop.connect("closed", lambda p: GLib.idle_add(p.unparent))
+        pop.popup()
+
+    def scan(self) -> None:
+        if self._scanning:
+            return
+        self._scanning = True
+        self.scan_btn.set_sensitive(False)
+        self.scan_btn.set_label("Procurando…")
+        store = self.ctl.ext.tags
+
+        def work():
+            try:
+                found = store.scan(os.path.expanduser("~"))
+            except Exception as err:  # noqa: BLE001
+                log(f"etiquetas: busca falhou ({err})")
+                found = -1
+            GLib.idle_add(done, found)
+
+        def done(found):
+            self._scanning = False
+            self.scan_btn.set_sensitive(True)
+            self.scan_btn.set_label("Procurar na pasta pessoal")
+            self.refresh()
+            if found >= 0:
+                self.ctl.toast(f"{found} {'item etiquetado encontrado' if found == 1 else 'itens etiquetados encontrados'}")
+            return GLib.SOURCE_REMOVE
+
+        threading.Thread(target=work, daemon=True, name="vitrine-tag-scan").start()
+
+
+# ───────────────────────── Todas as etiquetas… ─────────────────────────
+def open_manager(ctl) -> None:
+    dialog = TagManager(ctl)
+    dialog.present(ctl.win)
+
+
+class TagManager(Adw.Dialog):
+    """Criar, renomear, trocar a cor e apagar etiquetas."""
+
+    def __init__(self, ctl) -> None:
+        super().__init__(title="Etiquetas", content_width=420, content_height=520)
+        self.ctl = ctl
+        self.store = ctl.ext.tags
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+        page = Adw.PreferencesPage()
+        self.group = Adw.PreferencesGroup(
+            description="Os nomes ficam gravados nos arquivos (atributo user.xdg.tags) e "
+                        "valem em outros gerenciadores de arquivos. Renomear ou apagar "
+                        "atualiza os arquivos que a Vitrine conhece.")
+        page.add(self.group)
+        add_group = Adw.PreferencesGroup()
+        add_btn = Gtk.Button(label="Nova etiqueta", halign=Gtk.Align.CENTER)
+        add_btn.add_css_class("pill")
+        add_btn.connect("clicked", lambda *_a: self._new())
+        add_group.add(add_btn)
+        page.add(add_group)
+        view.set_content(page)
+        self.set_child(view)
+        self.rows: list = []
+        self._build()
+
+    def _build(self) -> None:
+        for row in self.rows:
+            self.group.remove(row)
+        self.rows = []
+        for name, color in self.store.definitions():
+            row = Adw.EntryRow(title="Nome", text=name, show_apply_button=True)
+            row.add_prefix(self._color_button(name, color))
+            delete = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER,
+                                tooltip_text="Apagar etiqueta")
+            delete.add_css_class("flat")
+            delete.connect("clicked", lambda *_a, n=name: self._delete(n))
+            row.add_suffix(delete)
+            row.connect("apply", lambda r, old=name: self._rename(old, r.get_text()))
+            self.group.add(row)
+            self.rows.append(row)
+
+    def _color_button(self, name: str, color: str) -> Gtk.MenuButton:
+        grid = Gtk.FlowBox(max_children_per_line=7, selection_mode=Gtk.SelectionMode.NONE)
+        btn = Gtk.MenuButton(child=dot(color, 16), valign=Gtk.Align.CENTER,
+                             tooltip_text="Cor")
+        btn.add_css_class("flat")
+        for key, (_hex, _emoji, label) in PALETTE.items():
+            choice = Gtk.Button(child=dot(key, 18), tooltip_text=label)
+            choice.add_css_class("flat")
+            choice.add_css_class("circular")
+            choice.connect("clicked", lambda *_a, k=key: (btn.popdown(), self._recolor(name, k)))
+            grid.append(choice)
+        btn.set_popover(Gtk.Popover(child=grid))
+        return btn
+
+    @guarded
+    def _rename(self, old: str, new: str) -> None:
+        if self.store.rename(old, new):
+            self.ctl.toast(f"Etiqueta {old} agora se chama {new.strip()}")
+        self._build()
+
+    @guarded
+    def _recolor(self, name: str, color: str) -> None:
+        self.store.recolor(name, color)
+        self._build()
+
+    @guarded
+    def _delete(self, name: str) -> None:
+        self.store.delete(name)
+        self._build()
+
+    @guarded
+    def _new(self) -> None:
+        n = 1
+        while f"Etiqueta {n}" in self.store.names():
+            n += 1
+        self.store.create(f"Etiqueta {n}", "gray")
+        self._build()
+        if self.rows:
+            self.rows[-1].grab_focus()
+__VITRINE_ARQUIVO_14__
+mkdir -p "vitrine"
+cat > 'vitrine/util.py' <<'__VITRINE_ARQUIVO_15__'
 """Utilitários: log, varredura da árvore de widgets e operações de arquivo nativas."""
 
 from __future__ import annotations
@@ -4171,9 +5135,9 @@ def snapshot_png(widget: Gtk.Widget, path: str) -> bool:
         return False
     tex = native.get_renderer().render_texture(node, Graphene.Rect().init(0, 0, w, h))
     return bool(tex.save_to_png(path))
-__VITRINE_ARQUIVO_13__
+__VITRINE_ARQUIVO_15__
 mkdir -p "vitrine"
-cat > 'vitrine/window.py' <<'__VITRINE_ARQUIVO_14__'
+cat > 'vitrine/window.py' <<'__VITRINE_ARQUIVO_16__'
 """Controlador por janela: injeta Colunas + Pré-visualização e aplica as regras por pasta."""
 
 from __future__ import annotations
@@ -4188,6 +5152,7 @@ from .computer import ComputerPage
 from .finder import FinderStyle
 from .history import History
 from .preview import PreviewPane
+from .tagui import TagPage
 from .util import (ancestor, debug, dump_tree, find_by_type_name, find_first, gtype_name, guarded,
                    log, walk)
 
@@ -4236,6 +5201,9 @@ class WindowController:
         self.history_shortcuts_removed = 0
         self._leave_source = 0
         self.style: FinderStyle | None = None
+        self.tag_page: TagPage | None = None
+        self._tag_visible: str | None = None
+        self.tag_sidebar = None  # seção Etiquetas (só no estilo Finder)
 
     # ───────────────────────── injeção ─────────────────────────
     def inject(self) -> bool:
@@ -4276,6 +5244,8 @@ class WindowController:
         self.content_stack.set_transition_duration(120)
         self.content_stack.add_named(tv, "tabs")
         self.content_stack.add_named(self.computer, "computer")
+        self.tag_page = TagPage(self)
+        self.content_stack.add_named(self.tag_page, "tag")
         self.content_stack.set_visible_child_name("tabs")
         inner.append(self.strip)
         inner.append(self.content_stack)
@@ -4479,6 +5449,7 @@ class WindowController:
         slot = self.active_slot()
         if slot is None:
             return
+        self.hide_tag()
         h = self.history(slot)
         if on:
             h.open_computer()
@@ -4519,6 +5490,66 @@ class WindowController:
 
     def computer_visible(self) -> bool:
         return self._computer_visible
+
+    # ───────────────────────── página de uma etiqueta ─────────────────────────
+    def show_tag(self, name: str) -> None:
+        """Arquivos com a etiqueta `name` (clique na barra lateral). Fica por cima da
+        lista, como o Meu computador, mas não entra no histórico de Voltar/Avançar."""
+        if self.content_stack is None or self.tag_page is None:
+            return
+        self._tag_visible = name
+        self.tag_page.show(name)
+        self.content_stack.set_visible_child_name("tag")
+        if self.strip is not None:
+            self.strip.set_visible(False)
+        if self.preview is not None:
+            self.preview.set_folder(None)
+            self.preview.show_uris([])
+        if self.sidebar_list is not None:
+            self.sidebar_list.unselect_all()
+        sidebar = find_by_type_name(self.win, "NautilusSidebar")
+        native_lb = find_first(sidebar, lambda w: isinstance(w, Gtk.ListBox)) if sidebar else None
+        if native_lb is not None:
+            native_lb.unselect_all()
+        if self.tag_sidebar is not None:
+            self.tag_sidebar.select(name)
+        self._style_sync()
+
+    def tag_visible(self) -> str | None:
+        return self._tag_visible
+
+    def hide_tag(self) -> None:
+        if self._tag_visible is None:
+            return
+        self._tag_visible = None
+        if self.tag_sidebar is not None:
+            self.tag_sidebar.select(None)
+        if self.content_stack is not None:
+            self.content_stack.set_visible_child_name("computer" if self._computer_visible else "tabs")
+        if self._computer_visible:
+            if self.sidebar_list is not None:
+                self.sidebar_list.select_row(self.sidebar_list.get_row_at_index(0))
+        else:
+            slot = self.active_slot()
+            if slot is not None:
+                self._set_columns_visible(getattr(slot, "_vitrine_mode", None) == "columns")
+                self._sync_active_ui(slot)
+        self._style_sync()
+
+    def leave_tag_and_open(self, uri: str) -> None:
+        self.hide_tag()
+        if self._computer_visible:
+            self.leave_computer_and_open(uri)
+        else:
+            self.navigate(uri)
+
+    def leave_tag_and_reveal(self, uri: str) -> None:
+        self.hide_tag()
+        if self._computer_visible:
+            self.show_computer(False)
+        parent = Gio.File.new_for_uri(uri).get_parent()
+        if parent is not None:
+            self.reveal(parent.get_uri(), uri)
 
     def leave_computer_and_open(self, uri: str) -> None:
         """Abrir um item da página (pasta, disco, dispositivo recém-montado)."""
@@ -4669,6 +5700,7 @@ class WindowController:
         step = h.back() if delta < 0 else h.forward()
         if step is None:
             return
+        self.hide_tag()
         debug(f"histórico {'voltar' if delta < 0 else 'avançar'}: {h.entries} idx={h.idx} "
               f"nativo={step.native}")
         self._display_computer(step.show_computer)
@@ -4832,6 +5864,7 @@ class WindowController:
         # Os botões ← → podem ter sido religados pelo Nautilus; garantimos de novo.
         self._take_over_buttons()
         self._update_history_actions()
+        self.hide_tag()
         if self.history(slot).on_computer():
             self._display_computer(True)
             return
@@ -4858,6 +5891,7 @@ class WindowController:
             return
         self.ext.suppress()
         if slot is self.active_slot():
+            self.hide_tag()  # navegou: a página da etiqueta fecha
             if self._computer_visible:
                 self._display_computer(False)  # navegou (barra de caminho, busca…)
             self._sync_active_ui(slot)
@@ -5169,9 +6203,9 @@ class WindowController:
         if self.strip is not None:
             self.strip.teardown()
         self.ext.forget_window(self.win)
-__VITRINE_ARQUIVO_14__
+__VITRINE_ARQUIVO_16__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/about.css' <<'__VITRINE_ARQUIVO_15__'
+cat > 'vitrine/assets/about.css' <<'__VITRINE_ARQUIVO_17__'
 /* Card principal da página "Sobre" (vitrine/about.py).
    --card-bg-color do libadwaita já é um pouco mais claro que a janela nos dois temas;
    a borda usa o azul da logo. */
@@ -5181,9 +6215,9 @@ cat > 'vitrine/assets/about.css' <<'__VITRINE_ARQUIVO_15__'
   border-radius: 16px;
   padding: 32px 24px 24px 24px;
 }
-__VITRINE_ARQUIVO_15__
+__VITRINE_ARQUIVO_17__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/finder.css' <<'__VITRINE_ARQUIVO_16__'
+cat > 'vitrine/assets/finder.css' <<'__VITRINE_ARQUIVO_18__'
 /* Estilo "Finder (macOS)" da Vitrine.
  *
  * Toda regra começa com window.vitrine-finder: sem essa classe na janela, nada daqui
@@ -5283,9 +6317,60 @@ window.vitrine-finder .vitrine-finder-sidebar .navigation-sidebar > row button i
 /* ── conteúdo ── */
 window.vitrine-finder .vitrine-computer,
 window.vitrine-finder .vitrine-strip { background-color: var(--view-bg-color); }
-__VITRINE_ARQUIVO_16__
+
+/* ── seção Etiquetas da barra lateral ── */
+window.vitrine-finder .vitrine-tags-section { margin: 10px 0 8px 0; }
+window.vitrine-finder .vitrine-tags-header {
+  min-height: 24px; padding: 0 16px; border-radius: 6px;
+}
+window.vitrine-finder .vitrine-sidebar-heading,
+window.vitrine-finder .vitrine-tags-header image {
+  font-size: 0.85em; font-weight: 700;
+  color: color-mix(in srgb, currentColor 50%, transparent);
+}
+window.vitrine-finder .vitrine-tags-section .navigation-sidebar { padding: 0 8px; background: none; }
+window.vitrine-finder .vitrine-tags-section .navigation-sidebar > row {
+  min-height: 30px; padding: 0 8px; border-radius: 8px;
+}
+window.vitrine-finder .vitrine-tags-section .navigation-sidebar > row:selected {
+  background-color: color-mix(in srgb, currentColor 11%, transparent); color: inherit;
+}
+window.vitrine-finder .vitrine-tags-section .navigation-sidebar > row:drop(active) {
+  box-shadow: inset 0 0 0 2px var(--accent-bg-color);
+}
+
+/* ── visão em grade (a do Finder) ── */
+window.vitrine-finder .nautilus-grid-view gridview > child:selected {
+  background-color: color-mix(in srgb, currentColor 10%, transparent);
+  color: inherit;
+}
+window.vitrine-finder .nautilus-grid-view gridview > child:selected:hover {
+  background-color: color-mix(in srgb, currentColor 14%, transparent);
+}
+/* bolinhas das etiquetas (emblemas) sem o esmaecido do Nautilus */
+window.vitrine-finder .nautilus-view-cell > box.dim-label { opacity: 1; }
+
+/* dimensões das imagens (1ª legenda) em azul, como no Finder. Cor fixa: dentro da
+   grade o Nautilus redefine --accent-color (vira cinza ali). */
+window.vitrine-finder.vitrine-finder-dimensions .nautilus-grid-view .icon-ui-labels-box > label:nth-child(2) {
+  color: #0a64d6;
+  opacity: 1;
+}
+/* tema escuro: a classe vem do Adw.StyleManager (vitrine/finder/__init__.py) */
+window.vitrine-finder.vitrine-finder-dark.vitrine-finder-dimensions .nautilus-grid-view .icon-ui-labels-box > label:nth-child(2) {
+  color: #5aa9ff;
+}
+
+/* ── visão em lista: linhas alternadas suaves ── */
+window.vitrine-finder .nautilus-list-view columnview > listview > row:nth-child(even):not(:selected) {
+  background-color: color-mix(in srgb, currentColor 3%, transparent);
+}
+
+/* miniaturas da página de etiquetas */
+window.vitrine-finder .vitrine-thumb { border-radius: 8px; }
+__VITRINE_ARQUIVO_18__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/nautilus-vitrine-logo.svg' <<'__VITRINE_ARQUIVO_17__'
+cat > 'vitrine/assets/nautilus-vitrine-logo.svg' <<'__VITRINE_ARQUIVO_19__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
@@ -5306,9 +6391,9 @@ cat > 'vitrine/assets/nautilus-vitrine-logo.svg' <<'__VITRINE_ARQUIVO_17__'
   <path d="M58 98 a18 18 0 0 1 18-18 h30 l14 16 h60 a18 18 0 0 1 18 18 v60 a18 18 0 0 1 -18 18 H76 a18 18 0 0 1 -18-18 Z" fill="none" stroke="url(#glass)" stroke-width="15" stroke-linejoin="round"/>
   <path d="M128 120 Q131.5 136.5 148 140 Q131.5 143.5 128 160 Q124.5 143.5 108 140 Q124.5 136.5 128 120 Z" fill="#ffd166"/>
 </svg>
-__VITRINE_ARQUIVO_17__
+__VITRINE_ARQUIVO_19__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/nautilus-vitrine-mark.svg' <<'__VITRINE_ARQUIVO_18__'
+cat > 'vitrine/assets/nautilus-vitrine-mark.svg' <<'__VITRINE_ARQUIVO_20__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
   <defs>
     <linearGradient id="glass" x1="0" y1="0" x2="1" y2="1">
@@ -5319,9 +6404,9 @@ cat > 'vitrine/assets/nautilus-vitrine-mark.svg' <<'__VITRINE_ARQUIVO_18__'
   <path d="M40 90 a22 22 0 0 1 22-22 h38 l18 20 h76 a22 22 0 0 1 22 22 v74 a22 22 0 0 1 -22 22 H62 a22 22 0 0 1 -22-22 Z" fill="none" stroke="url(#glass)" stroke-width="16" stroke-linejoin="round"/>
   <path d="M128 112 Q132.5 133.5 154 138 Q132.5 142.5 128 164 Q123.5 142.5 102 138 Q123.5 133.5 128 112 Z" fill="#ffd166"/>
 </svg>
-__VITRINE_ARQUIVO_18__
+__VITRINE_ARQUIVO_20__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/nautilus-vitrine-symbolic.svg' <<'__VITRINE_ARQUIVO_19__'
+cat > 'vitrine/assets/nautilus-vitrine-symbolic.svg' <<'__VITRINE_ARQUIVO_21__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Ícones simbólicos do GTK são recoloridos forçando `fill`: por isso o contorno
        da pasta é um caminho preenchido (borda externa menos borda interna, evenodd)
@@ -5329,9 +6414,66 @@ cat > 'vitrine/assets/nautilus-vitrine-symbolic.svg' <<'__VITRINE_ARQUIVO_19__'
   <path fill="currentColor" fill-rule="evenodd" d="M1.2 4.6 A2.2 2.2 0 0 1 3.4 2.4 H6.2 A0.8 0.8 0 0 1 6.807 2.679 L7.768 3.8 H12.6 A2.2 2.2 0 0 1 14.8 6 V12.4 A2.2 2.2 0 0 1 12.6 14.6 H3.4 A2.2 2.2 0 0 1 1.2 12.4 Z M2.8 4.6 A0.6 0.6 0 0 1 3.4 4 H5.832 L6.793 5.121 A0.8 0.8 0 0 0 7.4 5.4 H12.6 A0.6 0.6 0 0 1 13.2 6 V12.4 A0.6 0.6 0 0 1 12.6 13 H3.4 A0.6 0.6 0 0 1 2.8 12.4 Z"/>
   <path fill="currentColor" d="M8 6.1 Q8.35 8.15 10.4 8.5 Q8.35 8.85 8 10.9 Q7.65 8.85 5.6 8.5 Q7.65 8.15 8 6.1 Z"/>
 </svg>
-__VITRINE_ARQUIVO_19__
+__VITRINE_ARQUIVO_21__
+mkdir -p "vitrine/assets"
+cat > 'vitrine/assets/vitrine-tag-blue.svg' <<'__VITRINE_ARQUIVO_22__'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Emblema da etiqueta "blue" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
+  <circle cx="8" cy="8" r="6.5" fill="#0a84ff" stroke="#ffffff" stroke-width="1.5"/>
+</svg>
+__VITRINE_ARQUIVO_22__
+mkdir -p "vitrine/assets"
+cat > 'vitrine/assets/vitrine-tag-gray.svg' <<'__VITRINE_ARQUIVO_23__'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Emblema da etiqueta "gray" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
+  <circle cx="8" cy="8" r="6.5" fill="#98989d" stroke="#ffffff" stroke-width="1.5"/>
+</svg>
+__VITRINE_ARQUIVO_23__
+mkdir -p "vitrine/assets"
+cat > 'vitrine/assets/vitrine-tag-green.svg' <<'__VITRINE_ARQUIVO_24__'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Emblema da etiqueta "green" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
+  <circle cx="8" cy="8" r="6.5" fill="#30d158" stroke="#ffffff" stroke-width="1.5"/>
+</svg>
+__VITRINE_ARQUIVO_24__
+mkdir -p "vitrine/assets"
+cat > 'vitrine/assets/vitrine-tag-orange.svg' <<'__VITRINE_ARQUIVO_25__'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Emblema da etiqueta "orange" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
+  <circle cx="8" cy="8" r="6.5" fill="#ff9f0a" stroke="#ffffff" stroke-width="1.5"/>
+</svg>
+__VITRINE_ARQUIVO_25__
+mkdir -p "vitrine/assets"
+cat > 'vitrine/assets/vitrine-tag-purple.svg' <<'__VITRINE_ARQUIVO_26__'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Emblema da etiqueta "purple" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
+  <circle cx="8" cy="8" r="6.5" fill="#bf5af2" stroke="#ffffff" stroke-width="1.5"/>
+</svg>
+__VITRINE_ARQUIVO_26__
+mkdir -p "vitrine/assets"
+cat > 'vitrine/assets/vitrine-tag-red.svg' <<'__VITRINE_ARQUIVO_27__'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Emblema da etiqueta "red" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
+  <circle cx="8" cy="8" r="6.5" fill="#ff453a" stroke="#ffffff" stroke-width="1.5"/>
+</svg>
+__VITRINE_ARQUIVO_27__
+mkdir -p "vitrine/assets"
+cat > 'vitrine/assets/vitrine-tag-symbolic.svg' <<'__VITRINE_ARQUIVO_28__'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Etiqueta (botão "Etiquetas" do estilo Finder). Só preenchimento, como todo ícone
+       simbólico do GTK: contorno = forma externa menos a interna (evenodd), com o furo. -->
+  <path fill="currentColor" fill-rule="evenodd" d="M2.6 1.5 H7.6 a1.5 1.5 0 0 1 1.06 .44 l5.4 5.4 a1.5 1.5 0 0 1 0 2.12 l-4.94 4.94 a1.5 1.5 0 0 1 -2.12 0 l-5.4 -5.4 A1.5 1.5 0 0 1 1.1 7.94 V3 A1.5 1.5 0 0 1 2.6 1.5 Z M2.7 3.1 V7.75 l5.3 5.3 4.95 -4.95 -5.3 -5.3 Z M5 4 a1 1 0 1 1 0 2 a1 1 0 1 1 0 -2 Z"/>
+</svg>
+__VITRINE_ARQUIVO_28__
+mkdir -p "vitrine/assets"
+cat > 'vitrine/assets/vitrine-tag-yellow.svg' <<'__VITRINE_ARQUIVO_29__'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Emblema da etiqueta "yellow" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
+  <circle cx="8" cy="8" r="6.5" fill="#ffd60a" stroke="#ffffff" stroke-width="1.5"/>
+</svg>
+__VITRINE_ARQUIVO_29__
 mkdir -p "vitrine/finder"
-cat > 'vitrine/finder/__init__.py' <<'__VITRINE_ARQUIVO_20__'
+cat > 'vitrine/finder/__init__.py' <<'__VITRINE_ARQUIVO_30__'
 """Estilo "Finder (macOS)": visual e ferramentas inspirados no Finder, por cima do
 Nautilus, e removível a qualquer momento.
 
@@ -5348,10 +6490,14 @@ from __future__ import annotations
 
 import os
 
-from gi.repository import Adw, Gdk, Gtk
+from gi.repository import Adw, Gdk, Gio, Gtk
 
 from ..util import ASSETS, ancestor, find_by_type_name, find_first, gtype_name, log, walk
+from ..tagui import TagSidebar
 from .toolbar import FinderToolbar
+
+DIMENSIONS = "vitrine_dimensions"
+TAGS_COLUMN = "Vitrine::tags"
 
 _css = {"provider": None, "users": 0}
 
@@ -5375,6 +6521,28 @@ def _css_release() -> None:
     if _css["users"] == 0 and _css["provider"] is not None and display is not None:
         Gtk.StyleContext.remove_provider_for_display(display, _css["provider"])
         _css["provider"] = None
+
+
+def strip_dimensions_caption() -> None:
+    """Tira das preferências do Nautilus o que o estilo Finder pôs (legenda das
+    dimensões), inclusive sobras de uma sessão que travou.
+
+    A coluna "Etiquetas" da lista NÃO é ligada automaticamente: mudar
+    org.gnome.nautilus.list-view default-visible-columns com a janela aberta derruba o
+    Nautilus 51.1 (assertion em nautilus_file_is_in_trash). O usuário a liga em
+    "Colunas visíveis"; aqui só limpamos se algo a tiver posto nessa preferência."""
+    try:
+        settings = Gio.Settings.new("org.gnome.nautilus.icon-view")
+        captions = settings.get_strv("captions")
+        if DIMENSIONS in captions:
+            settings.set_strv("captions", ([c for c in captions if c != DIMENSIONS]
+                                           + ["none", "none", "none"])[:3])
+        lists = Gio.Settings.new("org.gnome.nautilus.list-view")
+        columns = lists.get_strv("default-visible-columns")
+        if TAGS_COLUMN in columns:
+            lists.set_strv("default-visible-columns", [c for c in columns if c != TAGS_COLUMN])
+    except Exception as err:  # noqa: BLE001
+        log(f"estilo Finder: preferências do Nautilus ({err!r})")
 
 
 def css_loaded() -> bool:
@@ -5443,9 +6611,12 @@ class FinderStyle:
             _css_acquire()
             self._later(_css_release)
             self._class(self.win, "vitrine-finder")
+            self._follow_dark()
             self._find_bars()
             self._sidebar()
+            self._tags_section()
             self._toolbar()
+            self._captions()
             self.sync()
             log("estilo Finder aplicado")
             return True
@@ -5455,6 +6626,7 @@ class FinderStyle:
             return False
 
     def remove(self) -> None:
+        strip_dimensions_caption()  # sobra de uma sessão que travou com o Finder ativo
         was_active = self.active
         self.active = False
         while self._undo:
@@ -5468,6 +6640,21 @@ class FinderStyle:
             log("estilo Finder removido (Nautilus padrão)")
 
     # ── partes ──
+    def _follow_dark(self) -> None:
+        """Classe vitrine-finder-dark quando o tema está escuro (algumas cores do Finder
+        são fixas, e o @media prefers-color-scheme não chega a todos os widgets)."""
+        manager = Adw.StyleManager.get_default()
+
+        def update(*_a):
+            if manager.get_dark():
+                self.win.add_css_class("vitrine-finder-dark")
+            else:
+                self.win.remove_css_class("vitrine-finder-dark")
+
+        update()
+        self._connect(manager, "notify::dark", update)
+        self._later(lambda: self.win.remove_css_class("vitrine-finder-dark"))
+
     def _find_bars(self) -> None:
         """Localiza as barras de título do Nautilus. Os botões da janela (fechar,
         minimizar, maximizar) não são tocados: ficam como o GNOME desenha."""
@@ -5495,6 +6682,67 @@ class FinderStyle:
         sidebar = find_by_type_name(self.win, "NautilusSidebar")
         pane = ancestor(sidebar, lambda w: isinstance(w, Adw.ToolbarView)) if sidebar else None
         self._class(pane, "vitrine-finder-sidebar")
+
+    def _tags_section(self) -> None:
+        """Seção Etiquetas logo abaixo dos locais nativos, rolando junto com eles.
+
+        A lista nativa fica num Gtk.Viewport dentro do Gtk.ScrolledWindow da barra
+        lateral: pomos uma caixa no lugar dela com [lista nativa, Etiquetas] e, ao
+        desfazer, devolvemos a lista ao Viewport. Se a estrutura for outra, a seção vai
+        para o rodapé da barra lateral."""
+        if not self.ctl.cfg.get("tags_in_sidebar"):
+            return
+        section = TagSidebar(self.ctl)
+        self.ctl.tag_sidebar = section
+        store = self.ctl.ext.tags
+
+        def forget():
+            store.off_change(section.listener)
+            self.ctl.tag_sidebar = None
+
+        self._later(forget)
+        sidebar = find_by_type_name(self.win, "NautilusSidebar")
+        viewport = find_first(sidebar, lambda w: isinstance(w, Gtk.Viewport)) if sidebar else None
+        listbox = viewport.get_child() if viewport is not None else None
+        if isinstance(listbox, Gtk.ListBox):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            viewport.set_child(None)   # `listbox` continua vivo: a variável Python o segura
+            box.append(listbox)
+            box.append(section)
+            viewport.set_child(box)
+
+            def undo():
+                viewport.set_child(None)
+                box.remove(listbox)
+                viewport.set_child(listbox)
+
+            self._later(undo)
+            return
+        pane = ancestor(sidebar, lambda w: isinstance(w, Adw.ToolbarView)) if sidebar else None
+        if pane is None:
+            raise RuntimeError("barra lateral sem lugar para as Etiquetas")
+        pane.add_bottom_bar(section)
+        self._later(lambda: pane.remove(section))
+
+    def _captions(self) -> None:
+        """Dimensões das imagens abaixo do nome na visão em grade (como no Finder).
+        A legenda é uma preferência do próprio Nautilus: guardamos e devolvemos."""
+        if not self.ctl.cfg.get("image_dimensions"):
+            return
+        settings = Gio.Settings.new("org.gnome.nautilus.icon-view")
+        captions = [c for c in settings.get_strv("captions") if c != DIMENSIONS]
+        captions = (captions + ["none", "none", "none"])[:3]
+        settings.set_strv("captions", [DIMENSIONS] + captions[:2])
+        self._class(self.win, "vitrine-finder-dimensions")
+
+        def undo():
+            current = [c for c in settings.get_strv("captions") if c != DIMENSIONS]
+            if current == captions[:2]:
+                settings.set_strv("captions", captions)   # ninguém mexeu: volta igual
+            else:  # o usuário mudou as legendas: só tiramos a nossa
+                settings.set_strv("captions", (current + ["none", "none", "none"])[:3])
+
+        self._later(undo)
 
     def _toolbar(self) -> None:
         header = self.header
@@ -5540,9 +6788,9 @@ def describe(win) -> str:
     return (f"classe={win.has_css_class('vitrine-finder')} css={css_loaded()} "
             f"janela={gtype_name(win)}")
 
-__VITRINE_ARQUIVO_20__
+__VITRINE_ARQUIVO_30__
 mkdir -p "vitrine/finder"
-cat > 'vitrine/finder/toolbar.py' <<'__VITRINE_ARQUIVO_21__'
+cat > 'vitrine/finder/toolbar.py' <<'__VITRINE_ARQUIVO_31__'
 """Barra de ferramentas do estilo Finder, montada dentro do AdwHeaderBar do Nautilus:
 
     [← | →]  Título da pasta          [▦ ☰ ▥] [⇅ ⌄] [⇪] [⋯] [🔍 Pesquisar]
@@ -5560,6 +6808,7 @@ import gettext
 from gi.repository import Gio, GLib, Gtk, Pango
 
 from .. import native, util
+from ..tagui import TagMenuButton
 from ..util import guarded, log
 
 
@@ -5629,7 +6878,8 @@ class FinderToolbar:
         later(lambda: win.insert_action_group("vfinder", None))
 
         start = [self._nav(), self.title]
-        end = [self._search(), self._more(), self._share(), self._sort(), self._views()]
+        end = [self._search(), self._more(), _capsule(TagMenuButton(self.ctl)), self._share(),
+               self._sort(), self._views()]
         for w in start:
             header.pack_start(w)
             later(lambda w=w: header.remove(w))
@@ -5769,7 +7019,7 @@ class FinderToolbar:
     def sync(self) -> None:
         self._syncing = True
         try:
-            computer = self.ctl.computer_visible()
+            computer = self.ctl.computer_visible() or bool(self.ctl.tag_visible())
             slot = self.ctl.active_slot()
             # O modo pedido pela Vitrine vale antes do Nautilus terminar de trocar a visão.
             mode = "columns" if self.ctl.columns_on else (
@@ -5792,6 +7042,8 @@ class FinderToolbar:
         self.title.set_label(self._title_text())
 
     def _title_text(self) -> str:
+        if self.ctl.tag_visible():
+            return self.ctl.tag_visible()
         if self.ctl.computer_visible():
             return "Meu computador"
         slot = self.ctl.active_slot()
@@ -5812,9 +7064,9 @@ def _spawn(argv: list[str]) -> None:
         Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE)
     except GLib.Error as err:
         log(f"não foi possível abrir {argv[0]}: {err.message}")
-__VITRINE_ARQUIVO_21__
+__VITRINE_ARQUIVO_31__
 mkdir -p "vitrine/schemas"
-cat > 'vitrine/schemas/io.github.bispov19.NautilusVitrine.gschema.xml' <<'__VITRINE_ARQUIVO_22__'
+cat > 'vitrine/schemas/io.github.bispov19.NautilusVitrine.gschema.xml' <<'__VITRINE_ARQUIVO_32__'
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   Preferências da Vitrine para Nautilus.
@@ -5917,15 +7169,33 @@ cat > 'vitrine/schemas/io.github.bispov19.NautilusVitrine.gschema.xml' <<'__VITR
       <summary>Avisar quando um dispositivo for conectado</summary>
     </key>
 
+    <key name="tags" type="a(ss)">
+      <default>[('Vermelho', 'red'), ('Laranja', 'orange'), ('Amarelo', 'yellow'), ('Verde', 'green'), ('Azul', 'blue'), ('Roxo', 'purple')]</default>
+      <summary>Etiquetas (nome, cor)</summary>
+      <description>Cores: red, orange, yellow, green, blue, purple, gray. Os nomes ficam gravados nos arquivos (atributo user.xdg.tags).</description>
+    </key>
+    <key name="tags-in-sidebar" type="b">
+      <default>true</default>
+      <summary>Seção Etiquetas na barra lateral (estilo Finder)</summary>
+    </key>
+    <key name="tags-section-expanded" type="b">
+      <default>true</default>
+      <summary>Seção Etiquetas aberta na barra lateral</summary>
+    </key>
+    <key name="image-dimensions" type="b">
+      <default>true</default>
+      <summary>Mostrar as dimensões das imagens abaixo do nome (estilo Finder, visão em grade)</summary>
+    </key>
+
     <key name="json-migrated" type="b">
       <default>false</default>
       <summary>As preferências antigas (settings.json) já foram importadas</summary>
     </key>
   </schema>
 </schemalist>
-__VITRINE_ARQUIVO_22__
+__VITRINE_ARQUIVO_32__
 mkdir -p "tools"
-cat > 'tools/smoke_test.py' <<'__VITRINE_ARQUIVO_23__'
+cat > 'tools/smoke_test.py' <<'__VITRINE_ARQUIVO_33__'
 """Teste rápido FORA do Nautilus: abre as colunas e o painel de preview numa janela
 própria e salva uma captura em PNG; monta a página "Sobre" nos temas claro e escuro
 (saida-sobre-claro.png / saida-sobre-escuro.png) e confere se a versão do .spec é a
@@ -6061,9 +7331,9 @@ app.run([])
 if failures:
     print("FALHAS:", failures)
     sys.exit(1)
-__VITRINE_ARQUIVO_23__
+__VITRINE_ARQUIVO_33__
 mkdir -p "tools"
-cat > 'tools/test_history.py' <<'__VITRINE_ARQUIVO_24__'
+cat > 'tools/test_history.py' <<'__VITRINE_ARQUIVO_34__'
 """Testes do histórico de Voltar/Avançar com o Meu computador (sem GTK, sem Nautilus).
 
     python3 tools/test_history.py
@@ -6266,9 +7536,9 @@ def run() -> bool:
 
 if __name__ == "__main__":
     sys.exit(0 if run() else 1)
-__VITRINE_ARQUIVO_24__
+__VITRINE_ARQUIVO_34__
 mkdir -p "tools"
-cat > 'tools/test_config.py' <<'__VITRINE_ARQUIVO_25__'
+cat > 'tools/test_config.py' <<'__VITRINE_ARQUIVO_35__'
 """Testes das preferências em GSettings (sem tocar nas suas preferências reais).
 
     python3 tools/test_config.py
@@ -6362,9 +7632,115 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-__VITRINE_ARQUIVO_25__
+__VITRINE_ARQUIVO_35__
 mkdir -p "tools"
-cat > 'tools/build_bootstrap.py' <<'__VITRINE_ARQUIVO_26__'
+cat > 'tools/test_tags.py' <<'__VITRINE_ARQUIVO_36__'
+"""Testes das etiquetas (user.xdg.tags) em arquivos temporários.
+
+    python3 tools/test_tags.py
+
+Precisa de um sistema de arquivos com atributos estendidos de usuário (ext4, btrfs,
+xfs e o tmpfs dos kernels recentes têm).
+"""
+
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+from vitrine import tags  # noqa: E402
+
+results = []
+
+
+def check(name, ok, detail=""):
+    results.append(bool(ok))
+    print(f"{'PASSOU' if ok else 'FALHOU'}: {name}" + (f"  ({detail})" if not ok and detail else ""))
+
+
+class FakeCfg:
+    def __init__(self):
+        self.data = {"tags": list(tags.DEFAULT_TAGS)}
+
+    def get(self, k):
+        return self.data.get(k)
+
+    def set(self, k, v):
+        self.data[k] = v
+
+
+def main() -> int:
+    root = tempfile.mkdtemp(prefix="vitrine-tags-")
+    a, b = os.path.join(root, "a.txt"), os.path.join(root, "b b.jpg")
+    sub = os.path.join(root, "pasta")
+    os.makedirs(os.path.join(sub, ".oculta"))
+    hidden = os.path.join(sub, ".oculta", "c.txt")
+    for p in (a, b, hidden):
+        open(p, "w").close()
+    try:
+        os.setxattr(a, "user.test", b"1")
+    except OSError as err:
+        print(f"PULADO: este sistema de arquivos não aceita atributos estendidos ({err})")
+        return 0
+    ua, ub = tags.path_to_uri(a), tags.path_to_uri(b)
+
+    notified = []
+    store = tags.TagStore(FakeCfg(), index_path=os.path.join(root, "idx.json"),
+                          on_files_changed=notified.extend)
+    check("6 etiquetas padrão com os nomes em português",
+          store.names() == ["Vermelho", "Laranja", "Amarelo", "Verde", "Azul", "Roxo"])
+
+    applied = store.toggle([ua, ub], "Vermelho")
+    check("aplicar etiqueta grava user.xdg.tags", applied and tags.read_tags(a) == ["Vermelho"]
+          and tags.read_tags(b) == ["Vermelho"], str(tags.read_tags(a)))
+    check("o Nautilus é avisado dos arquivos alterados", set(notified) == {ua, ub})
+    store.add([ua], "Azul")
+    check("várias etiquetas por arquivo (formato separado por vírgula)",
+          os.getxattr(a, tags.XATTR) == b"Vermelho,Azul")
+    check("arquivos com a etiqueta (índice)", store.files_with("Vermelho") == [ua, ub],
+          str(store.files_with("Vermelho")))
+
+    applied = store.toggle([ua, ub], "Vermelho")
+    check("se todos já têm, alternar tira de todos", not applied and tags.read_tags(a) == ["Azul"]
+          and tags.read_tags(b) == [])
+
+    store.add([ua], "Verde")
+    check("renomear etiqueta atualiza os arquivos", store.rename("Verde", "Projetos")
+          and tags.read_tags(a) == ["Azul", "Projetos"] and "Projetos" in store.names(),
+          str(tags.read_tags(a)))
+    store.recolor("Projetos", "purple")
+    check("trocar a cor", store.color_of("Projetos") == "purple")
+    store.delete("Azul")
+    check("apagar etiqueta tira dos arquivos", tags.read_tags(a) == ["Projetos"]
+          and "Azul" not in store.names())
+    check("nome repetido ou vazio não é criado", not store.create("Projetos")
+          and not store.create("  ") and store.create("Viagem, 2026", "blue")
+          and "Viagem  2026" in store.names())
+
+    store.clear([ua])
+    check("remover todas as etiquetas apaga o atributo",
+          tags.read_tags(a) == [] and store.files_with("Projetos") == [])
+
+    # Etiquetas postas por outro programa aparecem depois de uma busca
+    os.setxattr(b, tags.XATTR, b"Laranja")
+    os.setxattr(hidden, tags.XATTR, b"Laranja")
+    other = tags.TagStore(FakeCfg(), index_path=os.path.join(root, "idx2.json"))
+    found = other.scan(root)
+    check("busca acha etiquetas de outros programas (pula pastas ocultas)",
+          found == 1 and other.files_with("Laranja") == [ub], f"{found} {other.files_with('Laranja')}")
+    os.remove(b)
+    check("arquivo apagado sai do índice", other.files_with("Laranja") == [])
+
+    print(f"\n{sum(results)}/{len(results)} verificações passaram")
+    return 0 if all(results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+__VITRINE_ARQUIVO_36__
+mkdir -p "tools"
+cat > 'tools/build_bootstrap.py' <<'__VITRINE_ARQUIVO_37__'
 """Gera `criar-vitrine.sh`: um único script bash que recria o projeto inteiro
 (todos os arquivos) numa pasta e, se você quiser, já instala no Nautilus.
 
@@ -6382,6 +7758,7 @@ INCLUDE = [
     "tools/smoke_test.py",
     "tools/test_history.py",
     "tools/test_config.py",
+    "tools/test_tags.py",
     "tools/build_bootstrap.py",
     "install.sh",
     "uninstall.sh",
@@ -6481,8 +7858,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-__VITRINE_ARQUIVO_26__
-cat > 'install.sh' <<'__VITRINE_ARQUIVO_27__'
+__VITRINE_ARQUIVO_37__
+cat > 'install.sh' <<'__VITRINE_ARQUIVO_38__'
 #!/usr/bin/env bash
 # Instala a Vitrine para o seu usuário (não precisa de root, exceto para o nautilus-python).
 #
@@ -6548,8 +7925,8 @@ if [[ "$RESTART" == 1 ]]; then
   (setsid nautilus >/dev/null 2>&1 &)
 fi
 echo "Pronto. Log: ${XDG_CACHE_HOME:-$HOME/.cache}/nautilus-vitrine/vitrine.log"
-__VITRINE_ARQUIVO_27__
-cat > 'uninstall.sh' <<'__VITRINE_ARQUIVO_28__'
+__VITRINE_ARQUIVO_38__
+cat > 'uninstall.sh' <<'__VITRINE_ARQUIVO_39__'
 #!/usr/bin/env bash
 # Remove a Vitrine. Suas regras por pasta ficam em ~/.config/nautilus-vitrine
 # (use --purge para apagá-las também).
@@ -6561,15 +7938,15 @@ if [[ "${1:-}" == "--purge" ]]; then
 fi
 nautilus -q 2>/dev/null || true
 echo "Vitrine removida. Abra o Arquivos de novo para voltar ao Nautilus original."
-__VITRINE_ARQUIVO_28__
+__VITRINE_ARQUIVO_39__
 mkdir -p ".vscode"
-cat > '.vscode/extensions.json' <<'__VITRINE_ARQUIVO_29__'
+cat > '.vscode/extensions.json' <<'__VITRINE_ARQUIVO_40__'
 {
   "recommendations": ["ms-python.python", "ms-python.vscode-pylance"]
 }
-__VITRINE_ARQUIVO_29__
+__VITRINE_ARQUIVO_40__
 mkdir -p ".vscode"
-cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_30__'
+cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_41__'
 {
   "python.defaultInterpreterPath": "/usr/bin/python3",
   "python.analysis.extraPaths": ["${workspaceFolder}"],
@@ -6577,9 +7954,9 @@ cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_30__'
   "editor.rulers": [100],
   "[python]": { "editor.tabSize": 4 }
 }
-__VITRINE_ARQUIVO_30__
+__VITRINE_ARQUIVO_41__
 mkdir -p ".vscode"
-cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_31__'
+cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_42__'
 {
   // Ctrl+Shift+P → "Tasks: Run Task" para ver estas tarefas.
   // Ctrl+Shift+B roda a tarefa padrão (instalar em modo dev + reiniciar o Nautilus).
@@ -6650,8 +8027,8 @@ cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_31__'
     }
   ]
 }
-__VITRINE_ARQUIVO_31__
-cat > 'README.md' <<'__VITRINE_ARQUIVO_32__'
+__VITRINE_ARQUIVO_42__
+cat > 'README.md' <<'__VITRINE_ARQUIVO_43__'
 <p align="center">
   <img src="vitrine/assets/nautilus-vitrine-logo.svg" width="96" alt="Logo da Vitrine para Nautilus">
 </p>
@@ -6692,6 +8069,8 @@ O estilo **Finder** vem ligado de fábrica. Troque em **☰ da linha Meu computa
 - A barra de caminho aparece ao editar o local (**Ctrl+L**) ou ao pesquisar.
 - Barra lateral com ícones na cor de destaque do sistema e seleção cinza arredondada.
 - Os nomes seguem os do GNOME (a Vitrine usa a tradução do próprio Nautilus). Os botões de fechar, minimizar e maximizar ficam no padrão do GNOME.
+- **Visão em grade:** dimensões das imagens (ex.: *1.066 × 1.599*) em azul abaixo do nome, seleção cinza arredondada. O nome longo já é truncado no meio pelo próprio Nautilus.
+- **Visão em lista:** linhas alternadas suaves.
 - **Nautilus padrão** remove tudo o que o estilo Finder acrescentou (CSS, botões, sinais). Colunas, pré-visualização e Meu computador continuam conforme as suas opções.
 
 
@@ -6750,6 +8129,17 @@ Clique com o botão direito no **fundo de qualquer pasta** e escolha **Visualiza
 - Ligar/desligar a descoberta automática de pastas
 - Usar a visualização atual como padrão
 - Mostrar/ocultar pré-visualização
+
+### 🏷️ Etiquetas coloridas
+
+Vermelho, Laranja, Amarelo, Verde, Azul e Roxo, além das que você criar.
+
+- Gravadas no atributo estendido padrão **`user.xdg.tags`** (o mesmo de outros gerenciadores de arquivos, como o Dolphin): continuam valendo fora da Vitrine.
+- **Aplicar:** clique direito → *Etiquetas*, botão de etiqueta na barra de ferramentas (estilo Finder) ou arrastando arquivos para a etiqueta na barra lateral. Vários arquivos e várias etiquetas por arquivo.
+- **Ver:** bolinhas coloridas nos ícones (grade, lista e colunas), coluna **Etiquetas** na lista (ligue em *Colunas visíveis* do Nautilus) e a seção **Etiquetas** da barra lateral, que mostra os arquivos de cada etiqueta.
+- **Todas as etiquetas…:** criar, renomear, trocar a cor e apagar. Renomear e apagar atualizam os arquivos que a Vitrine conhece.
+- Arquivos etiquetados por outros programas aparecem depois de abertos no Nautilus, ou com *Procurar na pasta pessoal* na página da etiqueta.
+- Pen drives FAT/exFAT e alguns compartilhamentos de rede não aceitam atributos estendidos; a Vitrine avisa.
 
 ### 💻 Meu computador
 
@@ -6924,6 +8314,8 @@ vitrine/
   config.py             preferências (GSettings) e regras por pasta (JSON)
   finder/               estilo Finder: aplica e remove a camada visual
   schemas/              schema GSettings da Vitrine
+  tags.py               etiquetas (user.xdg.tags) e índice dos arquivos etiquetados
+  tagui.py              telas das etiquetas (barra, barra lateral, página, Todas as etiquetas…)
   history.py            Voltar/Avançar por aba incluindo o Meu computador (sem GTK)
   about.py              página "Sobre" do diálogo de personalização
   assets/               logo, ícone simbólico e CSS da página Sobre
@@ -6933,6 +8325,8 @@ vitrine/
 tools/
   smoke_test.py         colunas, preview e página Sobre fora do Nautilus
   test_history.py       testes do histórico de Voltar/Avançar
+  test_config.py        testes das preferências (GSettings)
+  test_tags.py          testes das etiquetas
   build_bootstrap.py    gera o criar-vitrine.sh
 packaging/
   nautilus-vitrine.spec receita do pacote RPM
@@ -7012,6 +8406,9 @@ Para lançar uma versão nova: aumente `Version` e acrescente uma entrada no `%c
 - Nas colunas anteriores o menu de clique direito é reduzido. Para o menu completo, use **Mostrar na lista**.
 - O zoom dos ícones é uma preferência global do Nautilus. Ao entrar numa pasta com zoom salvo, outras janelas abertas em ícones acompanham.
 - Locais especiais (Recentes, Favoritos, Lixeira, Rede, Pesquisa) mantêm o comportamento padrão do Nautilus.
+- A coluna **Etiquetas** não é ligada automaticamente: mudar as colunas padrão com a janela aberta derruba o Nautilus 51.1. Ligue em *Colunas visíveis*.
+- O menu de clique direito das extensões só aceita texto: as etiquetas aparecem num submenu (com 🔴🟠🟡…), não como a linha de bolinhas do macOS.
+- Sem desfoque de fundo ("vidro"): o GNOME não desfoca janelas de aplicativos.
 - O menu de histórico do botão ← (clique direito ou toque longo) é do Nautilus e não lista o Meu computador. Escolher um item ali funciona; a Vitrine se realinha sozinha.
 
 ## Próximos passos
@@ -7033,8 +8430,8 @@ A técnica de injeção na janela foi inspirada no projeto **[My Computer for Na
 ## Licença
 
 [MIT](LICENSE)
-__VITRINE_ARQUIVO_32__
-cat > 'LICENSE' <<'__VITRINE_ARQUIVO_33__'
+__VITRINE_ARQUIVO_43__
+cat > 'LICENSE' <<'__VITRINE_ARQUIVO_44__'
 MIT License
 
 Copyright (c) 2026 Vitrine para Nautilus contributors
@@ -7060,16 +8457,16 @@ SOFTWARE.
 ---
 Inspired by "My Computer for Nautilus" (https://github.com/yannmasoch/nautilus-my-computer),
 Copyright (c) 2026 Yann Masoch, MIT License.
-__VITRINE_ARQUIVO_33__
-cat > '.gitignore' <<'__VITRINE_ARQUIVO_34__'
+__VITRINE_ARQUIVO_44__
+cat > '.gitignore' <<'__VITRINE_ARQUIVO_45__'
 __pycache__/
 *.pyc
 *.tmp
 dist/
 dist-build.log
 gschemas.compiled
-__VITRINE_ARQUIVO_34__
-cat > 'Makefile' <<'__VITRINE_ARQUIVO_35__'
+__VITRINE_ARQUIVO_45__
+cat > 'Makefile' <<'__VITRINE_ARQUIVO_46__'
 # Empacotamento local.  Requer: sudo dnf install make rpm-build python3-devel
 #
 #   make rpm        gera o RPM em dist/
@@ -7103,9 +8500,9 @@ install-rpm:
 
 clean:
 	rm -rf $(DIST)
-__VITRINE_ARQUIVO_35__
+__VITRINE_ARQUIVO_46__
 mkdir -p "packaging"
-cat > 'packaging/nautilus-vitrine.spec' <<'__VITRINE_ARQUIVO_36__'
+cat > 'packaging/nautilus-vitrine.spec' <<'__VITRINE_ARQUIVO_47__'
 %global extdir %{_datadir}/nautilus-python/extensions
 
 Name:           nautilus-vitrine
@@ -7178,9 +8575,9 @@ glib-compile-schemas --strict %{buildroot}%{extdir}/vitrine/schemas
 
 * Wed Nov 11 2026 Vinicius Bispo - 0.1.0-1
 - Primeira versão: modo Colunas, painel de pré-visualização e visualização por pasta
-__VITRINE_ARQUIVO_36__
+__VITRINE_ARQUIVO_47__
 mkdir -p ".copr"
-cat > '.copr/Makefile' <<'__VITRINE_ARQUIVO_37__'
+cat > '.copr/Makefile' <<'__VITRINE_ARQUIVO_48__'
 # Usado pelo COPR (método "make srpm"): gera o SRPM direto do repositório git.
 # O COPR chama:  make -f .copr/Makefile srpm outdir=<pasta> spec=<arquivo .spec>
 SPEC := packaging/nautilus-vitrine.spec
@@ -7195,7 +8592,7 @@ srpm:
 	rpmbuild -bs $(SPEC) \
 		--define "_sourcedir $(outdir)" \
 		--define "_srcrpmdir $(outdir)"
-__VITRINE_ARQUIVO_37__
+__VITRINE_ARQUIVO_48__
 
 chmod +x install.sh uninstall.sh
 echo "Projeto criado em $TARGET"

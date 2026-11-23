@@ -14,10 +14,14 @@ from __future__ import annotations
 
 import os
 
-from gi.repository import Adw, Gdk, Gtk
+from gi.repository import Adw, Gdk, Gio, Gtk
 
 from ..util import ASSETS, ancestor, find_by_type_name, find_first, gtype_name, log, walk
+from ..tagui import TagSidebar
 from .toolbar import FinderToolbar
+
+DIMENSIONS = "vitrine_dimensions"
+TAGS_COLUMN = "Vitrine::tags"
 
 _css = {"provider": None, "users": 0}
 
@@ -41,6 +45,28 @@ def _css_release() -> None:
     if _css["users"] == 0 and _css["provider"] is not None and display is not None:
         Gtk.StyleContext.remove_provider_for_display(display, _css["provider"])
         _css["provider"] = None
+
+
+def strip_dimensions_caption() -> None:
+    """Tira das preferências do Nautilus o que o estilo Finder pôs (legenda das
+    dimensões), inclusive sobras de uma sessão que travou.
+
+    A coluna "Etiquetas" da lista NÃO é ligada automaticamente: mudar
+    org.gnome.nautilus.list-view default-visible-columns com a janela aberta derruba o
+    Nautilus 51.1 (assertion em nautilus_file_is_in_trash). O usuário a liga em
+    "Colunas visíveis"; aqui só limpamos se algo a tiver posto nessa preferência."""
+    try:
+        settings = Gio.Settings.new("org.gnome.nautilus.icon-view")
+        captions = settings.get_strv("captions")
+        if DIMENSIONS in captions:
+            settings.set_strv("captions", ([c for c in captions if c != DIMENSIONS]
+                                           + ["none", "none", "none"])[:3])
+        lists = Gio.Settings.new("org.gnome.nautilus.list-view")
+        columns = lists.get_strv("default-visible-columns")
+        if TAGS_COLUMN in columns:
+            lists.set_strv("default-visible-columns", [c for c in columns if c != TAGS_COLUMN])
+    except Exception as err:  # noqa: BLE001
+        log(f"estilo Finder: preferências do Nautilus ({err!r})")
 
 
 def css_loaded() -> bool:
@@ -109,9 +135,12 @@ class FinderStyle:
             _css_acquire()
             self._later(_css_release)
             self._class(self.win, "vitrine-finder")
+            self._follow_dark()
             self._find_bars()
             self._sidebar()
+            self._tags_section()
             self._toolbar()
+            self._captions()
             self.sync()
             log("estilo Finder aplicado")
             return True
@@ -121,6 +150,7 @@ class FinderStyle:
             return False
 
     def remove(self) -> None:
+        strip_dimensions_caption()  # sobra de uma sessão que travou com o Finder ativo
         was_active = self.active
         self.active = False
         while self._undo:
@@ -134,6 +164,21 @@ class FinderStyle:
             log("estilo Finder removido (Nautilus padrão)")
 
     # ── partes ──
+    def _follow_dark(self) -> None:
+        """Classe vitrine-finder-dark quando o tema está escuro (algumas cores do Finder
+        são fixas, e o @media prefers-color-scheme não chega a todos os widgets)."""
+        manager = Adw.StyleManager.get_default()
+
+        def update(*_a):
+            if manager.get_dark():
+                self.win.add_css_class("vitrine-finder-dark")
+            else:
+                self.win.remove_css_class("vitrine-finder-dark")
+
+        update()
+        self._connect(manager, "notify::dark", update)
+        self._later(lambda: self.win.remove_css_class("vitrine-finder-dark"))
+
     def _find_bars(self) -> None:
         """Localiza as barras de título do Nautilus. Os botões da janela (fechar,
         minimizar, maximizar) não são tocados: ficam como o GNOME desenha."""
@@ -161,6 +206,67 @@ class FinderStyle:
         sidebar = find_by_type_name(self.win, "NautilusSidebar")
         pane = ancestor(sidebar, lambda w: isinstance(w, Adw.ToolbarView)) if sidebar else None
         self._class(pane, "vitrine-finder-sidebar")
+
+    def _tags_section(self) -> None:
+        """Seção Etiquetas logo abaixo dos locais nativos, rolando junto com eles.
+
+        A lista nativa fica num Gtk.Viewport dentro do Gtk.ScrolledWindow da barra
+        lateral: pomos uma caixa no lugar dela com [lista nativa, Etiquetas] e, ao
+        desfazer, devolvemos a lista ao Viewport. Se a estrutura for outra, a seção vai
+        para o rodapé da barra lateral."""
+        if not self.ctl.cfg.get("tags_in_sidebar"):
+            return
+        section = TagSidebar(self.ctl)
+        self.ctl.tag_sidebar = section
+        store = self.ctl.ext.tags
+
+        def forget():
+            store.off_change(section.listener)
+            self.ctl.tag_sidebar = None
+
+        self._later(forget)
+        sidebar = find_by_type_name(self.win, "NautilusSidebar")
+        viewport = find_first(sidebar, lambda w: isinstance(w, Gtk.Viewport)) if sidebar else None
+        listbox = viewport.get_child() if viewport is not None else None
+        if isinstance(listbox, Gtk.ListBox):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            viewport.set_child(None)   # `listbox` continua vivo: a variável Python o segura
+            box.append(listbox)
+            box.append(section)
+            viewport.set_child(box)
+
+            def undo():
+                viewport.set_child(None)
+                box.remove(listbox)
+                viewport.set_child(listbox)
+
+            self._later(undo)
+            return
+        pane = ancestor(sidebar, lambda w: isinstance(w, Adw.ToolbarView)) if sidebar else None
+        if pane is None:
+            raise RuntimeError("barra lateral sem lugar para as Etiquetas")
+        pane.add_bottom_bar(section)
+        self._later(lambda: pane.remove(section))
+
+    def _captions(self) -> None:
+        """Dimensões das imagens abaixo do nome na visão em grade (como no Finder).
+        A legenda é uma preferência do próprio Nautilus: guardamos e devolvemos."""
+        if not self.ctl.cfg.get("image_dimensions"):
+            return
+        settings = Gio.Settings.new("org.gnome.nautilus.icon-view")
+        captions = [c for c in settings.get_strv("captions") if c != DIMENSIONS]
+        captions = (captions + ["none", "none", "none"])[:3]
+        settings.set_strv("captions", [DIMENSIONS] + captions[:2])
+        self._class(self.win, "vitrine-finder-dimensions")
+
+        def undo():
+            current = [c for c in settings.get_strv("captions") if c != DIMENSIONS]
+            if current == captions[:2]:
+                settings.set_strv("captions", captions)   # ninguém mexeu: volta igual
+            else:  # o usuário mudou as legendas: só tiramos a nossa
+                settings.set_strv("captions", (current + ["none", "none", "none"])[:3])
+
+        self._later(undo)
 
     def _toolbar(self) -> None:
         header = self.header

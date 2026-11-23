@@ -100,6 +100,24 @@
       <summary>Avisar quando um dispositivo for conectado</summary>
     </key>
 
+    <key name="tags" type="a(ss)">
+      <default>[('Vermelho', 'red'), ('Laranja', 'orange'), ('Amarelo', 'yellow'), ('Verde', 'green'), ('Azul', 'blue'), ('Roxo', 'purple')]</default>
+      <summary>Etiquetas (nome, cor)</summary>
+      <description>Cores: red, orange, yellow, green, blue, purple, gray. Os nomes ficam gravados nos arquivos (atributo user.xdg.tags).</description>
+    </key>
+    <key name="tags-in-sidebar" type="b">
+      <default>true</default>
+      <summary>Seção Etiquetas na barra lateral (estilo Finder)</summary>
+    </key>
+    <key name="tags-section-expanded" type="b">
+      <default>true</default>
+      <summary>Seção Etiquetas aberta na barra lateral</summary>
+    </key>
+    <key name="image-dimensions" type="b">
+      <default>true</default>
+      <summary>Mostrar as dimensões das imagens abaixo do nome (estilo Finder, visão em grade)</summary>
+    </key>
+
     <key name="json-migrated" type="b">
       <default>false</default>
       <summary>As preferências antigas (settings.json) já foram importadas</summary>

@@ -33,6 +33,12 @@ WINDOW_STYLES = ("finder", "nautilus")
 DEFAULT_SETTINGS = {
     # Estilo da janela: "finder" (visual do Finder do macOS) ou "nautilus" (padrão).
     "window_style": "finder",
+    # Etiquetas: (nome, cor). Os nomes ficam gravados nos arquivos (user.xdg.tags).
+    "tags": [("Vermelho", "red"), ("Laranja", "orange"), ("Amarelo", "yellow"),
+             ("Verde", "green"), ("Azul", "blue"), ("Roxo", "purple")],
+    "tags_in_sidebar": True,
+    "tags_section_expanded": True,
+    "image_dimensions": True,
     # Painel de pré-visualização à direita (Ctrl+Shift+P).
     "preview_visible": True,
     "preview_width": 320,
@@ -86,6 +92,8 @@ _GS_TYPES = {
     "start_on_computer": "b", "computer_in_sidebar": "b", "computer_sections": "a{sb}",
     "computer_hidden": "as", "notify_new_devices": "b",
     "default_mode": "s?", "default_grid_zoom": "s?",  # "" no GSettings = None aqui
+    "tags": "a(ss)", "tags_in_sidebar": "b", "tags_section_expanded": "b",
+    "image_dimensions": "b",
 }
 
 
@@ -151,6 +159,8 @@ def _gs_write(gs: Gio.Settings, key: str, value) -> None:
                                                       for k, v in (value or {}).items()}))
     elif kind == "as":
         gs.set_value(_gs_key(key), GLib.Variant(kind, [str(v) for v in (value or [])]))
+    elif kind == "a(ss)":
+        gs.set_value(_gs_key(key), GLib.Variant(kind, [(str(n), str(c)) for n, c in (value or [])]))
     elif kind == "d":
         gs.set_value(_gs_key(key), GLib.Variant(kind, float(value)))
     elif kind == "i":
