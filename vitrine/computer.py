@@ -717,6 +717,12 @@ class ComputerPage(Gtk.ScrolledWindow):
         switch(finder, "Dimensões das imagens",
                "Largura × altura abaixo do nome, na visão em grade",
                bool(cfg.get("image_dimensions")), lambda v: cfg.set("image_dimensions", v))
+        switch(finder, "Barra de caminho",
+               "A hierarquia da pasta atual embaixo, clicável",
+               bool(cfg.get("path_bar")), lambda v: cfg.set("path_bar", v))
+        switch(finder, "Barra de status",
+               "Quantidade de itens e espaço disponível, embaixo",
+               bool(cfg.get("status_bar")), lambda v: cfg.set("status_bar", v))
         manage = Adw.ButtonRow(title="Todas as etiquetas…")
         manage.connect("activated", lambda *_a: _open_manager(self.ctl))
         finder.add(manage)

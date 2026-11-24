@@ -148,3 +148,17 @@ window.vitrine-finder .nautilus-list-view columnview > listview > row:nth-child(
 
 /* miniaturas da página de etiquetas */
 window.vitrine-finder .vitrine-thumb { border-radius: 8px; }
+
+/* ── barra de caminho / status (embaixo) ── */
+window.vitrine-finder .vitrine-finder-bottombar {
+  border-top: 1px solid color-mix(in srgb, currentColor 9%, transparent);
+  background-color: var(--view-bg-color);
+}
+window.vitrine-finder .vitrine-finder-pathbar { padding: 2px 8px; }
+window.vitrine-finder .vitrine-finder-pathbar button {
+  min-height: 22px; padding: 0 6px; border-radius: 6px; font-size: 0.9em;
+}
+window.vitrine-finder .vitrine-finder-status {
+  font-size: 0.85em; padding: 3px 0 5px 0;
+  color: color-mix(in srgb, currentColor 55%, transparent);
+}

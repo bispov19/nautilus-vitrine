@@ -34,14 +34,24 @@ A diferença em relação a outras soluções é o **modo híbrido**. A pasta at
 
 O estilo **Finder** vem ligado de fábrica. Troque em **☰ da linha Meu computador → Personalizar → Estilo da janela**; vale na hora, em todas as janelas.
 
-- Barra de ferramentas: **← →** numa cápsula e o **nome da pasta** em negrito; à direita, **Visão em grade / Visão em lista / Colunas**, **Ordenar** (A-Z, Z-A, última e primeira modificação, tamanho, tipo), **Compartilhar** (copiar local, enviar por e-mail, Bluetooth, compartilhamento na rede), **⋯** (nova pasta, documento vazio, propriedades, renomear, comprimir, copiar, colar, mover para a lixeira, arquivos ocultos, painel de pré-visualização, pesquisar em todos os lugares) e **Pesquisar**.
+- Barra de ferramentas: **← →** numa cápsula e o **nome da pasta** em negrito; à direita, **Visão em grade / Visão em lista / Colunas / Galeria**, **Ordenar e agrupar** (A-Z, Z-A, última e primeira modificação, tamanho, tipo; agrupar na Galeria), **Etiquetas**, **Compartilhar** (copiar local, enviar por e-mail, Bluetooth, compartilhamento na rede), **⋯** (nova pasta, documento vazio, propriedades, renomear, comprimir, copiar, colar, mover para a lixeira, arquivos ocultos, painel de pré-visualização, pesquisar em todos os lugares) e **Pesquisar**.
 - A barra de caminho aparece ao editar o local (**Ctrl+L**) ou ao pesquisar.
+- Opcionais (em *Personalizar → Estilo Finder*): **barra de caminho** embaixo, clicável, e **barra de status** com a quantidade de itens e o espaço disponível.
 - Barra lateral com ícones na cor de destaque do sistema e seleção cinza arredondada.
 - Os nomes seguem os do GNOME (a Vitrine usa a tradução do próprio Nautilus). Os botões de fechar, minimizar e maximizar ficam no padrão do GNOME.
 - **Visão em grade:** dimensões das imagens (ex.: *1.066 × 1.599*) em azul abaixo do nome, seleção cinza arredondada. O nome longo já é truncado no meio pelo próprio Nautilus.
 - **Visão em lista:** linhas alternadas suaves.
 - **Nautilus padrão** remove tudo o que o estilo Finder acrescentou (CSS, botões, sinais). Colunas, pré-visualização e Meu computador continuam conforme as suas opções.
 
+
+### 🖼️ Galeria
+
+Ative com **Ctrl+4**, com o botão da Galeria (estilo Finder) ou em **Visualização desta pasta → Galeria**.
+
+- Imagem grande do item selecionado, faixa de miniaturas rolável embaixo e painel com nome, tipo, tamanho, dimensões, datas e etiquetas.
+- **Agrupar** a faixa por data de modificação (*Hoje, Ontem, Últimos 7 dias, Últimos 30 dias*, meses e anos), tipo, tamanho ou etiqueta, pelo menu *Ordenar e agrupar*.
+- Setas navegam; **Enter** abre; **Espaço** abre a visualização rápida. A seleção vai para a lista nativa do Nautilus, então Propriedades, Renomear, Comprimir e Mover para a lixeira (clique direito ou menu ⋯) agem no item da Galeria.
+- A escolha da Galeria é lembrada por pasta, como as outras visualizações.
 
 ### 🗂️ Modo Colunas
 
@@ -198,6 +208,8 @@ O Nautilus volta exatamente ao original. Suas regras ficam guardadas; use `./uni
 | Atalho | Ação |
 |---|---|
 | **Ctrl+3** | Modo Colunas |
+| **Ctrl+4** | Galeria |
+| **Ctrl+I** | Propriedades (com a aba Etiquetas) |
 | **Ctrl+1** / **Ctrl+2** | Lista / Ícones (nativos do Nautilus, agora lembrados por pasta) |
 | **Ctrl+Shift+P** | Mostrar/ocultar a pré-visualização |
 | **Ctrl+Shift+C** | Abrir/fechar o Meu computador |
@@ -243,6 +255,12 @@ Na primeira execução da versão com GSettings, o antigo `settings.json` é imp
 | `computer_sections` | `{}` | Seções desligadas, ex.: `{"network": false}` (`places`, `devices`, `network`, `disks_button`) |
 | `computer_hidden` | `[]` | Itens ocultos: URIs de locais (`"trash:///"`) ou chaves de dispositivos |
 | `notify_new_devices` | `true` | Avisar quando um pen drive, HD externo ou cartão for conectado |
+| `tags` | 6 cores | Etiquetas: lista de (nome, cor); cores `red`, `orange`, `yellow`, `green`, `blue`, `purple`, `gray` |
+| `tags_in_sidebar` | `true` | Seção Etiquetas na barra lateral (estilo Finder) |
+| `image_dimensions` | `true` | Dimensões das imagens abaixo do nome na grade (estilo Finder) |
+| `gallery_group_by` | `"date"` | Agrupamento da Galeria: `none`, `date`, `type`, `size`, `tags` |
+| `path_bar` | `false` | Barra de caminho embaixo (estilo Finder) |
+| `status_bar` | `false` | Barra de status embaixo (estilo Finder) |
 
 **`~/.config/nautilus-vitrine/folders.json`** guarda as regras por pasta:
 
@@ -281,9 +299,10 @@ vitrine/
   imageload.py          carregamento rápido de imagens, cache e pré-carregamento
   computer.py           página Meu computador e monitor de dispositivos
   config.py             preferências (GSettings) e regras por pasta (JSON)
-  finder/               estilo Finder: aplica e remove a camada visual
+  finder/               estilo Finder: aplica e remove a camada visual (barra de ferramentas, barras de baixo)
   schemas/              schema GSettings da Vitrine
   tags.py               etiquetas (user.xdg.tags) e índice dos arquivos etiquetados
+  gallery.py            visualização em Galeria (Ctrl+4)
   tagui.py              telas das etiquetas (barra, barra lateral, página, Todas as etiquetas…)
   history.py            Voltar/Avançar por aba incluindo o Meu computador (sem GTK)
   about.py              página "Sobre" do diálogo de personalização
@@ -296,6 +315,7 @@ tools/
   test_history.py       testes do histórico de Voltar/Avançar
   test_config.py        testes das preferências (GSettings)
   test_tags.py          testes das etiquetas
+  test_gallery.py       testes dos grupos de data da Galeria
   build_bootstrap.py    gera o criar-vitrine.sh
 packaging/
   nautilus-vitrine.spec receita do pacote RPM
@@ -378,6 +398,10 @@ Para lançar uma versão nova: aumente `Version` e acrescente uma entrada no `%c
 - A coluna **Etiquetas** não é ligada automaticamente: mudar as colunas padrão com a janela aberta derruba o Nautilus 51.1. Ligue em *Colunas visíveis*.
 - O menu de clique direito das extensões só aceita texto: as etiquetas aparecem num submenu (com 🔴🟠🟡…), não como a linha de bolinhas do macOS.
 - Sem desfoque de fundo ("vidro"): o GNOME não desfoca janelas de aplicativos.
+- Agrupar com cabeçalhos ("Hoje", "Ontem"…) só existe na Galeria: a grade nativa do Nautilus não aceita cabeçalhos.
+- A barra lateral nativa não tem seções recolhíveis; só a seção Etiquetas da Vitrine recolhe.
+- Compartilhar usa e-mail, Bluetooth e o compartilhamento na rede do GNOME: o GNOME não tem um portal de compartilhamento como o do macOS.
+- "Duplicar" não existe no GNOME e ficou de fora; "Obter informações" é **Propriedades** (Ctrl+I).
 - O menu de histórico do botão ← (clique direito ou toque longo) é do Nautilus e não lista o Meu computador. Escolher um item ali funciona; a Vitrine se realinha sozinha.
 
 ## Próximos passos
@@ -389,6 +413,9 @@ Para lançar uma versão nova: aumente `Version` e acrescente uma entrada no `%c
 - [ ] Dados EXIF da foto (câmera, lente, GPS)
 - [x] Tela de personalização do Meu computador
 - [ ] Tela de preferências geral (colunas, preview, regras por pasta)
+- [x] Estilo Finder, etiquetas coloridas e Galeria
+- [ ] Pastas inteligentes / pesquisas salvas na barra lateral
+- [ ] Agrupar com cabeçalhos também na visão em grade (precisa de suporte do Nautilus)
 
 Sugestões e *pull requests* são bem-vindos.
 

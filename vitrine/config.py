@@ -23,7 +23,7 @@ CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "nautilus-vitrine")
 SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
 FOLDERS_PATH = os.path.join(CONFIG_DIR, "folders.json")
 
-MODES = ("list", "grid", "columns")
+MODES = ("list", "grid", "columns", "gallery")
 GRID_ZOOMS = ("small", "small-plus", "medium", "large", "extra-large")
 
 SCHEMA_ID = "io.github.bispov19.NautilusVitrine"
@@ -39,6 +39,11 @@ DEFAULT_SETTINGS = {
     "tags_in_sidebar": True,
     "tags_section_expanded": True,
     "image_dimensions": True,
+    # Galeria: agrupar a faixa de miniaturas (none, date, type, size, tags).
+    "gallery_group_by": "date",
+    # Estilo Finder: barra de caminho e barra de status embaixo.
+    "path_bar": False,
+    "status_bar": False,
     # Painel de pré-visualização à direita (Ctrl+Shift+P).
     "preview_visible": True,
     "preview_width": 320,
@@ -93,7 +98,7 @@ _GS_TYPES = {
     "computer_hidden": "as", "notify_new_devices": "b",
     "default_mode": "s?", "default_grid_zoom": "s?",  # "" no GSettings = None aqui
     "tags": "a(ss)", "tags_in_sidebar": "b", "tags_section_expanded": "b",
-    "image_dimensions": "b",
+    "image_dimensions": "b", "gallery_group_by": "s", "path_bar": "b", "status_bar": "b",
 }
 
 

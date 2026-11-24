@@ -48,6 +48,18 @@ levelbar.vitrine-usage trough { min-height: 6px; }
 levelbar.vitrine-usage block.vitrine-ok { background-color: var(--accent-bg-color); }
 levelbar.vitrine-usage block.vitrine-warn { background-color: var(--warning-bg-color); }
 levelbar.vitrine-usage block.vitrine-full { background-color: var(--error-bg-color); }
+.vitrine-gallery { background-color: var(--view-bg-color); }
+.vitrine-gallery-stage { padding: 24px 24px 8px 24px; }
+.vitrine-gallery-picture { border-radius: 12px; }
+.vitrine-gallery-strip { padding: 8px 14px 12px 14px; }
+.vitrine-gallery-item { padding: 4px; border-radius: 10px; min-width: 0; min-height: 0; }
+.vitrine-gallery-item.selected {
+  background-color: color-mix(in srgb, var(--accent-bg-color) 28%, transparent); }
+.vitrine-gallery-thumb { border-radius: 8px; }
+.vitrine-gallery-group { font-weight: bold; font-size: smaller; margin: 0 6px 0 14px;
+  color: color-mix(in srgb, currentColor 55%, transparent); }
+.vitrine-gallery-info { padding: 20px 18px;
+  border-left: 1px solid color-mix(in srgb, currentColor 10%, transparent); }
 .vitrine-badge { font-size: smaller; font-weight: bold; color: var(--accent-fg-color);
   background-color: var(--accent-bg-color); border-radius: 99px; padding: 0 7px; }
 """
@@ -57,7 +69,7 @@ _ACTIVE_INSTANCE = None
 
 
 class VitrineExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.InfoProvider,
-                       Nautilus.ColumnProvider):
+                       Nautilus.ColumnProvider, Nautilus.PropertiesModelProvider):
     def __init__(self) -> None:
         global _ACTIVE_INSTANCE
         super().__init__()
@@ -159,7 +171,7 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.InfoProv
         if key == "window_style":
             for ctl in list(self.windows.values()):
                 ctl.apply_window_style()
-        elif key in ("tags_in_sidebar", "image_dimensions"):
+        elif key in ("tags_in_sidebar", "image_dimensions", "path_bar", "status_bar"):
             # Opções da camada Finder: reaplica para valer na hora.
             for ctl in list(self.windows.values()):
                 if ctl.style is not None and ctl.style.active:
@@ -240,6 +252,26 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.InfoProv
                             label="Dimensões", description="Largura × altura das imagens"),
         ]
 
+    def get_models(self, files):
+        """Aba "Etiquetas" na janela Propriedades (Ctrl+I), pela API oficial."""
+        if self._inert or not files:
+            return []
+        try:
+            from gi.repository import Gio as _Gio
+            store = _Gio.ListStore.new(Nautilus.PropertiesItem)
+            for f in files:
+                if f.get_uri_scheme() != "file":
+                    continue
+                names = read_tags(uri_to_path(f.get_uri()))
+                label = f.get_name() if len(files) > 1 else "Etiquetas"
+                store.append(Nautilus.PropertiesItem.new(label, ", ".join(names) if names else "Nenhuma"))
+            if store.get_n_items() == 0:
+                return []
+            return [Nautilus.PropertiesModel.new("Etiquetas", store)]
+        except Exception as err:  # noqa: BLE001
+            log(f"propriedades: {err!r}")
+            return []
+
     def _invalidate_files(self, uris) -> None:
         """Etiquetas mudaram: o Nautilus pergunta de novo (emblemas, coluna)."""
         for uri in uris:
@@ -317,6 +349,7 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.InfoProv
         add("grid", "Ícones", lambda c: c.user_set_mode("grid", "medium"))
         add("grid-large", "Ícones grandes", lambda c: c.user_set_mode("grid", "extra-large"))
         add("columns", "Colunas", lambda c: c.user_set_mode("columns"))
+        add("gallery", "Galeria", lambda c: c.user_set_mode("gallery"))
 
         if exact and rule:
             if rule.get("recursive"):

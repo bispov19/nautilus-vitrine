@@ -10,6 +10,7 @@ from . import discovery, native
 from .columns import ColumnStrip
 from .computer import ComputerPage
 from .finder import FinderStyle
+from .gallery import GalleryView
 from .history import History
 from .preview import PreviewPane
 from .tagui import TagPage
@@ -62,6 +63,8 @@ class WindowController:
         self._leave_source = 0
         self.style: FinderStyle | None = None
         self.tag_page: TagPage | None = None
+        self.gallery: GalleryView | None = None
+        self.gallery_on = False
         self._tag_visible: str | None = None
         self.tag_sidebar = None  # seção Etiquetas (só no estilo Finder)
 
@@ -106,6 +109,8 @@ class WindowController:
         self.content_stack.add_named(self.computer, "computer")
         self.tag_page = TagPage(self)
         self.content_stack.add_named(self.tag_page, "tag")
+        self.gallery = GalleryView(self)
+        self.content_stack.add_named(self.gallery, "gallery")
         self.content_stack.set_visible_child_name("tabs")
         inner.append(self.strip)
         inner.append(self.content_stack)
@@ -325,7 +330,7 @@ class WindowController:
         if on == self._computer_visible:
             return
         self._computer_visible = on
-        self.content_stack.set_visible_child_name("computer" if on else "tabs")
+        self.content_stack.set_visible_child_name("computer" if on else self._main_page())
         if on:
             if self.strip is not None:
                 self.strip.set_visible(False)
@@ -345,7 +350,7 @@ class WindowController:
                 self.sidebar_list.unselect_all()
             slot = self.active_slot()
             if slot is not None:
-                self._set_columns_visible(getattr(slot, "_vitrine_mode", None) == "columns")
+                self._apply_view(slot)
                 self._sync_active_ui(slot)
 
     def computer_visible(self) -> bool:
@@ -385,14 +390,14 @@ class WindowController:
         if self.tag_sidebar is not None:
             self.tag_sidebar.select(None)
         if self.content_stack is not None:
-            self.content_stack.set_visible_child_name("computer" if self._computer_visible else "tabs")
+            self.content_stack.set_visible_child_name("computer" if self._computer_visible else self._main_page())
         if self._computer_visible:
             if self.sidebar_list is not None:
                 self.sidebar_list.select_row(self.sidebar_list.get_row_at_index(0))
         else:
             slot = self.active_slot()
             if slot is not None:
-                self._set_columns_visible(getattr(slot, "_vitrine_mode", None) == "columns")
+                self._apply_view(slot)
                 self._sync_active_ui(slot)
         self._style_sync()
 
@@ -679,8 +684,17 @@ class WindowController:
             self.go_history(-1 if keyval == Gdk.KEY_Back else +1)
             return True
         if mods == Gdk.ModifierType.CONTROL_MASK:
-            if keyval in (Gdk.KEY_1, Gdk.KEY_2, Gdk.KEY_3) and self._computer_visible:
+            if keyval in (Gdk.KEY_1, Gdk.KEY_2, Gdk.KEY_3, Gdk.KEY_4) and self._computer_visible:
                 self.show_computer(False)
+            if keyval == Gdk.KEY_4:
+                self.user_set_mode("gallery")
+                return True
+            if keyval in (Gdk.KEY_i, Gdk.KEY_I):
+                # Propriedades (o "Obter informações" do Finder); o Nautilus não tem Ctrl+I.
+                slot = self.active_slot()
+                if slot is not None:
+                    slot.activate_action("view.properties", None)
+                return True
             if keyval == Gdk.KEY_3:
                 self.user_set_mode("columns")
                 return True
@@ -731,7 +745,7 @@ class WindowController:
         if self._computer_visible:
             self._display_computer(False)
             return
-        self._set_columns_visible(getattr(slot, "_vitrine_mode", None) == "columns")
+        self._apply_view(slot)
         self._sync_active_ui(slot)
 
     @guarded
@@ -773,6 +787,8 @@ class WindowController:
             self.preview.set_folder(uri if regular else None)
             self.preview.show_uris([])
         self._rebind_model_soon()
+        if self.gallery_on and self.gallery is not None and regular:
+            self.gallery.set_folder(uri)
         self._style_sync()
 
     def _rebind_model_soon(self) -> None:
@@ -809,7 +825,7 @@ class WindowController:
         mode = native.view_mode(slot) if slot is not None else None
         if mode is None:
             return GLib.SOURCE_REMOVE
-        if self.columns_on and mode == "list":
+        if (self.columns_on or self.gallery_on) and mode == "list":
             return GLib.SOURCE_REMOVE  # coluna usa lista por baixo; nada mudou de fato
         debug(f"usuário trocou a visualização nativa para {mode}")
         self.user_set_mode(mode)
@@ -862,6 +878,7 @@ class WindowController:
         if not native.is_regular_location(uri):
             if slot is self.active_slot():
                 self._set_columns_visible(False)
+                self._set_gallery_visible(False)
             return GLib.SOURCE_REMOVE
         rule, _exact = self.cfg.rule_for(uri)
         current = getattr(slot, "_vitrine_mode", None)
@@ -871,8 +888,8 @@ class WindowController:
             self.apply_mode(slot, rule.get("mode", "list"), rule.get("zoom"))
         elif manual:
             self.apply_mode(slot, *manual)  # escolha manual vence a descoberta
-        elif current == "columns":
-            self.apply_mode(slot, "columns")  # navegar em colunas continua em colunas
+        elif current in ("columns", "gallery"):
+            self.apply_mode(slot, current)  # navegar em colunas/galeria continua nelas
         elif discover:
             discovery.discover(uri, float(self.cfg.get("auto_media_ratio")),
                                lambda kind: self._apply_discovered(slot, uri, kind))
@@ -883,13 +900,14 @@ class WindowController:
         return GLib.SOURCE_REMOVE
 
     def apply_mode(self, slot, mode: str, zoom: str | None = None) -> None:
-        if mode not in ("list", "grid", "columns"):
+        if mode not in ("list", "grid", "columns", "gallery"):
             mode = "list"
         self.ext.suppress()
         slot._vitrine_mode = mode
         if slot is self.active_slot():
             self._set_columns_visible(mode == "columns")
-        native.set_view_mode(slot, "list" if mode == "columns" else mode)
+            self._set_gallery_visible(mode == "gallery")
+        native.set_view_mode(slot, "list" if mode in ("columns", "gallery") else mode)
         if mode == "grid":
             self.ext.set_grid_zoom(zoom or self.cfg.get("default_grid_zoom"))
         # Confere depois que o Nautilus terminar de trocar a visualização.
@@ -898,7 +916,7 @@ class WindowController:
     def _verify_mode(self, slot, mode: str) -> bool:
         if getattr(slot, "_vitrine_mode", None) != mode:
             return GLib.SOURCE_REMOVE
-        want = "list" if mode == "columns" else mode
+        want = "list" if mode in ("columns", "gallery") else mode
         if native.view_mode(slot) not in (None, want):
             self.ext.suppress()
             native.set_view_mode(slot, want)
@@ -985,6 +1003,41 @@ class WindowController:
             self.apply_mode(slot, self.cfg.get("default_mode"))
 
     # ───────────────────────── colunas / painel ─────────────────────────
+    def _apply_view(self, slot) -> None:
+        """Visões da Vitrine por cima da lista nativa: Colunas ou Galeria."""
+        mode = getattr(slot, "_vitrine_mode", None) if slot is not None else None
+        self._set_columns_visible(mode == "columns")
+        self._set_gallery_visible(mode == "gallery")
+
+    def _main_page(self) -> str:
+        return "gallery" if self.gallery_on else "tabs"
+
+    def _set_gallery_visible(self, on: bool) -> None:
+        if self.gallery is None or self.content_stack is None:
+            return
+        slot = self.active_slot()
+        uri = native.slot_uri(slot)
+        if on and not native.is_regular_location(uri):
+            on = False
+        was = self.gallery_on
+        self.gallery_on = on
+        overlay = self._computer_visible or self._tag_visible is not None
+        if on:
+            self.gallery.set_folder(uri)
+            if not overlay:
+                self.content_stack.set_visible_child_name("gallery")
+                self.gallery.grab_focus()
+            # A Galeria tem o próprio painel de informações.
+            if self.preview is not None:
+                self.preview.set_visible(False)
+        else:
+            if self.content_stack.get_visible_child_name() == "gallery":
+                self.content_stack.set_visible_child_name("tabs")
+            if was and self.preview is not None:
+                self.preview.set_visible(bool(self.cfg.get("preview_visible")))
+        if was != on:
+            self._sync_buttons()
+
     def _set_columns_visible(self, on: bool) -> None:
         self.columns_on = on
         if self.strip is not None:

@@ -16,6 +16,7 @@ INCLUDE = [
     "tools/test_history.py",
     "tools/test_config.py",
     "tools/test_tags.py",
+    "tools/test_gallery.py",
     "tools/build_bootstrap.py",
     "install.sh",
     "uninstall.sh",

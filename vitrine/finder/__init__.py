@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import os
 
-from gi.repository import Adw, Gdk, Gio, Gtk
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from ..util import ASSETS, ancestor, find_by_type_name, find_first, gtype_name, log, walk
 from ..tagui import TagSidebar
+from .bottombar import FinderBottomBar
 from .toolbar import FinderToolbar
 
 DIMENSIONS = "vitrine_dimensions"
@@ -85,6 +86,7 @@ class FinderStyle:
         self.header: Adw.HeaderBar | None = None
         self.sidebar_header: Adw.HeaderBar | None = None
         self.split: Adw.OverlaySplitView | None = None
+        self.bottombar: FinderBottomBar | None = None
 
     # ── registro de desfeitas ──
     def _later(self, fn) -> None:
@@ -141,6 +143,7 @@ class FinderStyle:
             self._tags_section()
             self._toolbar()
             self._captions()
+            self._bottom()
             self.sync()
             log("estilo Finder aplicado")
             return True
@@ -248,6 +251,22 @@ class FinderStyle:
         pane.add_bottom_bar(section)
         self._later(lambda: pane.remove(section))
 
+    def _bottom(self) -> None:
+        """Barra de caminho e barra de status embaixo do conteúdo (opcionais)."""
+        content = ancestor(self.ctl.paned, lambda w: isinstance(w, Adw.ToolbarView)) \
+            if self.ctl.paned is not None else None
+        if content is None:
+            return
+        bar = FinderBottomBar(self.ctl)
+        content.add_bottom_bar(bar)
+        self.bottombar = bar
+
+        def undo():
+            content.remove(bar)
+            self.bottombar = None
+
+        self._later(undo)
+
     def _captions(self) -> None:
         """Dimensões das imagens abaixo do nome na visão em grade (como no Finder).
         A legenda é uma preferência do próprio Nautilus: guardamos e devolvemos."""
@@ -305,6 +324,10 @@ class FinderStyle:
         """Chamado pelo WindowController quando muda pasta, aba, modo ou Meu computador."""
         if self.active and self.toolbar is not None:
             self.toolbar.sync()
+        if self.active and self.bottombar is not None:
+            self.bottombar.update()
+            # a lista nativa termina de carregar depois: confere a contagem de novo
+            GLib.timeout_add(900, lambda: (self.bottombar and self.bottombar.update(), False)[1])
 
 
 def describe(win) -> str:
