@@ -49,7 +49,7 @@ cat > 'vitrine/__init__.py' <<'__VITRINE_ARQUIVO_1__'
 
 # Fonte única da versão no código. O `Version:` de packaging/nautilus-vitrine.spec
 # precisa ser igual (tools/smoke_test.py confere).
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __VITRINE_ARQUIVO_1__
 mkdir -p "vitrine"
 cat > 'vitrine/about.py' <<'__VITRINE_ARQUIVO_2__'
@@ -1341,6 +1341,12 @@ class ComputerPage(Gtk.ScrolledWindow):
         switch(finder, "Dimensões das imagens",
                "Largura × altura abaixo do nome, na visão em grade",
                bool(cfg.get("image_dimensions")), lambda v: cfg.set("image_dimensions", v))
+        switch(finder, "Barra de caminho",
+               "A hierarquia da pasta atual embaixo, clicável",
+               bool(cfg.get("path_bar")), lambda v: cfg.set("path_bar", v))
+        switch(finder, "Barra de status",
+               "Quantidade de itens e espaço disponível, embaixo",
+               bool(cfg.get("status_bar")), lambda v: cfg.set("status_bar", v))
         manage = Adw.ButtonRow(title="Todas as etiquetas…")
         manage.connect("activated", lambda *_a: _open_manager(self.ctl))
         finder.add(manage)
@@ -1493,7 +1499,7 @@ CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "nautilus-vitrine")
 SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
 FOLDERS_PATH = os.path.join(CONFIG_DIR, "folders.json")
 
-MODES = ("list", "grid", "columns")
+MODES = ("list", "grid", "columns", "gallery")
 GRID_ZOOMS = ("small", "small-plus", "medium", "large", "extra-large")
 
 SCHEMA_ID = "io.github.bispov19.NautilusVitrine"
@@ -1509,6 +1515,11 @@ DEFAULT_SETTINGS = {
     "tags_in_sidebar": True,
     "tags_section_expanded": True,
     "image_dimensions": True,
+    # Galeria: agrupar a faixa de miniaturas (none, date, type, size, tags).
+    "gallery_group_by": "date",
+    # Estilo Finder: barra de caminho e barra de status embaixo.
+    "path_bar": False,
+    "status_bar": False,
     # Painel de pré-visualização à direita (Ctrl+Shift+P).
     "preview_visible": True,
     "preview_width": 320,
@@ -1563,7 +1574,7 @@ _GS_TYPES = {
     "computer_hidden": "as", "notify_new_devices": "b",
     "default_mode": "s?", "default_grid_zoom": "s?",  # "" no GSettings = None aqui
     "tags": "a(ss)", "tags_in_sidebar": "b", "tags_section_expanded": "b",
-    "image_dimensions": "b",
+    "image_dimensions": "b", "gallery_group_by": "s", "path_bar": "b", "status_bar": "b",
 }
 
 
@@ -1930,7 +1941,513 @@ def forget_manual(uri: str) -> None:
     _MANUAL.pop(uri, None)
 __VITRINE_ARQUIVO_6__
 mkdir -p "vitrine"
-cat > 'vitrine/history.py' <<'__VITRINE_ARQUIVO_7__'
+cat > 'vitrine/gallery.py' <<'__VITRINE_ARQUIVO_7__'
+"""Visualização em Galeria (Ctrl+4): imagem grande do item selecionado, faixa de
+miniaturas rolável embaixo (com cabeçalhos de grupo: Hoje, Ontem, Últimos 7 dias…) e
+painel com os metadados à direita.
+
+É uma visão da Vitrine, como as Colunas. A lista nativa do Nautilus continua aberta por
+baixo e recebe a mesma seleção: Espaço (visualização rápida), Propriedades, Renomear,
+Mover para a lixeira e as demais ações do Nautilus valem para o item da Galeria.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango
+
+from . import imageload, native, util
+from .util import guarded, log
+
+ATTRS = ("standard::name,standard::display-name,standard::type,standard::content-type,"
+         "standard::icon,standard::size,standard::is-hidden,standard::is-backup,"
+         "time::modified,time::created,thumbnail::*")
+MAX_ITEMS = 5000
+THUMB = 72
+
+GROUPS = (
+    ("none", "Nenhum"),
+    ("date", "Data de modificação"),
+    ("type", "Tipo"),
+    ("size", "Tamanho"),
+    ("tags", "Etiquetas"),
+)
+
+
+def date_bucket(mtime: float, now: float | None = None) -> tuple[int, str]:
+    """(ordem, rótulo) do grupo de data, como no Finder: Hoje, Ontem, Últimos 7 dias,
+    Últimos 30 dias, meses do ano atual e, antes disso, o ano."""
+    now_dt = GLib.DateTime.new_from_unix_local(int(now if now is not None else time.time()))
+    dt = GLib.DateTime.new_from_unix_local(int(mtime))
+    today = GLib.DateTime.new_local(now_dt.get_year(), now_dt.get_month(), now_dt.get_day_of_month(), 0, 0, 0)
+    days = int((today.to_unix() - GLib.DateTime.new_local(
+        dt.get_year(), dt.get_month(), dt.get_day_of_month(), 0, 0, 0).to_unix()) // 86400)
+    if days <= 0:
+        return 0, "Hoje"
+    if days == 1:
+        return 1, "Ontem"
+    if days < 7:
+        return 2, "Últimos 7 dias"
+    if days < 30:
+        return 3, "Últimos 30 dias"
+    if dt.get_year() == now_dt.get_year():
+        return 100 - dt.get_month(), f"{_MONTHS[dt.get_month() - 1]}"
+    return 1000 + (now_dt.get_year() - dt.get_year()), str(dt.get_year())
+
+
+_MONTHS = ("Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto",
+           "Setembro", "Outubro", "Novembro", "Dezembro")
+
+_SIZES = ((1024 ** 3, "Maiores que 1 GB"), (100 * 1024 ** 2, "100 MB a 1 GB"),
+          (1024 ** 2, "1 MB a 100 MB"), (0, "Menores que 1 MB"))
+
+
+class Item:
+    __slots__ = ("uri", "path", "name", "is_dir", "ctype", "size", "mtime", "ctime",
+                 "thumb", "icon", "tags", "button", "image")
+
+    def __init__(self, folder: Gio.File, info: Gio.FileInfo, tags) -> None:
+        child = folder.get_child(info.get_name())
+        self.uri = child.get_uri()
+        self.path = child.get_path()
+        self.name = info.get_display_name()
+        self.is_dir = info.get_file_type() == Gio.FileType.DIRECTORY
+        self.ctype = info.get_content_type() or ""
+        self.size = info.get_size()
+        mod = info.get_modification_date_time()
+        self.mtime = mod.to_unix() if mod is not None else 0
+        created = info.get_creation_date_time()
+        self.ctime = created.to_unix() if created is not None else None
+        self.thumb = imageload.best_thumbnail(info)
+        self.icon = info.get_icon()
+        self.tags = tags.tags_of(self.uri) if self.path else []
+        self.button = None
+        self.image = None
+
+
+def group_of(item: Item, mode: str, store) -> tuple:
+    if mode == "date":
+        return date_bucket(item.mtime)
+    if mode == "type":
+        label = "Pastas" if item.is_dir else (Gio.content_type_get_description(item.ctype) or "Outros")
+        return (0 if item.is_dir else 1, label.lower()), label
+    if mode == "size":
+        if item.is_dir:
+            return 99, "Pastas"
+        for i, (limit, label) in enumerate(_SIZES):
+            if item.size >= limit:
+                return i, label
+    if mode == "tags":
+        names = store.names()
+        for i, name in enumerate(names):
+            if name in item.tags:
+                return i, name
+        return 999, "Sem etiqueta"
+    return 0, ""
+
+
+def sort_key(item: Item, mode: str, store):
+    name = GLib.utf8_collate_key_for_filename(item.name, -1)
+    if mode == "date":
+        return (group_of(item, mode, store)[0], -item.mtime, name)
+    if mode == "size":
+        return (group_of(item, mode, store)[0], -item.size, name)
+    return (group_of(item, mode, store)[0], not item.is_dir, name)
+
+
+class GalleryView(Gtk.Box):
+    __gtype_name__ = "VitrineGalleryView"
+
+    def __init__(self, ctl) -> None:
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
+        self.add_css_class("vitrine-gallery")
+        self.ctl = ctl
+        self.folder: Gio.File | None = None
+        self.items: list[Item] = []
+        self.selected: Item | None = None
+        self._cancel = Gio.Cancellable()
+        self._monitor = None
+        self._reload_source = 0
+        self._load_token = 0
+        self._prefs = Gio.Settings.new("org.gnome.nautilus.preferences")
+        self.set_focusable(True)
+
+        # imagem grande + faixa
+        main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
+        self.stage = Gtk.Stack(vexpand=True, transition_type=Gtk.StackTransitionType.CROSSFADE,
+                               transition_duration=120)
+        self.picture = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, can_shrink=True)
+        self.picture.add_css_class("vitrine-gallery-picture")
+        self.picture.set_overflow(Gtk.Overflow.HIDDEN)  # cantos arredondados cortam a imagem
+        self.big_icon = Gtk.Image(pixel_size=160)
+        self.empty = Gtk.Label(label="Pasta vazia")
+        self.empty.add_css_class("dim-label")
+        self.empty.add_css_class("title-2")
+        for name, w in (("picture", self.picture), ("icon", self.big_icon), ("empty", self.empty)):
+            self.stage.add_named(w, name)
+        stage_frame = Gtk.Box(vexpand=True)
+        stage_frame.add_css_class("vitrine-gallery-stage")
+        self.stage.set_hexpand(True)
+        stage_frame.append(self.stage)
+        main.append(stage_frame)
+        self.strip = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
+        self.strip.add_css_class("vitrine-gallery-strip")
+        self.scroller = Gtk.ScrolledWindow(vscrollbar_policy=Gtk.PolicyType.NEVER,
+                                           hscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+                                           child=self.strip)
+        self.scroller.set_size_request(-1, THUMB + 54)
+        main.append(self.scroller)
+        self.append(main)
+
+        # metadados
+        self.info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, width_request=260)
+        self.info.add_css_class("vitrine-gallery-info")
+        self.title = Gtk.Label(xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR)
+        self.title.add_css_class("title-4")
+        self.kind = Gtk.Label(xalign=0, wrap=True)
+        self.kind.add_css_class("dim-label")
+        self.grid = Gtk.Grid(column_spacing=10, row_spacing=6, margin_top=12)
+        self.tags_box = Gtk.Box(spacing=4, margin_top=8)
+        self.open_btn = Gtk.Button(label="Abrir", halign=Gtk.Align.START, margin_top=12)
+        self.open_btn.add_css_class("pill")
+        self.open_btn.connect("clicked", lambda *_a: self.selected and self.activate_item(self.selected))
+        for w in (self.title, self.kind, self.tags_box, self.grid, self.open_btn):
+            self.info.append(w)
+        self.append(self.info)
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self._on_key)
+        self.add_controller(keys)
+        self._prefs.connect("changed::show-hidden-files", lambda *_a: self.reload())
+        ctl.ext.tags.on_change(lambda: self.get_mapped() and self.reload())
+
+    # ── pasta ──
+    def set_folder(self, uri: str | None) -> None:
+        folder = Gio.File.new_for_uri(uri) if uri else None
+        if folder is not None and self.folder is not None and folder.equal(self.folder) and self.items:
+            return
+        self.folder = folder
+        self.selected = None
+        self._watch()
+        self.reload()
+
+    def _watch(self) -> None:
+        if self._monitor is not None:
+            self._monitor.cancel()
+            self._monitor = None
+        if self.folder is None:
+            return
+        try:
+            self._monitor = self.folder.monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
+            self._monitor.connect("changed", lambda *_a: self._reload_soon())
+        except GLib.Error:
+            self._monitor = None
+
+    def _reload_soon(self) -> None:
+        if self._reload_source:
+            return
+        self._reload_source = GLib.timeout_add(400, self._reload_now)
+
+    def _reload_now(self) -> bool:
+        self._reload_source = 0
+        if self.get_mapped():
+            self.reload()
+        return GLib.SOURCE_REMOVE
+
+    def reload(self) -> None:
+        self._cancel.cancel()
+        self._cancel = Gio.Cancellable()
+        self._load_token += 1
+        token = self._load_token
+        if self.folder is None:
+            self._show([])
+            return
+        keep = self.selected.uri if self.selected is not None else None
+        show_hidden = self._prefs.get_boolean("show-hidden-files")
+        folder = self.folder
+        infos: list = []
+
+        def on_enum(f, res):
+            try:
+                en = f.enumerate_children_finish(res)
+            except GLib.Error as err:
+                if not err.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+                    log(f"galeria: {err.message}")
+                    self._show([])
+                return
+            en.next_files_async(200, GLib.PRIORITY_DEFAULT, self._cancel, on_files)
+
+        def on_files(en, res):
+            try:
+                batch = en.next_files_finish(res)
+            except GLib.Error:
+                return
+            if token != self._load_token:
+                return
+            for info in batch:
+                if show_hidden or not (info.get_is_hidden() or info.get_is_backup()):
+                    infos.append(info)
+            if batch and len(infos) < MAX_ITEMS:
+                en.next_files_async(200, GLib.PRIORITY_DEFAULT, self._cancel, on_files)
+                return
+            en.close_async(GLib.PRIORITY_LOW, None, None)
+            items = [Item(folder, i, self.ctl.ext.tags) for i in infos]
+            self._show(items, keep)
+
+        folder.enumerate_children_async(ATTRS, Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT,
+                                        self._cancel, on_enum)
+
+    # ── montagem da faixa ──
+    def group_mode(self) -> str:
+        mode = self.ctl.cfg.get("gallery_group_by")
+        return mode if mode in dict(GROUPS) else "date"
+
+    def _show(self, items: list[Item], keep: str | None = None) -> None:
+        store = self.ctl.ext.tags
+        mode = self.group_mode()
+        items.sort(key=lambda it: sort_key(it, mode, store))
+        self.items = items
+        child = self.strip.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self.strip.remove(child)
+            child = nxt
+        last = None
+        for item in items:
+            if mode != "none":
+                key, label = group_of(item, mode, store)
+                if key != last:
+                    head = Gtk.Label(label=label, valign=Gtk.Align.CENTER)
+                    head.add_css_class("vitrine-gallery-group")
+                    self.strip.append(head)
+                    last = key
+            self.strip.append(self._button(item))
+        if not items:
+            self.selected = None
+            self.stage.set_visible_child_name("empty")
+            self._fill_info(None)
+            return
+        target = next((it for it in items if it.uri == keep), items[0])
+        self.select(target, sync_native=False)
+
+    def _button(self, item: Item) -> Gtk.Button:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        image = Gtk.Picture(content_fit=Gtk.ContentFit.COVER, can_shrink=True)
+        image.set_size_request(THUMB, THUMB)
+        image.add_css_class("vitrine-gallery-thumb")
+        image.set_overflow(Gtk.Overflow.HIDDEN)
+        if item.thumb:
+            image.set_filename(item.thumb)
+        else:
+            icon = Gtk.Image.new_from_gicon(item.icon) if item.icon else Gtk.Image.new_from_icon_name("text-x-generic")
+            icon.set_pixel_size(THUMB - 16)
+            icon.set_size_request(THUMB, THUMB)
+            image = icon
+        box.append(image)
+        dots = Gtk.Box(spacing=2, halign=Gtk.Align.CENTER, height_request=8)
+        for t in item.tags[:4]:
+            d = Gtk.Image.new_from_icon_name(f"vitrine-tag-{self.ctl.ext.tags.color_of(t)}")
+            d.set_pixel_size(8)
+            dots.append(d)
+        box.append(dots)
+        btn = Gtk.Button(child=box, tooltip_text=item.name)
+        btn.add_css_class("flat")
+        btn.add_css_class("vitrine-gallery-item")
+        btn.connect("clicked", lambda *_a, it=item: self.select(it))
+        double = Gtk.GestureClick(button=Gdk.BUTTON_PRIMARY)
+        double.connect("pressed", lambda g, n, *_a, it=item: n == 2 and self.activate_item(it))
+        btn.add_controller(double)
+        menu = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        menu.connect("pressed", self._on_menu, item)
+        btn.add_controller(menu)
+        item.button = btn
+        return btn
+
+    # ── seleção ──
+    def select(self, item: Item, *, sync_native: bool = True) -> None:
+        if self.selected is not None and self.selected.button is not None:
+            self.selected.button.remove_css_class("selected")
+        self.selected = item
+        if item.button is not None:
+            item.button.add_css_class("selected")
+            GLib.idle_add(self._scroll_to, item)
+        self._stage(item)
+        self._fill_info(item)
+        if sync_native:
+            self._sync_native(item)
+
+    def _scroll_to(self, item: Item) -> bool:
+        btn = item.button
+        if btn is None or not btn.get_mapped():
+            return GLib.SOURCE_REMOVE
+        ok, rect = btn.compute_bounds(self.strip)
+        if ok:
+            adj = self.scroller.get_hadjustment()
+            x, w = rect.get_x(), rect.get_width()
+            page = adj.get_page_size()
+            if x < adj.get_value():
+                adj.set_value(max(0, x - 24))
+            elif x + w > adj.get_value() + page:
+                adj.set_value(x + w - page + 24)
+        return GLib.SOURCE_REMOVE
+
+    def _sync_native(self, item: Item) -> None:
+        model = native.find_model(self.ctl.active_slot())
+        if model is not None:
+            native.select_uris(model, [item.uri])
+
+    def _stage(self, item: Item) -> None:
+        token = self._load_token
+        if item.path and item.ctype.startswith("image/"):
+            if item.thumb:
+                self.picture.set_filename(item.thumb)
+                self.stage.set_visible_child_name("picture")
+            else:
+                self.big_icon.set_from_gicon(item.icon)
+                self.stage.set_visible_child_name("icon")
+
+            def done(fut):
+                try:
+                    tex = fut.result()[0]
+                except Exception as err:  # noqa: BLE001
+                    log(f"galeria: {item.name}: {err}")
+                    return
+                GLib.idle_add(apply, tex)
+
+            def apply(tex):
+                if token == self._load_token and self.selected is item:
+                    self.picture.set_paintable(tex)
+                    self.stage.set_visible_child_name("picture")
+                return GLib.SOURCE_REMOVE
+
+            imageload.EXECUTOR.submit(imageload.load, item.path, item.ctype).add_done_callback(done)
+        elif item.thumb:
+            self.picture.set_filename(item.thumb)
+            self.stage.set_visible_child_name("picture")
+        else:
+            if item.icon is not None:
+                self.big_icon.set_from_gicon(item.icon)
+            self.stage.set_visible_child_name("icon")
+
+    def _fill_info(self, item: Item | None) -> None:
+        child = self.grid.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self.grid.remove(child)
+            child = nxt
+        child = self.tags_box.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self.tags_box.remove(child)
+            child = nxt
+        self.info.set_visible(item is not None)
+        if item is None:
+            return
+        self.title.set_label(item.name)
+        self.kind.set_label("Pasta" if item.is_dir else (Gio.content_type_get_description(item.ctype) or ""))
+        rows = []
+        if not item.is_dir:
+            rows.append(("Tamanho", util.human_size(item.size)))
+        if item.path and item.ctype in ("image/jpeg", "image/png"):
+            pr = imageload.probe(item.path, item.ctype)
+            if pr.width and pr.height:
+                w, h = (pr.height, pr.width) if pr.orientation in (5, 6, 7, 8) else (pr.width, pr.height)
+                rows.append(("Dimensões", f"{w:,} × {h:,}".replace(",", ".")))
+        rows.append(("Modificado", _fmt(item.mtime)))
+        if item.ctime:
+            rows.append(("Criado", _fmt(item.ctime)))
+        for i, (k, v) in enumerate(rows):
+            key = Gtk.Label(label=k, xalign=1)
+            key.add_css_class("dim-label")
+            self.grid.attach(key, 0, i, 1, 1)
+            self.grid.attach(Gtk.Label(label=v, xalign=0, wrap=True, selectable=True), 1, i, 1, 1)
+        for t in item.tags:
+            d = Gtk.Image.new_from_icon_name(f"vitrine-tag-{self.ctl.ext.tags.color_of(t)}")
+            d.set_pixel_size(10)
+            self.tags_box.append(d)
+            self.tags_box.append(Gtk.Label(label=t, margin_end=8))
+        self.tags_box.set_visible(bool(item.tags))
+        self.open_btn.set_label("Abrir pasta" if item.is_dir else "Abrir")
+
+    # ── ações ──
+    def activate_item(self, item: Item) -> None:
+        if item.is_dir:
+            self.ctl.navigate(item.uri)
+        else:
+            util.open_uri(item.uri)
+
+    def move(self, delta: int) -> None:
+        if not self.items:
+            return
+        i = self.items.index(self.selected) if self.selected in self.items else -1
+        self.select(self.items[max(0, min(len(self.items) - 1, i + delta))])
+
+    @guarded
+    def _on_key(self, _ctrl, keyval, _code, state) -> bool:
+        if state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK):
+            return False
+        if keyval in (Gdk.KEY_Left, Gdk.KEY_Up):
+            self.move(-1)
+        elif keyval in (Gdk.KEY_Right, Gdk.KEY_Down):
+            self.move(+1)
+        elif keyval == Gdk.KEY_Home and self.items:
+            self.select(self.items[0])
+        elif keyval == Gdk.KEY_End and self.items:
+            self.select(self.items[-1])
+        elif keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and self.selected is not None:
+            self.activate_item(self.selected)
+        elif keyval == Gdk.KEY_space and self.selected is not None:
+            self._sync_native(self.selected)
+            self.ctl.quicklook()
+        else:
+            return False
+        return True
+
+    @guarded
+    def _on_menu(self, gesture, _n, x, y, item: Item) -> None:
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        self.select(item)
+        from .finder.toolbar import nt  # rótulos com os nomes do GNOME
+
+        menu = Gio.Menu()
+        top = Gio.Menu()
+        top.append(nt("_Open", "Abrir"), "vgallery.open")
+        top.append(nt("Open _With…", "Abrir com…"), "view.open-with-other-application")
+        menu.append_section(None, top)
+        mid = Gio.Menu()
+        mid.append(nt("Rena_me…", "Renomear…"), "view.rename")
+        mid.append(nt("C_ompress…", "Comprimir…"), "view.compress")
+        mid.append(nt("_Copy", "Copiar"), "view.copy")
+        mid.append(nt("Mo_ve to Trash", "Mover para a lixeira"), "view.move-to-trash")
+        menu.append_section(None, mid)
+        end = Gio.Menu()
+        end.append(nt("P_roperties", "Propriedades"), "view.properties")
+        menu.append_section(None, end)
+        group = Gio.SimpleActionGroup()
+        act = Gio.SimpleAction.new("open", None)
+        act.connect("activate", lambda *_a: self.activate_item(item))
+        group.add_action(act)
+        btn = item.button
+        btn.insert_action_group("vgallery", group)
+        pop = Gtk.PopoverMenu.new_from_model(menu)
+        pop.set_parent(btn)
+        pop.set_has_arrow(False)
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        pop.set_pointing_to(rect)
+        pop.connect("closed", lambda p: GLib.idle_add(p.unparent))
+        pop.popup()
+
+
+def _fmt(ts: float | None) -> str:
+    if not ts:
+        return "—"
+    return GLib.DateTime.new_from_unix_local(int(ts)).format("%d/%m/%Y %H:%M")
+__VITRINE_ARQUIVO_7__
+mkdir -p "vitrine"
+cat > 'vitrine/history.py' <<'__VITRINE_ARQUIVO_8__'
 """Histórico de Voltar/Avançar que inclui o Meu computador.
 
 O Meu computador é uma página que a Vitrine põe *por cima* da lista do Nautilus, então
@@ -2098,9 +2615,9 @@ class History:
                 self.entries, self.idx, self.depth = entries, j, e.depth
                 return True
         return False
-__VITRINE_ARQUIVO_7__
+__VITRINE_ARQUIVO_8__
 mkdir -p "vitrine"
-cat > 'vitrine/imageload.py' <<'__VITRINE_ARQUIVO_8__'
+cat > 'vitrine/imageload.py' <<'__VITRINE_ARQUIVO_9__'
 """Carregamento rápido de imagens para o preview.
 
 No Fedora 45 o gdk-pixbuf usa o glycin, que abre um processo isolado (sandbox)
@@ -2283,9 +2800,9 @@ THUMB_ATTRS = ",".join(
     for s in ("", "-normal", "-large", "-xlarge", "-xxlarge")
     for k in ("path", "is-valid")
 )
-__VITRINE_ARQUIVO_8__
+__VITRINE_ARQUIVO_9__
 mkdir -p "vitrine"
-cat > 'vitrine/main.py' <<'__VITRINE_ARQUIVO_9__'
+cat > 'vitrine/main.py' <<'__VITRINE_ARQUIVO_10__'
 """Ponto central: descobre as janelas do Nautilus e oferece o menu "Visualização desta pasta"."""
 
 from __future__ import annotations
@@ -2336,6 +2853,18 @@ levelbar.vitrine-usage trough { min-height: 6px; }
 levelbar.vitrine-usage block.vitrine-ok { background-color: var(--accent-bg-color); }
 levelbar.vitrine-usage block.vitrine-warn { background-color: var(--warning-bg-color); }
 levelbar.vitrine-usage block.vitrine-full { background-color: var(--error-bg-color); }
+.vitrine-gallery { background-color: var(--view-bg-color); }
+.vitrine-gallery-stage { padding: 24px 24px 8px 24px; }
+.vitrine-gallery-picture { border-radius: 12px; }
+.vitrine-gallery-strip { padding: 8px 14px 12px 14px; }
+.vitrine-gallery-item { padding: 4px; border-radius: 10px; min-width: 0; min-height: 0; }
+.vitrine-gallery-item.selected {
+  background-color: color-mix(in srgb, var(--accent-bg-color) 28%, transparent); }
+.vitrine-gallery-thumb { border-radius: 8px; }
+.vitrine-gallery-group { font-weight: bold; font-size: smaller; margin: 0 6px 0 14px;
+  color: color-mix(in srgb, currentColor 55%, transparent); }
+.vitrine-gallery-info { padding: 20px 18px;
+  border-left: 1px solid color-mix(in srgb, currentColor 10%, transparent); }
 .vitrine-badge { font-size: smaller; font-weight: bold; color: var(--accent-fg-color);
   background-color: var(--accent-bg-color); border-radius: 99px; padding: 0 7px; }
 """
@@ -2345,7 +2874,7 @@ _ACTIVE_INSTANCE = None
 
 
 class VitrineExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.InfoProvider,
-                       Nautilus.ColumnProvider):
+                       Nautilus.ColumnProvider, Nautilus.PropertiesModelProvider):
     def __init__(self) -> None:
         global _ACTIVE_INSTANCE
         super().__init__()
@@ -2447,7 +2976,7 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.InfoProv
         if key == "window_style":
             for ctl in list(self.windows.values()):
                 ctl.apply_window_style()
-        elif key in ("tags_in_sidebar", "image_dimensions"):
+        elif key in ("tags_in_sidebar", "image_dimensions", "path_bar", "status_bar"):
             # Opções da camada Finder: reaplica para valer na hora.
             for ctl in list(self.windows.values()):
                 if ctl.style is not None and ctl.style.active:
@@ -2528,6 +3057,26 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.InfoProv
                             label="Dimensões", description="Largura × altura das imagens"),
         ]
 
+    def get_models(self, files):
+        """Aba "Etiquetas" na janela Propriedades (Ctrl+I), pela API oficial."""
+        if self._inert or not files:
+            return []
+        try:
+            from gi.repository import Gio as _Gio
+            store = _Gio.ListStore.new(Nautilus.PropertiesItem)
+            for f in files:
+                if f.get_uri_scheme() != "file":
+                    continue
+                names = read_tags(uri_to_path(f.get_uri()))
+                label = f.get_name() if len(files) > 1 else "Etiquetas"
+                store.append(Nautilus.PropertiesItem.new(label, ", ".join(names) if names else "Nenhuma"))
+            if store.get_n_items() == 0:
+                return []
+            return [Nautilus.PropertiesModel.new("Etiquetas", store)]
+        except Exception as err:  # noqa: BLE001
+            log(f"propriedades: {err!r}")
+            return []
+
     def _invalidate_files(self, uris) -> None:
         """Etiquetas mudaram: o Nautilus pergunta de novo (emblemas, coluna)."""
         for uri in uris:
@@ -2605,6 +3154,7 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.InfoProv
         add("grid", "Ícones", lambda c: c.user_set_mode("grid", "medium"))
         add("grid-large", "Ícones grandes", lambda c: c.user_set_mode("grid", "extra-large"))
         add("columns", "Colunas", lambda c: c.user_set_mode("columns"))
+        add("gallery", "Galeria", lambda c: c.user_set_mode("gallery"))
 
         if exact and rule:
             if rule.get("recursive"):
@@ -2677,9 +3227,9 @@ def _thousands(n: int) -> str:
 def _open_tag_manager(ctl) -> None:
     from .tagui import open_manager
     open_manager(ctl)
-__VITRINE_ARQUIVO_9__
+__VITRINE_ARQUIVO_10__
 mkdir -p "vitrine"
-cat > 'vitrine/native.py' <<'__VITRINE_ARQUIVO_10__'
+cat > 'vitrine/native.py' <<'__VITRINE_ARQUIVO_11__'
 """Ponte com as partes internas do Nautilus (aba/slot, modo de visualização, seleção).
 
 Regra de ouro: nunca guardar referência forte a widgets ou modelos do Nautilus.
@@ -2934,9 +3484,9 @@ class ModelWatch:
             self._callback(model)
         except Exception as err:  # noqa: BLE001
             log(f"ModelWatch callback: {err}")
-__VITRINE_ARQUIVO_10__
+__VITRINE_ARQUIVO_11__
 mkdir -p "vitrine"
-cat > 'vitrine/preview.py' <<'__VITRINE_ARQUIVO_11__'
+cat > 'vitrine/preview.py' <<'__VITRINE_ARQUIVO_12__'
 """Painel de pré-visualização à direita: imagem, texto, miniatura de vídeo/PDF e informações."""
 
 from __future__ import annotations
@@ -3461,9 +4011,9 @@ class PreviewPane(Gtk.Box):
             self._on_navigate(self._current_uri)
         else:
             util.open_uri(self._current_uri)
-__VITRINE_ARQUIVO_11__
+__VITRINE_ARQUIVO_12__
 mkdir -p "vitrine"
-cat > 'vitrine/selftest.py' <<'__VITRINE_ARQUIVO_12__'
+cat > 'vitrine/selftest.py' <<'__VITRINE_ARQUIVO_13__'
 """Autoteste dentro do Nautilus real. Só roda com VITRINE_SELFTEST=1.
 
 Navega por pastas, troca modos, seleciona arquivos e grava PASSOU/FALHOU no log.
@@ -3976,7 +4526,7 @@ def run(ctl) -> bool:
         views = st.toolbar.view_buttons if st.toolbar else {}
         check("estilo Finder: aplicado na hora (classe, CSS, barra de ferramentas)",
               st.active and ctl.win.has_css_class("vitrine-finder") and finder_mod.css_loaded()
-              and set(views) == {"grid", "list", "columns"},
+              and set(views) == {"grid", "list", "columns", "gallery"},
               finder_mod.describe(ctl.win))
         check("estilo Finder: botões da janela ficam no padrão do GNOME",
               (st.header.get_decoration_layout(),) == style_state["layouts"]
@@ -4074,6 +4624,59 @@ def run(ctl) -> bool:
                 w = w.get_parent()
             log(f"legenda: cor={dims[0].get_color().to_string()} ancestrais={' < '.join(chain[:9])}")
         shot("finder-icones-etiquetas")
+        ctl.user_set_mode("gallery")
+
+    # ── Galeria e barras de baixo ──
+    @step
+    def g1():
+        gal = ctl.gallery
+        heads = [w.get_label() for w in util.walk(gal.strip)
+                 if isinstance(w, Gtk.Label) and "vitrine-gallery-group" in w.get_css_classes()]
+        sel = native.selected_uris(native.find_model(slot()))
+        tb = ctl.style.toolbar
+        check("galeria: abre com a faixa de miniaturas e o grupo Hoje",
+              ctl.content_stack.get_visible_child_name() == "gallery" and len(gal.items) == 2
+              and gal.selected is not None and heads == ["Hoje"],
+              f"página={ctl.content_stack.get_visible_child_name()} itens={len(gal.items)} grupos={heads}")
+        check("galeria: botão Galeria ativo na barra do Finder",
+              tb is not None and tb.view_buttons["gallery"].get_active())
+        check("galeria: seleção vai para a lista nativa (Espaço, Propriedades…)",
+              gal.selected is not None and sel == [gal.selected.uri], f"{sel}")
+        shot("finder-galeria")
+        ctl.cfg.set("path_bar", True)
+        ctl.cfg.set("status_bar", True)
+
+    @step
+    def g2():
+        gal = ctl.gallery
+        first = gal.selected
+        gal.move(+1)
+        sel = native.selected_uris(native.find_model(slot()))
+        check("galeria: setas trocam o item e a seleção nativa",
+              gal.selected is not first and sel == [gal.selected.uri])
+        bar = ctl.style.bottombar
+        crumbs = bar.crumbs(native.slot_uri(slot())) if bar else []
+        check("barra de caminho: hierarquia clicável até a pasta atual",
+              bar is not None and bar.path_scroll.get_visible()
+              and crumbs and crumbs[-1][0] == os.path.basename(tagdir["root"]),
+              str([c[0] for c in crumbs]))
+        bar.update()
+        check("barra de status: itens e espaço disponível",
+              bar.status.get_visible() and bar.status.get_label().startswith("2 itens"),
+              bar.status.get_label())
+        from gi.repository import Nautilus
+        models = ctl.ext.get_models([Nautilus.FileInfo.create_for_uri(tagdir["png"])])
+        item = models[0].get_model().get_item(0) if models else None
+        check("Propriedades (Ctrl+I): aba Etiquetas",
+              item is not None and item.get_value() == "Vermelho",
+              item.get_value() if item else "sem aba")
+
+    @step
+    def g3():
+        shot("finder-galeria-barras")
+        ctl.cfg.set("path_bar", False)
+        ctl.cfg.set("status_bar", False)
+        ctl.user_set_mode("grid", "large")
         ctl.show_tag("Vermelho")
 
     @step
@@ -4127,6 +4730,9 @@ def run(ctl) -> bool:
         ctl.set_preview_visible(bool(saved_settings.get("preview_visible")))
         ctl.ext.refresh_computer_pages()
         ctl.apply_window_style()
+        if ctl.style is not None and ctl.style.active:  # opções do Finder restauradas
+            ctl.style.remove()
+            ctl.style.apply()
         ctl.ext.set_grid_zoom(saved_zoom)
         ok = sum(1 for r in results if r[1])
         log(f"SELFTEST RESUMO: {ok}/{len(results)} passaram")
@@ -4143,9 +4749,9 @@ def run(ctl) -> bool:
 
     GLib.timeout_add(STEP_MS, runner)
     return GLib.SOURCE_REMOVE
-__VITRINE_ARQUIVO_12__
+__VITRINE_ARQUIVO_13__
 mkdir -p "vitrine"
-cat > 'vitrine/tags.py' <<'__VITRINE_ARQUIVO_13__'
+cat > 'vitrine/tags.py' <<'__VITRINE_ARQUIVO_14__'
 """Etiquetas coloridas, guardadas no atributo estendido padrão `user.xdg.tags`.
 
 O atributo guarda os *nomes* das etiquetas separados por vírgula (o mesmo formato do
@@ -4453,9 +5059,9 @@ class TagStore:
 
 def _clean(name: str) -> str:
     return (name or "").replace(",", " ").strip()[:60]
-__VITRINE_ARQUIVO_13__
+__VITRINE_ARQUIVO_14__
 mkdir -p "vitrine"
-cat > 'vitrine/tagui.py' <<'__VITRINE_ARQUIVO_14__'
+cat > 'vitrine/tagui.py' <<'__VITRINE_ARQUIVO_15__'
 """Telas das etiquetas: botão da barra de ferramentas, seção da barra lateral, página
 com os arquivos de uma etiqueta e a tela "Todas as etiquetas…".
 
@@ -4879,9 +5485,9 @@ class TagManager(Adw.Dialog):
         self._build()
         if self.rows:
             self.rows[-1].grab_focus()
-__VITRINE_ARQUIVO_14__
+__VITRINE_ARQUIVO_15__
 mkdir -p "vitrine"
-cat > 'vitrine/util.py' <<'__VITRINE_ARQUIVO_15__'
+cat > 'vitrine/util.py' <<'__VITRINE_ARQUIVO_16__'
 """Utilitários: log, varredura da árvore de widgets e operações de arquivo nativas."""
 
 from __future__ import annotations
@@ -5135,9 +5741,9 @@ def snapshot_png(widget: Gtk.Widget, path: str) -> bool:
         return False
     tex = native.get_renderer().render_texture(node, Graphene.Rect().init(0, 0, w, h))
     return bool(tex.save_to_png(path))
-__VITRINE_ARQUIVO_15__
+__VITRINE_ARQUIVO_16__
 mkdir -p "vitrine"
-cat > 'vitrine/window.py' <<'__VITRINE_ARQUIVO_16__'
+cat > 'vitrine/window.py' <<'__VITRINE_ARQUIVO_17__'
 """Controlador por janela: injeta Colunas + Pré-visualização e aplica as regras por pasta."""
 
 from __future__ import annotations
@@ -5150,6 +5756,7 @@ from . import discovery, native
 from .columns import ColumnStrip
 from .computer import ComputerPage
 from .finder import FinderStyle
+from .gallery import GalleryView
 from .history import History
 from .preview import PreviewPane
 from .tagui import TagPage
@@ -5202,6 +5809,8 @@ class WindowController:
         self._leave_source = 0
         self.style: FinderStyle | None = None
         self.tag_page: TagPage | None = None
+        self.gallery: GalleryView | None = None
+        self.gallery_on = False
         self._tag_visible: str | None = None
         self.tag_sidebar = None  # seção Etiquetas (só no estilo Finder)
 
@@ -5246,6 +5855,8 @@ class WindowController:
         self.content_stack.add_named(self.computer, "computer")
         self.tag_page = TagPage(self)
         self.content_stack.add_named(self.tag_page, "tag")
+        self.gallery = GalleryView(self)
+        self.content_stack.add_named(self.gallery, "gallery")
         self.content_stack.set_visible_child_name("tabs")
         inner.append(self.strip)
         inner.append(self.content_stack)
@@ -5465,7 +6076,7 @@ class WindowController:
         if on == self._computer_visible:
             return
         self._computer_visible = on
-        self.content_stack.set_visible_child_name("computer" if on else "tabs")
+        self.content_stack.set_visible_child_name("computer" if on else self._main_page())
         if on:
             if self.strip is not None:
                 self.strip.set_visible(False)
@@ -5485,7 +6096,7 @@ class WindowController:
                 self.sidebar_list.unselect_all()
             slot = self.active_slot()
             if slot is not None:
-                self._set_columns_visible(getattr(slot, "_vitrine_mode", None) == "columns")
+                self._apply_view(slot)
                 self._sync_active_ui(slot)
 
     def computer_visible(self) -> bool:
@@ -5525,14 +6136,14 @@ class WindowController:
         if self.tag_sidebar is not None:
             self.tag_sidebar.select(None)
         if self.content_stack is not None:
-            self.content_stack.set_visible_child_name("computer" if self._computer_visible else "tabs")
+            self.content_stack.set_visible_child_name("computer" if self._computer_visible else self._main_page())
         if self._computer_visible:
             if self.sidebar_list is not None:
                 self.sidebar_list.select_row(self.sidebar_list.get_row_at_index(0))
         else:
             slot = self.active_slot()
             if slot is not None:
-                self._set_columns_visible(getattr(slot, "_vitrine_mode", None) == "columns")
+                self._apply_view(slot)
                 self._sync_active_ui(slot)
         self._style_sync()
 
@@ -5819,8 +6430,17 @@ class WindowController:
             self.go_history(-1 if keyval == Gdk.KEY_Back else +1)
             return True
         if mods == Gdk.ModifierType.CONTROL_MASK:
-            if keyval in (Gdk.KEY_1, Gdk.KEY_2, Gdk.KEY_3) and self._computer_visible:
+            if keyval in (Gdk.KEY_1, Gdk.KEY_2, Gdk.KEY_3, Gdk.KEY_4) and self._computer_visible:
                 self.show_computer(False)
+            if keyval == Gdk.KEY_4:
+                self.user_set_mode("gallery")
+                return True
+            if keyval in (Gdk.KEY_i, Gdk.KEY_I):
+                # Propriedades (o "Obter informações" do Finder); o Nautilus não tem Ctrl+I.
+                slot = self.active_slot()
+                if slot is not None:
+                    slot.activate_action("view.properties", None)
+                return True
             if keyval == Gdk.KEY_3:
                 self.user_set_mode("columns")
                 return True
@@ -5871,7 +6491,7 @@ class WindowController:
         if self._computer_visible:
             self._display_computer(False)
             return
-        self._set_columns_visible(getattr(slot, "_vitrine_mode", None) == "columns")
+        self._apply_view(slot)
         self._sync_active_ui(slot)
 
     @guarded
@@ -5913,6 +6533,8 @@ class WindowController:
             self.preview.set_folder(uri if regular else None)
             self.preview.show_uris([])
         self._rebind_model_soon()
+        if self.gallery_on and self.gallery is not None and regular:
+            self.gallery.set_folder(uri)
         self._style_sync()
 
     def _rebind_model_soon(self) -> None:
@@ -5949,7 +6571,7 @@ class WindowController:
         mode = native.view_mode(slot) if slot is not None else None
         if mode is None:
             return GLib.SOURCE_REMOVE
-        if self.columns_on and mode == "list":
+        if (self.columns_on or self.gallery_on) and mode == "list":
             return GLib.SOURCE_REMOVE  # coluna usa lista por baixo; nada mudou de fato
         debug(f"usuário trocou a visualização nativa para {mode}")
         self.user_set_mode(mode)
@@ -6002,6 +6624,7 @@ class WindowController:
         if not native.is_regular_location(uri):
             if slot is self.active_slot():
                 self._set_columns_visible(False)
+                self._set_gallery_visible(False)
             return GLib.SOURCE_REMOVE
         rule, _exact = self.cfg.rule_for(uri)
         current = getattr(slot, "_vitrine_mode", None)
@@ -6011,8 +6634,8 @@ class WindowController:
             self.apply_mode(slot, rule.get("mode", "list"), rule.get("zoom"))
         elif manual:
             self.apply_mode(slot, *manual)  # escolha manual vence a descoberta
-        elif current == "columns":
-            self.apply_mode(slot, "columns")  # navegar em colunas continua em colunas
+        elif current in ("columns", "gallery"):
+            self.apply_mode(slot, current)  # navegar em colunas/galeria continua nelas
         elif discover:
             discovery.discover(uri, float(self.cfg.get("auto_media_ratio")),
                                lambda kind: self._apply_discovered(slot, uri, kind))
@@ -6023,13 +6646,14 @@ class WindowController:
         return GLib.SOURCE_REMOVE
 
     def apply_mode(self, slot, mode: str, zoom: str | None = None) -> None:
-        if mode not in ("list", "grid", "columns"):
+        if mode not in ("list", "grid", "columns", "gallery"):
             mode = "list"
         self.ext.suppress()
         slot._vitrine_mode = mode
         if slot is self.active_slot():
             self._set_columns_visible(mode == "columns")
-        native.set_view_mode(slot, "list" if mode == "columns" else mode)
+            self._set_gallery_visible(mode == "gallery")
+        native.set_view_mode(slot, "list" if mode in ("columns", "gallery") else mode)
         if mode == "grid":
             self.ext.set_grid_zoom(zoom or self.cfg.get("default_grid_zoom"))
         # Confere depois que o Nautilus terminar de trocar a visualização.
@@ -6038,7 +6662,7 @@ class WindowController:
     def _verify_mode(self, slot, mode: str) -> bool:
         if getattr(slot, "_vitrine_mode", None) != mode:
             return GLib.SOURCE_REMOVE
-        want = "list" if mode == "columns" else mode
+        want = "list" if mode in ("columns", "gallery") else mode
         if native.view_mode(slot) not in (None, want):
             self.ext.suppress()
             native.set_view_mode(slot, want)
@@ -6125,6 +6749,41 @@ class WindowController:
             self.apply_mode(slot, self.cfg.get("default_mode"))
 
     # ───────────────────────── colunas / painel ─────────────────────────
+    def _apply_view(self, slot) -> None:
+        """Visões da Vitrine por cima da lista nativa: Colunas ou Galeria."""
+        mode = getattr(slot, "_vitrine_mode", None) if slot is not None else None
+        self._set_columns_visible(mode == "columns")
+        self._set_gallery_visible(mode == "gallery")
+
+    def _main_page(self) -> str:
+        return "gallery" if self.gallery_on else "tabs"
+
+    def _set_gallery_visible(self, on: bool) -> None:
+        if self.gallery is None or self.content_stack is None:
+            return
+        slot = self.active_slot()
+        uri = native.slot_uri(slot)
+        if on and not native.is_regular_location(uri):
+            on = False
+        was = self.gallery_on
+        self.gallery_on = on
+        overlay = self._computer_visible or self._tag_visible is not None
+        if on:
+            self.gallery.set_folder(uri)
+            if not overlay:
+                self.content_stack.set_visible_child_name("gallery")
+                self.gallery.grab_focus()
+            # A Galeria tem o próprio painel de informações.
+            if self.preview is not None:
+                self.preview.set_visible(False)
+        else:
+            if self.content_stack.get_visible_child_name() == "gallery":
+                self.content_stack.set_visible_child_name("tabs")
+            if was and self.preview is not None:
+                self.preview.set_visible(bool(self.cfg.get("preview_visible")))
+        if was != on:
+            self._sync_buttons()
+
     def _set_columns_visible(self, on: bool) -> None:
         self.columns_on = on
         if self.strip is not None:
@@ -6203,9 +6862,9 @@ class WindowController:
         if self.strip is not None:
             self.strip.teardown()
         self.ext.forget_window(self.win)
-__VITRINE_ARQUIVO_16__
+__VITRINE_ARQUIVO_17__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/about.css' <<'__VITRINE_ARQUIVO_17__'
+cat > 'vitrine/assets/about.css' <<'__VITRINE_ARQUIVO_18__'
 /* Card principal da página "Sobre" (vitrine/about.py).
    --card-bg-color do libadwaita já é um pouco mais claro que a janela nos dois temas;
    a borda usa o azul da logo. */
@@ -6215,9 +6874,9 @@ cat > 'vitrine/assets/about.css' <<'__VITRINE_ARQUIVO_17__'
   border-radius: 16px;
   padding: 32px 24px 24px 24px;
 }
-__VITRINE_ARQUIVO_17__
+__VITRINE_ARQUIVO_18__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/finder.css' <<'__VITRINE_ARQUIVO_18__'
+cat > 'vitrine/assets/finder.css' <<'__VITRINE_ARQUIVO_19__'
 /* Estilo "Finder (macOS)" da Vitrine.
  *
  * Toda regra começa com window.vitrine-finder: sem essa classe na janela, nada daqui
@@ -6368,9 +7027,23 @@ window.vitrine-finder .nautilus-list-view columnview > listview > row:nth-child(
 
 /* miniaturas da página de etiquetas */
 window.vitrine-finder .vitrine-thumb { border-radius: 8px; }
-__VITRINE_ARQUIVO_18__
+
+/* ── barra de caminho / status (embaixo) ── */
+window.vitrine-finder .vitrine-finder-bottombar {
+  border-top: 1px solid color-mix(in srgb, currentColor 9%, transparent);
+  background-color: var(--view-bg-color);
+}
+window.vitrine-finder .vitrine-finder-pathbar { padding: 2px 8px; }
+window.vitrine-finder .vitrine-finder-pathbar button {
+  min-height: 22px; padding: 0 6px; border-radius: 6px; font-size: 0.9em;
+}
+window.vitrine-finder .vitrine-finder-status {
+  font-size: 0.85em; padding: 3px 0 5px 0;
+  color: color-mix(in srgb, currentColor 55%, transparent);
+}
+__VITRINE_ARQUIVO_19__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/nautilus-vitrine-logo.svg' <<'__VITRINE_ARQUIVO_19__'
+cat > 'vitrine/assets/nautilus-vitrine-logo.svg' <<'__VITRINE_ARQUIVO_20__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
@@ -6391,9 +7064,9 @@ cat > 'vitrine/assets/nautilus-vitrine-logo.svg' <<'__VITRINE_ARQUIVO_19__'
   <path d="M58 98 a18 18 0 0 1 18-18 h30 l14 16 h60 a18 18 0 0 1 18 18 v60 a18 18 0 0 1 -18 18 H76 a18 18 0 0 1 -18-18 Z" fill="none" stroke="url(#glass)" stroke-width="15" stroke-linejoin="round"/>
   <path d="M128 120 Q131.5 136.5 148 140 Q131.5 143.5 128 160 Q124.5 143.5 108 140 Q124.5 136.5 128 120 Z" fill="#ffd166"/>
 </svg>
-__VITRINE_ARQUIVO_19__
+__VITRINE_ARQUIVO_20__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/nautilus-vitrine-mark.svg' <<'__VITRINE_ARQUIVO_20__'
+cat > 'vitrine/assets/nautilus-vitrine-mark.svg' <<'__VITRINE_ARQUIVO_21__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
   <defs>
     <linearGradient id="glass" x1="0" y1="0" x2="1" y2="1">
@@ -6404,9 +7077,9 @@ cat > 'vitrine/assets/nautilus-vitrine-mark.svg' <<'__VITRINE_ARQUIVO_20__'
   <path d="M40 90 a22 22 0 0 1 22-22 h38 l18 20 h76 a22 22 0 0 1 22 22 v74 a22 22 0 0 1 -22 22 H62 a22 22 0 0 1 -22-22 Z" fill="none" stroke="url(#glass)" stroke-width="16" stroke-linejoin="round"/>
   <path d="M128 112 Q132.5 133.5 154 138 Q132.5 142.5 128 164 Q123.5 142.5 102 138 Q123.5 133.5 128 112 Z" fill="#ffd166"/>
 </svg>
-__VITRINE_ARQUIVO_20__
+__VITRINE_ARQUIVO_21__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/nautilus-vitrine-symbolic.svg' <<'__VITRINE_ARQUIVO_21__'
+cat > 'vitrine/assets/nautilus-vitrine-symbolic.svg' <<'__VITRINE_ARQUIVO_22__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Ícones simbólicos do GTK são recoloridos forçando `fill`: por isso o contorno
        da pasta é um caminho preenchido (borda externa menos borda interna, evenodd)
@@ -6414,66 +7087,66 @@ cat > 'vitrine/assets/nautilus-vitrine-symbolic.svg' <<'__VITRINE_ARQUIVO_21__'
   <path fill="currentColor" fill-rule="evenodd" d="M1.2 4.6 A2.2 2.2 0 0 1 3.4 2.4 H6.2 A0.8 0.8 0 0 1 6.807 2.679 L7.768 3.8 H12.6 A2.2 2.2 0 0 1 14.8 6 V12.4 A2.2 2.2 0 0 1 12.6 14.6 H3.4 A2.2 2.2 0 0 1 1.2 12.4 Z M2.8 4.6 A0.6 0.6 0 0 1 3.4 4 H5.832 L6.793 5.121 A0.8 0.8 0 0 0 7.4 5.4 H12.6 A0.6 0.6 0 0 1 13.2 6 V12.4 A0.6 0.6 0 0 1 12.6 13 H3.4 A0.6 0.6 0 0 1 2.8 12.4 Z"/>
   <path fill="currentColor" d="M8 6.1 Q8.35 8.15 10.4 8.5 Q8.35 8.85 8 10.9 Q7.65 8.85 5.6 8.5 Q7.65 8.15 8 6.1 Z"/>
 </svg>
-__VITRINE_ARQUIVO_21__
+__VITRINE_ARQUIVO_22__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/vitrine-tag-blue.svg' <<'__VITRINE_ARQUIVO_22__'
+cat > 'vitrine/assets/vitrine-tag-blue.svg' <<'__VITRINE_ARQUIVO_23__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Emblema da etiqueta "blue" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
   <circle cx="8" cy="8" r="6.5" fill="#0a84ff" stroke="#ffffff" stroke-width="1.5"/>
 </svg>
-__VITRINE_ARQUIVO_22__
+__VITRINE_ARQUIVO_23__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/vitrine-tag-gray.svg' <<'__VITRINE_ARQUIVO_23__'
+cat > 'vitrine/assets/vitrine-tag-gray.svg' <<'__VITRINE_ARQUIVO_24__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Emblema da etiqueta "gray" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
   <circle cx="8" cy="8" r="6.5" fill="#98989d" stroke="#ffffff" stroke-width="1.5"/>
 </svg>
-__VITRINE_ARQUIVO_23__
+__VITRINE_ARQUIVO_24__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/vitrine-tag-green.svg' <<'__VITRINE_ARQUIVO_24__'
+cat > 'vitrine/assets/vitrine-tag-green.svg' <<'__VITRINE_ARQUIVO_25__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Emblema da etiqueta "green" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
   <circle cx="8" cy="8" r="6.5" fill="#30d158" stroke="#ffffff" stroke-width="1.5"/>
 </svg>
-__VITRINE_ARQUIVO_24__
+__VITRINE_ARQUIVO_25__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/vitrine-tag-orange.svg' <<'__VITRINE_ARQUIVO_25__'
+cat > 'vitrine/assets/vitrine-tag-orange.svg' <<'__VITRINE_ARQUIVO_26__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Emblema da etiqueta "orange" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
   <circle cx="8" cy="8" r="6.5" fill="#ff9f0a" stroke="#ffffff" stroke-width="1.5"/>
 </svg>
-__VITRINE_ARQUIVO_25__
+__VITRINE_ARQUIVO_26__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/vitrine-tag-purple.svg' <<'__VITRINE_ARQUIVO_26__'
+cat > 'vitrine/assets/vitrine-tag-purple.svg' <<'__VITRINE_ARQUIVO_27__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Emblema da etiqueta "purple" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
   <circle cx="8" cy="8" r="6.5" fill="#bf5af2" stroke="#ffffff" stroke-width="1.5"/>
 </svg>
-__VITRINE_ARQUIVO_26__
+__VITRINE_ARQUIVO_27__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/vitrine-tag-red.svg' <<'__VITRINE_ARQUIVO_27__'
+cat > 'vitrine/assets/vitrine-tag-red.svg' <<'__VITRINE_ARQUIVO_28__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Emblema da etiqueta "red" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
   <circle cx="8" cy="8" r="6.5" fill="#ff453a" stroke="#ffffff" stroke-width="1.5"/>
 </svg>
-__VITRINE_ARQUIVO_27__
+__VITRINE_ARQUIVO_28__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/vitrine-tag-symbolic.svg' <<'__VITRINE_ARQUIVO_28__'
+cat > 'vitrine/assets/vitrine-tag-symbolic.svg' <<'__VITRINE_ARQUIVO_29__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Etiqueta (botão "Etiquetas" do estilo Finder). Só preenchimento, como todo ícone
        simbólico do GTK: contorno = forma externa menos a interna (evenodd), com o furo. -->
   <path fill="currentColor" fill-rule="evenodd" d="M2.6 1.5 H7.6 a1.5 1.5 0 0 1 1.06 .44 l5.4 5.4 a1.5 1.5 0 0 1 0 2.12 l-4.94 4.94 a1.5 1.5 0 0 1 -2.12 0 l-5.4 -5.4 A1.5 1.5 0 0 1 1.1 7.94 V3 A1.5 1.5 0 0 1 2.6 1.5 Z M2.7 3.1 V7.75 l5.3 5.3 4.95 -4.95 -5.3 -5.3 Z M5 4 a1 1 0 1 1 0 2 a1 1 0 1 1 0 -2 Z"/>
 </svg>
-__VITRINE_ARQUIVO_28__
+__VITRINE_ARQUIVO_29__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/vitrine-tag-yellow.svg' <<'__VITRINE_ARQUIVO_29__'
+cat > 'vitrine/assets/vitrine-tag-yellow.svg' <<'__VITRINE_ARQUIVO_30__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Emblema da etiqueta "yellow" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
   <circle cx="8" cy="8" r="6.5" fill="#ffd60a" stroke="#ffffff" stroke-width="1.5"/>
 </svg>
-__VITRINE_ARQUIVO_29__
+__VITRINE_ARQUIVO_30__
 mkdir -p "vitrine/finder"
-cat > 'vitrine/finder/__init__.py' <<'__VITRINE_ARQUIVO_30__'
+cat > 'vitrine/finder/__init__.py' <<'__VITRINE_ARQUIVO_31__'
 """Estilo "Finder (macOS)": visual e ferramentas inspirados no Finder, por cima do
 Nautilus, e removível a qualquer momento.
 
@@ -6490,10 +7163,11 @@ from __future__ import annotations
 
 import os
 
-from gi.repository import Adw, Gdk, Gio, Gtk
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from ..util import ASSETS, ancestor, find_by_type_name, find_first, gtype_name, log, walk
 from ..tagui import TagSidebar
+from .bottombar import FinderBottomBar
 from .toolbar import FinderToolbar
 
 DIMENSIONS = "vitrine_dimensions"
@@ -6561,6 +7235,7 @@ class FinderStyle:
         self.header: Adw.HeaderBar | None = None
         self.sidebar_header: Adw.HeaderBar | None = None
         self.split: Adw.OverlaySplitView | None = None
+        self.bottombar: FinderBottomBar | None = None
 
     # ── registro de desfeitas ──
     def _later(self, fn) -> None:
@@ -6617,6 +7292,7 @@ class FinderStyle:
             self._tags_section()
             self._toolbar()
             self._captions()
+            self._bottom()
             self.sync()
             log("estilo Finder aplicado")
             return True
@@ -6724,6 +7400,22 @@ class FinderStyle:
         pane.add_bottom_bar(section)
         self._later(lambda: pane.remove(section))
 
+    def _bottom(self) -> None:
+        """Barra de caminho e barra de status embaixo do conteúdo (opcionais)."""
+        content = ancestor(self.ctl.paned, lambda w: isinstance(w, Adw.ToolbarView)) \
+            if self.ctl.paned is not None else None
+        if content is None:
+            return
+        bar = FinderBottomBar(self.ctl)
+        content.add_bottom_bar(bar)
+        self.bottombar = bar
+
+        def undo():
+            content.remove(bar)
+            self.bottombar = None
+
+        self._later(undo)
+
     def _captions(self) -> None:
         """Dimensões das imagens abaixo do nome na visão em grade (como no Finder).
         A legenda é uma preferência do próprio Nautilus: guardamos e devolvemos."""
@@ -6781,6 +7473,10 @@ class FinderStyle:
         """Chamado pelo WindowController quando muda pasta, aba, modo ou Meu computador."""
         if self.active and self.toolbar is not None:
             self.toolbar.sync()
+        if self.active and self.bottombar is not None:
+            self.bottombar.update()
+            # a lista nativa termina de carregar depois: confere a contagem de novo
+            GLib.timeout_add(900, lambda: (self.bottombar and self.bottombar.update(), False)[1])
 
 
 def describe(win) -> str:
@@ -6788,9 +7484,153 @@ def describe(win) -> str:
     return (f"classe={win.has_css_class('vitrine-finder')} css={css_loaded()} "
             f"janela={gtype_name(win)}")
 
-__VITRINE_ARQUIVO_30__
+__VITRINE_ARQUIVO_31__
 mkdir -p "vitrine/finder"
-cat > 'vitrine/finder/toolbar.py' <<'__VITRINE_ARQUIVO_31__'
+cat > 'vitrine/finder/bottombar.py' <<'__VITRINE_ARQUIVO_32__'
+"""Barras de baixo do estilo Finder (opcionais, desligadas de fábrica como no macOS):
+
+  * barra de caminho: a hierarquia da pasta atual, clicável
+    (Pasta pessoal › Projetos › nautilus-vitrine);
+  * barra de status: quantidade de itens e espaço disponível no disco.
+"""
+
+from __future__ import annotations
+
+import gettext
+import os
+
+from gi.repository import Gio, GLib, Gtk, Pango
+
+from .. import native, util
+from ..util import guarded
+
+
+def _root_label() -> str:
+    text = gettext.dgettext("gtk40", "Computer")
+    return "Computador" if text == "Computer" else text
+
+
+class FinderBottomBar(Gtk.Box):
+    def __init__(self, ctl) -> None:
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.add_css_class("vitrine-finder-bottombar")
+        self.ctl = ctl
+        self.path_row = Gtk.Box(spacing=2)
+        self.path_row.add_css_class("vitrine-finder-pathbar")
+        self.path_scroll = Gtk.ScrolledWindow(vscrollbar_policy=Gtk.PolicyType.NEVER,
+                                              hscrollbar_policy=Gtk.PolicyType.EXTERNAL,
+                                              child=self.path_row)
+        self.status = Gtk.Label(ellipsize=Pango.EllipsizeMode.END)
+        self.status.add_css_class("vitrine-finder-status")
+        self.append(self.path_scroll)
+        self.append(self.status)
+        self._cancel = Gio.Cancellable()
+        self._free: str | None = None
+        self._free_for: str | None = None
+        self.apply_settings()
+
+    def apply_settings(self) -> None:
+        cfg = self.ctl.cfg
+        self.path_scroll.set_visible(bool(cfg.get("path_bar")))
+        self.status.set_visible(bool(cfg.get("status_bar")))
+        self.set_visible(bool(cfg.get("path_bar")) or bool(cfg.get("status_bar")))
+
+    # ── atualização ──
+    def update(self) -> None:
+        if not self.get_visible():
+            return
+        slot = self.ctl.active_slot()
+        uri = None if (self.ctl.computer_visible() or self.ctl.tag_visible()) else native.slot_uri(slot)
+        self._path(uri)
+        self._status(uri, slot)
+
+    def _path(self, uri: str | None) -> None:
+        child = self.path_row.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self.path_row.remove(child)
+            child = nxt
+        crumbs = self.crumbs(uri)
+        for i, (label, icon, target) in enumerate(crumbs):
+            if i:
+                sep = Gtk.Image.new_from_icon_name("go-next-symbolic")
+                sep.add_css_class("dim-label")
+                sep.set_pixel_size(10)
+                self.path_row.append(sep)
+            content = Gtk.Box(spacing=4)
+            if icon:
+                content.append(Gtk.Image.new_from_icon_name(icon))
+            content.append(Gtk.Label(label=label))
+            btn = Gtk.Button(child=content)
+            btn.add_css_class("flat")
+            if target:
+                btn.connect("clicked", lambda *_a, t=target: self.ctl.navigate(t))
+            else:
+                btn.set_sensitive(False)
+            self.path_row.append(btn)
+
+    def crumbs(self, uri: str | None) -> list[tuple[str, str | None, str | None]]:
+        """(rótulo, ícone, destino) de cada parte do caminho."""
+        if self.ctl.tag_visible():
+            return [(self.ctl.tag_visible(), "vitrine-tag-symbolic", None)]
+        if self.ctl.computer_visible() or not uri:
+            return [("Meu computador", "computer-symbolic", None)]
+        gfile = Gio.File.new_for_uri(uri)
+        if gfile.get_path() is None:  # Lixeira, Recentes, Rede…
+            title = self.ctl.style.toolbar.title.get_label() if (
+                self.ctl.style and self.ctl.style.toolbar) else uri
+            return [(title, None, None)]
+        home = Gio.File.new_for_path(os.path.expanduser("~"))
+        parts = []
+        f = gfile
+        while f is not None:
+            if f.equal(home):
+                parts.append((gettext.dgettext("nautilus", "Home"), "user-home-symbolic", f.get_uri()))
+                break
+            if f.get_parent() is None:
+                parts.append((_root_label(), "drive-harddisk-symbolic", f.get_uri()))
+                break
+            parts.append((f.get_basename(), None, f.get_uri()))
+            f = f.get_parent()
+        return list(reversed(parts))
+
+    def _status(self, uri: str | None, slot) -> None:
+        if uri is None:
+            self.status.set_label("")
+            return
+        if self.ctl.gallery_on and self.ctl.gallery is not None:
+            count = len(self.ctl.gallery.items)
+        else:
+            model = native.find_model(slot)
+            count = model.get_n_items() if model is not None else 0
+        text = f"{count} {'item' if count == 1 else 'itens'}"
+        if self._free is not None and self._free_for == uri:
+            text += f", {self._free} disponíveis"
+        self.status.set_label(text)
+        if self._free_for != uri:
+            self._query_free(uri)
+
+    def _query_free(self, uri: str) -> None:
+        self._cancel.cancel()
+        self._cancel = Gio.Cancellable()
+        self._free_for = uri
+        self._free = None
+
+        @guarded
+        def done(f, res):
+            try:
+                info = f.query_filesystem_info_finish(res)
+            except GLib.Error:
+                return
+            if info.has_attribute("filesystem::free") and self._free_for == uri:
+                self._free = util.human_size(info.get_attribute_uint64("filesystem::free"))
+                self.update()
+
+        Gio.File.new_for_uri(uri).query_filesystem_info_async(
+            "filesystem::free", GLib.PRIORITY_LOW, self._cancel, done)
+__VITRINE_ARQUIVO_32__
+mkdir -p "vitrine/finder"
+cat > 'vitrine/finder/toolbar.py' <<'__VITRINE_ARQUIVO_33__'
 """Barra de ferramentas do estilo Finder, montada dentro do AdwHeaderBar do Nautilus:
 
     [← | →]  Título da pasta          [▦ ☰ ▥] [⇅ ⌄] [⇪] [⋯] [🔍 Pesquisar]
@@ -6835,6 +7675,7 @@ VIEWS = (
     ("grid", "view-grid-symbolic", lambda: nt("Grid View", "Ícones"), "Ctrl+2"),
     ("list", "view-list-symbolic", lambda: nt("List View", "Lista"), "Ctrl+1"),
     ("columns", "view-dual-symbolic", lambda: "Colunas", "Ctrl+3"),
+    ("gallery", "view-paged-symbolic", lambda: "Galeria", "Ctrl+4"),
 )
 
 
@@ -6919,7 +7760,15 @@ class FinderToolbar:
             item.set_action_and_target_value("view.sort", GLib.Variant("(sb)", (attr, reverse)))
             section.append_item(item)
         menu.append_section("Ordenar por", section)
-        return _capsule(_menu_button("view-sort-descending-symbolic", "Ordenar", menu, arrow=True))
+        from ..gallery import GROUPS
+        groups = Gio.Menu()
+        for value, label in GROUPS:
+            item = Gio.MenuItem.new(label, None)
+            item.set_action_and_target_value("vfinder.group", GLib.Variant("s", value))
+            groups.append_item(item)
+        menu.append_section("Agrupar na Galeria", groups)
+        return _capsule(_menu_button("view-sort-descending-symbolic", "Ordenar e agrupar", menu,
+                                     arrow=True))
 
     def _share(self) -> Gtk.Widget:
         menu = Gio.Menu()
@@ -6979,6 +7828,20 @@ class FinderToolbar:
         preview.connect("activate", lambda a, _p: self.ctl.set_preview_visible(
             not self.ctl.preview.get_visible()))
         self.actions.add_action(preview)
+        group = Gio.SimpleAction.new_stateful(
+            "group", GLib.VariantType.new("s"),
+            GLib.Variant("s", self.ctl.cfg.get("gallery_group_by") or "date"))
+        group.connect("activate", self._on_group)
+        self.actions.add_action(group)
+
+    @guarded
+    def _on_group(self, action, value) -> None:
+        action.set_state(value)
+        self.ctl.cfg.set("gallery_group_by", value.get_string())
+        if self.ctl.gallery is not None:
+            self.ctl.gallery.reload()
+        if not self.ctl.gallery_on:
+            self.ctl.user_set_mode("gallery")  # agrupar só existe na Galeria
 
     def _selection_or_folder(self) -> list[str]:
         slot = self.ctl.active_slot()
@@ -7022,7 +7885,7 @@ class FinderToolbar:
             computer = self.ctl.computer_visible() or bool(self.ctl.tag_visible())
             slot = self.ctl.active_slot()
             # O modo pedido pela Vitrine vale antes do Nautilus terminar de trocar a visão.
-            mode = "columns" if self.ctl.columns_on else (
+            mode = "gallery" if self.ctl.gallery_on else "columns" if self.ctl.columns_on else (
                 getattr(slot, "_vitrine_mode", None) or native.view_mode(slot) if slot else None)
             for name, btn in self.view_buttons.items():
                 btn.set_active(name == mode and not computer)
@@ -7064,9 +7927,9 @@ def _spawn(argv: list[str]) -> None:
         Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE)
     except GLib.Error as err:
         log(f"não foi possível abrir {argv[0]}: {err.message}")
-__VITRINE_ARQUIVO_31__
+__VITRINE_ARQUIVO_33__
 mkdir -p "vitrine/schemas"
-cat > 'vitrine/schemas/io.github.bispov19.NautilusVitrine.gschema.xml' <<'__VITRINE_ARQUIVO_32__'
+cat > 'vitrine/schemas/io.github.bispov19.NautilusVitrine.gschema.xml' <<'__VITRINE_ARQUIVO_34__'
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   Preferências da Vitrine para Nautilus.
@@ -7187,15 +8050,32 @@ cat > 'vitrine/schemas/io.github.bispov19.NautilusVitrine.gschema.xml' <<'__VITR
       <summary>Mostrar as dimensões das imagens abaixo do nome (estilo Finder, visão em grade)</summary>
     </key>
 
+    <key name="gallery-group-by" type="s">
+      <choices>
+        <choice value="none"/><choice value="date"/><choice value="type"/>
+        <choice value="size"/><choice value="tags"/>
+      </choices>
+      <default>'date'</default>
+      <summary>Agrupamento da Galeria</summary>
+    </key>
+    <key name="path-bar" type="b">
+      <default>false</default>
+      <summary>Barra de caminho embaixo (estilo Finder)</summary>
+    </key>
+    <key name="status-bar" type="b">
+      <default>false</default>
+      <summary>Barra de status embaixo (estilo Finder)</summary>
+    </key>
+
     <key name="json-migrated" type="b">
       <default>false</default>
       <summary>As preferências antigas (settings.json) já foram importadas</summary>
     </key>
   </schema>
 </schemalist>
-__VITRINE_ARQUIVO_32__
+__VITRINE_ARQUIVO_34__
 mkdir -p "tools"
-cat > 'tools/smoke_test.py' <<'__VITRINE_ARQUIVO_33__'
+cat > 'tools/smoke_test.py' <<'__VITRINE_ARQUIVO_35__'
 """Teste rápido FORA do Nautilus: abre as colunas e o painel de preview numa janela
 própria e salva uma captura em PNG; monta a página "Sobre" nos temas claro e escuro
 (saida-sobre-claro.png / saida-sobre-escuro.png) e confere se a versão do .spec é a
@@ -7331,9 +8211,9 @@ app.run([])
 if failures:
     print("FALHAS:", failures)
     sys.exit(1)
-__VITRINE_ARQUIVO_33__
+__VITRINE_ARQUIVO_35__
 mkdir -p "tools"
-cat > 'tools/test_history.py' <<'__VITRINE_ARQUIVO_34__'
+cat > 'tools/test_history.py' <<'__VITRINE_ARQUIVO_36__'
 """Testes do histórico de Voltar/Avançar com o Meu computador (sem GTK, sem Nautilus).
 
     python3 tools/test_history.py
@@ -7536,9 +8416,9 @@ def run() -> bool:
 
 if __name__ == "__main__":
     sys.exit(0 if run() else 1)
-__VITRINE_ARQUIVO_34__
+__VITRINE_ARQUIVO_36__
 mkdir -p "tools"
-cat > 'tools/test_config.py' <<'__VITRINE_ARQUIVO_35__'
+cat > 'tools/test_config.py' <<'__VITRINE_ARQUIVO_37__'
 """Testes das preferências em GSettings (sem tocar nas suas preferências reais).
 
     python3 tools/test_config.py
@@ -7632,9 +8512,9 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-__VITRINE_ARQUIVO_35__
+__VITRINE_ARQUIVO_37__
 mkdir -p "tools"
-cat > 'tools/test_tags.py' <<'__VITRINE_ARQUIVO_36__'
+cat > 'tools/test_tags.py' <<'__VITRINE_ARQUIVO_38__'
 """Testes das etiquetas (user.xdg.tags) em arquivos temporários.
 
     python3 tools/test_tags.py
@@ -7738,9 +8618,56 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-__VITRINE_ARQUIVO_36__
+__VITRINE_ARQUIVO_38__
 mkdir -p "tools"
-cat > 'tools/build_bootstrap.py' <<'__VITRINE_ARQUIVO_37__'
+cat > 'tools/test_gallery.py' <<'__VITRINE_ARQUIVO_39__'
+"""Testes dos grupos da Galeria (sem Nautilus).
+
+    python3 tools/test_gallery.py
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import GLib  # noqa: E402
+
+from vitrine.gallery import date_bucket  # noqa: E402
+
+results = []
+
+
+def check(name, got, want):
+    ok = got == want
+    results.append(ok)
+    print(f"{'PASSOU' if ok else 'FALHOU'}: {name}" + ("" if ok else f"  (veio {got!r}, esperado {want!r})"))
+
+
+def at(y, m, d, h=12):
+    return GLib.DateTime.new_local(y, m, d, h, 0, 0).to_unix()
+
+
+now = at(2026, 11, 24, 15)
+check("hoje", date_bucket(at(2026, 11, 24, 0) + 60, now)[1], "Hoje")
+check("ontem (mesmo perto da meia-noite)", date_bucket(at(2026, 11, 23, 23), now)[1], "Ontem")
+check("últimos 7 dias", date_bucket(at(2026, 11, 19), now)[1], "Últimos 7 dias")
+check("últimos 30 dias", date_bucket(at(2026, 11, 2), now)[1], "Últimos 30 dias")
+check("mês do ano atual", date_bucket(at(2026, 3, 10), now)[1], "Março")
+check("ano anterior", date_bucket(at(2024, 12, 31), now)[1], "2024")
+order = [date_bucket(t, now)[0] for t in (now, at(2026, 11, 23), at(2026, 11, 19), at(2026, 11, 2),
+                                          at(2026, 9, 1), at(2026, 3, 1), at(2025, 6, 1), at(2023, 1, 1))]
+check("grupos do mais novo para o mais antigo", order, sorted(order))
+print(f"\n{sum(results)}/{len(results)} verificações passaram")
+sys.exit(0 if all(results) else 1)
+__VITRINE_ARQUIVO_39__
+mkdir -p "tools"
+cat > 'tools/build_bootstrap.py' <<'__VITRINE_ARQUIVO_40__'
 """Gera `criar-vitrine.sh`: um único script bash que recria o projeto inteiro
 (todos os arquivos) numa pasta e, se você quiser, já instala no Nautilus.
 
@@ -7759,6 +8686,7 @@ INCLUDE = [
     "tools/test_history.py",
     "tools/test_config.py",
     "tools/test_tags.py",
+    "tools/test_gallery.py",
     "tools/build_bootstrap.py",
     "install.sh",
     "uninstall.sh",
@@ -7858,8 +8786,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-__VITRINE_ARQUIVO_37__
-cat > 'install.sh' <<'__VITRINE_ARQUIVO_38__'
+__VITRINE_ARQUIVO_40__
+cat > 'install.sh' <<'__VITRINE_ARQUIVO_41__'
 #!/usr/bin/env bash
 # Instala a Vitrine para o seu usuário (não precisa de root, exceto para o nautilus-python).
 #
@@ -7925,8 +8853,8 @@ if [[ "$RESTART" == 1 ]]; then
   (setsid nautilus >/dev/null 2>&1 &)
 fi
 echo "Pronto. Log: ${XDG_CACHE_HOME:-$HOME/.cache}/nautilus-vitrine/vitrine.log"
-__VITRINE_ARQUIVO_38__
-cat > 'uninstall.sh' <<'__VITRINE_ARQUIVO_39__'
+__VITRINE_ARQUIVO_41__
+cat > 'uninstall.sh' <<'__VITRINE_ARQUIVO_42__'
 #!/usr/bin/env bash
 # Remove a Vitrine. Suas regras por pasta ficam em ~/.config/nautilus-vitrine
 # (use --purge para apagá-las também).
@@ -7938,15 +8866,15 @@ if [[ "${1:-}" == "--purge" ]]; then
 fi
 nautilus -q 2>/dev/null || true
 echo "Vitrine removida. Abra o Arquivos de novo para voltar ao Nautilus original."
-__VITRINE_ARQUIVO_39__
+__VITRINE_ARQUIVO_42__
 mkdir -p ".vscode"
-cat > '.vscode/extensions.json' <<'__VITRINE_ARQUIVO_40__'
+cat > '.vscode/extensions.json' <<'__VITRINE_ARQUIVO_43__'
 {
   "recommendations": ["ms-python.python", "ms-python.vscode-pylance"]
 }
-__VITRINE_ARQUIVO_40__
+__VITRINE_ARQUIVO_43__
 mkdir -p ".vscode"
-cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_41__'
+cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_44__'
 {
   "python.defaultInterpreterPath": "/usr/bin/python3",
   "python.analysis.extraPaths": ["${workspaceFolder}"],
@@ -7954,9 +8882,9 @@ cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_41__'
   "editor.rulers": [100],
   "[python]": { "editor.tabSize": 4 }
 }
-__VITRINE_ARQUIVO_41__
+__VITRINE_ARQUIVO_44__
 mkdir -p ".vscode"
-cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_42__'
+cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_45__'
 {
   // Ctrl+Shift+P → "Tasks: Run Task" para ver estas tarefas.
   // Ctrl+Shift+B roda a tarefa padrão (instalar em modo dev + reiniciar o Nautilus).
@@ -8027,8 +8955,8 @@ cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_42__'
     }
   ]
 }
-__VITRINE_ARQUIVO_42__
-cat > 'README.md' <<'__VITRINE_ARQUIVO_43__'
+__VITRINE_ARQUIVO_45__
+cat > 'README.md' <<'__VITRINE_ARQUIVO_46__'
 <p align="center">
   <img src="vitrine/assets/nautilus-vitrine-logo.svg" width="96" alt="Logo da Vitrine para Nautilus">
 </p>
@@ -8065,14 +8993,24 @@ A diferença em relação a outras soluções é o **modo híbrido**. A pasta at
 
 O estilo **Finder** vem ligado de fábrica. Troque em **☰ da linha Meu computador → Personalizar → Estilo da janela**; vale na hora, em todas as janelas.
 
-- Barra de ferramentas: **← →** numa cápsula e o **nome da pasta** em negrito; à direita, **Visão em grade / Visão em lista / Colunas**, **Ordenar** (A-Z, Z-A, última e primeira modificação, tamanho, tipo), **Compartilhar** (copiar local, enviar por e-mail, Bluetooth, compartilhamento na rede), **⋯** (nova pasta, documento vazio, propriedades, renomear, comprimir, copiar, colar, mover para a lixeira, arquivos ocultos, painel de pré-visualização, pesquisar em todos os lugares) e **Pesquisar**.
+- Barra de ferramentas: **← →** numa cápsula e o **nome da pasta** em negrito; à direita, **Visão em grade / Visão em lista / Colunas / Galeria**, **Ordenar e agrupar** (A-Z, Z-A, última e primeira modificação, tamanho, tipo; agrupar na Galeria), **Etiquetas**, **Compartilhar** (copiar local, enviar por e-mail, Bluetooth, compartilhamento na rede), **⋯** (nova pasta, documento vazio, propriedades, renomear, comprimir, copiar, colar, mover para a lixeira, arquivos ocultos, painel de pré-visualização, pesquisar em todos os lugares) e **Pesquisar**.
 - A barra de caminho aparece ao editar o local (**Ctrl+L**) ou ao pesquisar.
+- Opcionais (em *Personalizar → Estilo Finder*): **barra de caminho** embaixo, clicável, e **barra de status** com a quantidade de itens e o espaço disponível.
 - Barra lateral com ícones na cor de destaque do sistema e seleção cinza arredondada.
 - Os nomes seguem os do GNOME (a Vitrine usa a tradução do próprio Nautilus). Os botões de fechar, minimizar e maximizar ficam no padrão do GNOME.
 - **Visão em grade:** dimensões das imagens (ex.: *1.066 × 1.599*) em azul abaixo do nome, seleção cinza arredondada. O nome longo já é truncado no meio pelo próprio Nautilus.
 - **Visão em lista:** linhas alternadas suaves.
 - **Nautilus padrão** remove tudo o que o estilo Finder acrescentou (CSS, botões, sinais). Colunas, pré-visualização e Meu computador continuam conforme as suas opções.
 
+
+### 🖼️ Galeria
+
+Ative com **Ctrl+4**, com o botão da Galeria (estilo Finder) ou em **Visualização desta pasta → Galeria**.
+
+- Imagem grande do item selecionado, faixa de miniaturas rolável embaixo e painel com nome, tipo, tamanho, dimensões, datas e etiquetas.
+- **Agrupar** a faixa por data de modificação (*Hoje, Ontem, Últimos 7 dias, Últimos 30 dias*, meses e anos), tipo, tamanho ou etiqueta, pelo menu *Ordenar e agrupar*.
+- Setas navegam; **Enter** abre; **Espaço** abre a visualização rápida. A seleção vai para a lista nativa do Nautilus, então Propriedades, Renomear, Comprimir e Mover para a lixeira (clique direito ou menu ⋯) agem no item da Galeria.
+- A escolha da Galeria é lembrada por pasta, como as outras visualizações.
 
 ### 🗂️ Modo Colunas
 
@@ -8229,6 +9167,8 @@ O Nautilus volta exatamente ao original. Suas regras ficam guardadas; use `./uni
 | Atalho | Ação |
 |---|---|
 | **Ctrl+3** | Modo Colunas |
+| **Ctrl+4** | Galeria |
+| **Ctrl+I** | Propriedades (com a aba Etiquetas) |
 | **Ctrl+1** / **Ctrl+2** | Lista / Ícones (nativos do Nautilus, agora lembrados por pasta) |
 | **Ctrl+Shift+P** | Mostrar/ocultar a pré-visualização |
 | **Ctrl+Shift+C** | Abrir/fechar o Meu computador |
@@ -8274,6 +9214,12 @@ Na primeira execução da versão com GSettings, o antigo `settings.json` é imp
 | `computer_sections` | `{}` | Seções desligadas, ex.: `{"network": false}` (`places`, `devices`, `network`, `disks_button`) |
 | `computer_hidden` | `[]` | Itens ocultos: URIs de locais (`"trash:///"`) ou chaves de dispositivos |
 | `notify_new_devices` | `true` | Avisar quando um pen drive, HD externo ou cartão for conectado |
+| `tags` | 6 cores | Etiquetas: lista de (nome, cor); cores `red`, `orange`, `yellow`, `green`, `blue`, `purple`, `gray` |
+| `tags_in_sidebar` | `true` | Seção Etiquetas na barra lateral (estilo Finder) |
+| `image_dimensions` | `true` | Dimensões das imagens abaixo do nome na grade (estilo Finder) |
+| `gallery_group_by` | `"date"` | Agrupamento da Galeria: `none`, `date`, `type`, `size`, `tags` |
+| `path_bar` | `false` | Barra de caminho embaixo (estilo Finder) |
+| `status_bar` | `false` | Barra de status embaixo (estilo Finder) |
 
 **`~/.config/nautilus-vitrine/folders.json`** guarda as regras por pasta:
 
@@ -8312,9 +9258,10 @@ vitrine/
   imageload.py          carregamento rápido de imagens, cache e pré-carregamento
   computer.py           página Meu computador e monitor de dispositivos
   config.py             preferências (GSettings) e regras por pasta (JSON)
-  finder/               estilo Finder: aplica e remove a camada visual
+  finder/               estilo Finder: aplica e remove a camada visual (barra de ferramentas, barras de baixo)
   schemas/              schema GSettings da Vitrine
   tags.py               etiquetas (user.xdg.tags) e índice dos arquivos etiquetados
+  gallery.py            visualização em Galeria (Ctrl+4)
   tagui.py              telas das etiquetas (barra, barra lateral, página, Todas as etiquetas…)
   history.py            Voltar/Avançar por aba incluindo o Meu computador (sem GTK)
   about.py              página "Sobre" do diálogo de personalização
@@ -8327,6 +9274,7 @@ tools/
   test_history.py       testes do histórico de Voltar/Avançar
   test_config.py        testes das preferências (GSettings)
   test_tags.py          testes das etiquetas
+  test_gallery.py       testes dos grupos de data da Galeria
   build_bootstrap.py    gera o criar-vitrine.sh
 packaging/
   nautilus-vitrine.spec receita do pacote RPM
@@ -8409,6 +9357,10 @@ Para lançar uma versão nova: aumente `Version` e acrescente uma entrada no `%c
 - A coluna **Etiquetas** não é ligada automaticamente: mudar as colunas padrão com a janela aberta derruba o Nautilus 51.1. Ligue em *Colunas visíveis*.
 - O menu de clique direito das extensões só aceita texto: as etiquetas aparecem num submenu (com 🔴🟠🟡…), não como a linha de bolinhas do macOS.
 - Sem desfoque de fundo ("vidro"): o GNOME não desfoca janelas de aplicativos.
+- Agrupar com cabeçalhos ("Hoje", "Ontem"…) só existe na Galeria: a grade nativa do Nautilus não aceita cabeçalhos.
+- A barra lateral nativa não tem seções recolhíveis; só a seção Etiquetas da Vitrine recolhe.
+- Compartilhar usa e-mail, Bluetooth e o compartilhamento na rede do GNOME: o GNOME não tem um portal de compartilhamento como o do macOS.
+- "Duplicar" não existe no GNOME e ficou de fora; "Obter informações" é **Propriedades** (Ctrl+I).
 - O menu de histórico do botão ← (clique direito ou toque longo) é do Nautilus e não lista o Meu computador. Escolher um item ali funciona; a Vitrine se realinha sozinha.
 
 ## Próximos passos
@@ -8420,6 +9372,9 @@ Para lançar uma versão nova: aumente `Version` e acrescente uma entrada no `%c
 - [ ] Dados EXIF da foto (câmera, lente, GPS)
 - [x] Tela de personalização do Meu computador
 - [ ] Tela de preferências geral (colunas, preview, regras por pasta)
+- [x] Estilo Finder, etiquetas coloridas e Galeria
+- [ ] Pastas inteligentes / pesquisas salvas na barra lateral
+- [ ] Agrupar com cabeçalhos também na visão em grade (precisa de suporte do Nautilus)
 
 Sugestões e *pull requests* são bem-vindos.
 
@@ -8430,8 +9385,8 @@ A técnica de injeção na janela foi inspirada no projeto **[My Computer for Na
 ## Licença
 
 [MIT](LICENSE)
-__VITRINE_ARQUIVO_43__
-cat > 'LICENSE' <<'__VITRINE_ARQUIVO_44__'
+__VITRINE_ARQUIVO_46__
+cat > 'LICENSE' <<'__VITRINE_ARQUIVO_47__'
 MIT License
 
 Copyright (c) 2026 Vitrine para Nautilus contributors
@@ -8457,16 +9412,16 @@ SOFTWARE.
 ---
 Inspired by "My Computer for Nautilus" (https://github.com/yannmasoch/nautilus-my-computer),
 Copyright (c) 2026 Yann Masoch, MIT License.
-__VITRINE_ARQUIVO_44__
-cat > '.gitignore' <<'__VITRINE_ARQUIVO_45__'
+__VITRINE_ARQUIVO_47__
+cat > '.gitignore' <<'__VITRINE_ARQUIVO_48__'
 __pycache__/
 *.pyc
 *.tmp
 dist/
 dist-build.log
 gschemas.compiled
-__VITRINE_ARQUIVO_45__
-cat > 'Makefile' <<'__VITRINE_ARQUIVO_46__'
+__VITRINE_ARQUIVO_48__
+cat > 'Makefile' <<'__VITRINE_ARQUIVO_49__'
 # Empacotamento local.  Requer: sudo dnf install make rpm-build python3-devel
 #
 #   make rpm        gera o RPM em dist/
@@ -8500,15 +9455,15 @@ install-rpm:
 
 clean:
 	rm -rf $(DIST)
-__VITRINE_ARQUIVO_46__
+__VITRINE_ARQUIVO_49__
 mkdir -p "packaging"
-cat > 'packaging/nautilus-vitrine.spec' <<'__VITRINE_ARQUIVO_47__'
+cat > 'packaging/nautilus-vitrine.spec' <<'__VITRINE_ARQUIVO_50__'
 %global extdir %{_datadir}/nautilus-python/extensions
 
 Name:           nautilus-vitrine
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
-Summary:        Column view, preview pane and per-folder views for GNOME Files (Nautilus)
+Summary:        Finder-style look, column and gallery views, tags and preview pane for GNOME Files
 
 License:        MIT
 URL:            https://github.com/bispov19/nautilus-vitrine
@@ -8561,6 +9516,13 @@ glib-compile-schemas --strict %{buildroot}%{extdir}/vitrine/schemas
 %{extdir}/vitrine/
 
 %changelog
+* Tue Nov 24 2026 Vinicius Bispo - 0.4.0-1
+- Estilo Finder (padrão) com volta ao Nautilus padrão; preferências em GSettings
+- Etiquetas coloridas (user.xdg.tags): menu, barra, barra lateral, Propriedades
+- Galeria (Ctrl+4) com agrupamento por data, tipo, tamanho e etiqueta
+- Dimensões das imagens na grade, barra de caminho e barra de status opcionais
+- Ctrl+I abre Propriedades
+
 * Sun Nov 22 2026 Vinicius Bispo - 0.3.0-1
 - Voltar/Avançar levam de volta ao Meu computador (histórico próprio por aba)
 - Menu ☰ na linha "Meu computador" da barra lateral (Personalizar e Sobre)
@@ -8575,9 +9537,9 @@ glib-compile-schemas --strict %{buildroot}%{extdir}/vitrine/schemas
 
 * Wed Nov 11 2026 Vinicius Bispo - 0.1.0-1
 - Primeira versão: modo Colunas, painel de pré-visualização e visualização por pasta
-__VITRINE_ARQUIVO_47__
+__VITRINE_ARQUIVO_50__
 mkdir -p ".copr"
-cat > '.copr/Makefile' <<'__VITRINE_ARQUIVO_48__'
+cat > '.copr/Makefile' <<'__VITRINE_ARQUIVO_51__'
 # Usado pelo COPR (método "make srpm"): gera o SRPM direto do repositório git.
 # O COPR chama:  make -f .copr/Makefile srpm outdir=<pasta> spec=<arquivo .spec>
 SPEC := packaging/nautilus-vitrine.spec
@@ -8592,7 +9554,7 @@ srpm:
 	rpmbuild -bs $(SPEC) \
 		--define "_sourcedir $(outdir)" \
 		--define "_srcrpmdir $(outdir)"
-__VITRINE_ARQUIVO_48__
+__VITRINE_ARQUIVO_51__
 
 chmod +x install.sh uninstall.sh
 echo "Projeto criado em $TARGET"

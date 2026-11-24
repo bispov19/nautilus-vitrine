@@ -510,7 +510,7 @@ def run(ctl) -> bool:
         views = st.toolbar.view_buttons if st.toolbar else {}
         check("estilo Finder: aplicado na hora (classe, CSS, barra de ferramentas)",
               st.active and ctl.win.has_css_class("vitrine-finder") and finder_mod.css_loaded()
-              and set(views) == {"grid", "list", "columns"},
+              and set(views) == {"grid", "list", "columns", "gallery"},
               finder_mod.describe(ctl.win))
         check("estilo Finder: botões da janela ficam no padrão do GNOME",
               (st.header.get_decoration_layout(),) == style_state["layouts"]
@@ -608,6 +608,59 @@ def run(ctl) -> bool:
                 w = w.get_parent()
             log(f"legenda: cor={dims[0].get_color().to_string()} ancestrais={' < '.join(chain[:9])}")
         shot("finder-icones-etiquetas")
+        ctl.user_set_mode("gallery")
+
+    # ── Galeria e barras de baixo ──
+    @step
+    def g1():
+        gal = ctl.gallery
+        heads = [w.get_label() for w in util.walk(gal.strip)
+                 if isinstance(w, Gtk.Label) and "vitrine-gallery-group" in w.get_css_classes()]
+        sel = native.selected_uris(native.find_model(slot()))
+        tb = ctl.style.toolbar
+        check("galeria: abre com a faixa de miniaturas e o grupo Hoje",
+              ctl.content_stack.get_visible_child_name() == "gallery" and len(gal.items) == 2
+              and gal.selected is not None and heads == ["Hoje"],
+              f"página={ctl.content_stack.get_visible_child_name()} itens={len(gal.items)} grupos={heads}")
+        check("galeria: botão Galeria ativo na barra do Finder",
+              tb is not None and tb.view_buttons["gallery"].get_active())
+        check("galeria: seleção vai para a lista nativa (Espaço, Propriedades…)",
+              gal.selected is not None and sel == [gal.selected.uri], f"{sel}")
+        shot("finder-galeria")
+        ctl.cfg.set("path_bar", True)
+        ctl.cfg.set("status_bar", True)
+
+    @step
+    def g2():
+        gal = ctl.gallery
+        first = gal.selected
+        gal.move(+1)
+        sel = native.selected_uris(native.find_model(slot()))
+        check("galeria: setas trocam o item e a seleção nativa",
+              gal.selected is not first and sel == [gal.selected.uri])
+        bar = ctl.style.bottombar
+        crumbs = bar.crumbs(native.slot_uri(slot())) if bar else []
+        check("barra de caminho: hierarquia clicável até a pasta atual",
+              bar is not None and bar.path_scroll.get_visible()
+              and crumbs and crumbs[-1][0] == os.path.basename(tagdir["root"]),
+              str([c[0] for c in crumbs]))
+        bar.update()
+        check("barra de status: itens e espaço disponível",
+              bar.status.get_visible() and bar.status.get_label().startswith("2 itens"),
+              bar.status.get_label())
+        from gi.repository import Nautilus
+        models = ctl.ext.get_models([Nautilus.FileInfo.create_for_uri(tagdir["png"])])
+        item = models[0].get_model().get_item(0) if models else None
+        check("Propriedades (Ctrl+I): aba Etiquetas",
+              item is not None and item.get_value() == "Vermelho",
+              item.get_value() if item else "sem aba")
+
+    @step
+    def g3():
+        shot("finder-galeria-barras")
+        ctl.cfg.set("path_bar", False)
+        ctl.cfg.set("status_bar", False)
+        ctl.user_set_mode("grid", "large")
         ctl.show_tag("Vermelho")
 
     @step
@@ -661,6 +714,9 @@ def run(ctl) -> bool:
         ctl.set_preview_visible(bool(saved_settings.get("preview_visible")))
         ctl.ext.refresh_computer_pages()
         ctl.apply_window_style()
+        if ctl.style is not None and ctl.style.active:  # opções do Finder restauradas
+            ctl.style.remove()
+            ctl.style.apply()
         ctl.ext.set_grid_zoom(saved_zoom)
         ok = sum(1 for r in results if r[1])
         log(f"SELFTEST RESUMO: {ok}/{len(results)} passaram")

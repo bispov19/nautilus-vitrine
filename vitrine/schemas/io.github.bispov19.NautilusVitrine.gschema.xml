@@ -118,6 +118,23 @@
       <summary>Mostrar as dimensões das imagens abaixo do nome (estilo Finder, visão em grade)</summary>
     </key>
 
+    <key name="gallery-group-by" type="s">
+      <choices>
+        <choice value="none"/><choice value="date"/><choice value="type"/>
+        <choice value="size"/><choice value="tags"/>
+      </choices>
+      <default>'date'</default>
+      <summary>Agrupamento da Galeria</summary>
+    </key>
+    <key name="path-bar" type="b">
+      <default>false</default>
+      <summary>Barra de caminho embaixo (estilo Finder)</summary>
+    </key>
+    <key name="status-bar" type="b">
+      <default>false</default>
+      <summary>Barra de status embaixo (estilo Finder)</summary>
+    </key>
+
     <key name="json-migrated" type="b">
       <default>false</default>
       <summary>As preferências antigas (settings.json) já foram importadas</summary>

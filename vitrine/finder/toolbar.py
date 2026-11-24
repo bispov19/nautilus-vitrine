@@ -42,6 +42,7 @@ VIEWS = (
     ("grid", "view-grid-symbolic", lambda: nt("Grid View", "Ícones"), "Ctrl+2"),
     ("list", "view-list-symbolic", lambda: nt("List View", "Lista"), "Ctrl+1"),
     ("columns", "view-dual-symbolic", lambda: "Colunas", "Ctrl+3"),
+    ("gallery", "view-paged-symbolic", lambda: "Galeria", "Ctrl+4"),
 )
 
 
@@ -126,7 +127,15 @@ class FinderToolbar:
             item.set_action_and_target_value("view.sort", GLib.Variant("(sb)", (attr, reverse)))
             section.append_item(item)
         menu.append_section("Ordenar por", section)
-        return _capsule(_menu_button("view-sort-descending-symbolic", "Ordenar", menu, arrow=True))
+        from ..gallery import GROUPS
+        groups = Gio.Menu()
+        for value, label in GROUPS:
+            item = Gio.MenuItem.new(label, None)
+            item.set_action_and_target_value("vfinder.group", GLib.Variant("s", value))
+            groups.append_item(item)
+        menu.append_section("Agrupar na Galeria", groups)
+        return _capsule(_menu_button("view-sort-descending-symbolic", "Ordenar e agrupar", menu,
+                                     arrow=True))
 
     def _share(self) -> Gtk.Widget:
         menu = Gio.Menu()
@@ -186,6 +195,20 @@ class FinderToolbar:
         preview.connect("activate", lambda a, _p: self.ctl.set_preview_visible(
             not self.ctl.preview.get_visible()))
         self.actions.add_action(preview)
+        group = Gio.SimpleAction.new_stateful(
+            "group", GLib.VariantType.new("s"),
+            GLib.Variant("s", self.ctl.cfg.get("gallery_group_by") or "date"))
+        group.connect("activate", self._on_group)
+        self.actions.add_action(group)
+
+    @guarded
+    def _on_group(self, action, value) -> None:
+        action.set_state(value)
+        self.ctl.cfg.set("gallery_group_by", value.get_string())
+        if self.ctl.gallery is not None:
+            self.ctl.gallery.reload()
+        if not self.ctl.gallery_on:
+            self.ctl.user_set_mode("gallery")  # agrupar só existe na Galeria
 
     def _selection_or_folder(self) -> list[str]:
         slot = self.ctl.active_slot()
@@ -229,7 +252,7 @@ class FinderToolbar:
             computer = self.ctl.computer_visible() or bool(self.ctl.tag_visible())
             slot = self.ctl.active_slot()
             # O modo pedido pela Vitrine vale antes do Nautilus terminar de trocar a visão.
-            mode = "columns" if self.ctl.columns_on else (
+            mode = "gallery" if self.ctl.gallery_on else "columns" if self.ctl.columns_on else (
                 getattr(slot, "_vitrine_mode", None) or native.view_mode(slot) if slot else None)
             for name, btn in self.view_buttons.items():
                 btn.set_active(name == mode and not computer)
