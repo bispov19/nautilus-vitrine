@@ -314,10 +314,20 @@ class FinderStyle:
 
         self.toolbar = FinderToolbar(self.ctl, switcher)
         self.toolbar.attach(header, self._later)
+        # Barra compacta em janela estreita: confere a largura a cada quadro (só compara
+        # um número; o callback sai junto com a camada Finder).
+        tick = header.add_tick_callback(self._on_tick)
+        self._later(lambda: header.remove_tick_callback(tick))
+        self._later(lambda: self.win.remove_css_class("vitrine-compact"))
         if switcher is not None:
             self._connect(switcher, "notify::visible-child-name",
                           lambda *_a: self.toolbar and self.toolbar.sync_title())
             self._later(lambda s=switcher: s.set_visible(True))
+
+    def _on_tick(self, _widget, _clock) -> bool:
+        if self.toolbar is not None:
+            self.toolbar.set_compact(self.win.get_width() < self.toolbar.COMPACT_BELOW)
+        return True
 
     # ── estado ──
     def sync(self) -> None:

@@ -7,7 +7,7 @@ import os
 import socket
 import time
 
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
 
 from . import native, util
 from .about import build_about_page
@@ -746,6 +746,16 @@ class ComputerPage(Gtk.ScrolledWindow):
                "Fotos e vídeos em ícones extra grandes, documentos em lista. "
                "Escolhas feitas à mão numa pasta têm prioridade",
                bool(cfg.get("folder_discovery")), lambda v: cfg.set("folder_discovery", v))
+        prio = switch(views, "Priorizar nomes no modo coluna",
+                      "O nome fica sempre legível: Tamanho e Modificado, colunas anteriores "
+                      "e o painel de pré-visualização cedem espaço",
+                      bool(cfg.get("columns_prioritize_names")),
+                      lambda v: cfg.set("columns_prioritize_names", v))
+        auto = switch(views, "Recolher painel de pré-visualização automaticamente quando faltar espaço",
+                      "Só enquanto faltar espaço; a sua opção do painel não muda",
+                      bool(cfg.get("columns_auto_preview")),
+                      lambda v: cfg.set("columns_auto_preview", v))
+        prio.bind_property("active", auto, "sensitive", GObject.BindingFlags.SYNC_CREATE)
         page.add(views)
 
         sections =Adw.PreferencesGroup(title="Seções",

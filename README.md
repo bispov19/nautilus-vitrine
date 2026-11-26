@@ -62,6 +62,7 @@ Ative com **Ctrl+4**, com o botão da Galeria (estilo Finder) ou em **Visualiza�
 - **Arraste e solte** entre colunas, da coluna para a lista e da lista para a coluna. Mover e copiar usam as operações do próprio Nautilus, com barra de progresso, diálogo de conflito e **Ctrl+Z**.
 - Clique do meio numa pasta abre em nova janela. O clique direito traz Abrir, Abrir em nova janela, Mostrar na lista, Copiar caminho e Mover para a lixeira.
 - Respeita a opção de **mostrar arquivos ocultos** do Nautilus.
+- **O nome vem primeiro.** Se faltar espaço para ler os nomes da pasta atual, a Vitrine cede espaço nesta ordem: esconde Tamanho, Modificado e a estrela; mostra menos colunas anteriores (role para a esquerda para ver as outras); estreita o painel de pré-visualização; e, por fim, recolhe o painel. Quando a janela volta a ter espaço, tudo volta sozinho. Recolher o painel não muda a sua preferência, e se você reabrir o painel à mão ele fica aberto. Desligue em *Personalizar → Priorizar nomes no modo coluna*.
 
 ### 🖼️ Painel de pré-visualização
 
@@ -260,6 +261,8 @@ Na primeira execução da versão com GSettings, o antigo `settings.json` é imp
 | `image_dimensions` | `true` | Dimensões das imagens abaixo do nome na grade (estilo Finder) |
 | `gallery_group_by` | `"date"` | Agrupamento da Galeria: `none`, `date`, `type`, `size`, `tags` |
 | `path_bar` | `false` | Barra de caminho embaixo (estilo Finder) |
+| `columns_prioritize_names` | `true` | Modo Colunas: Tamanho/Modificado, colunas anteriores e painel cedem espaço ao nome |
+| `columns_auto_preview` | `true` | Modo Colunas: recolher o painel de pré-visualização enquanto faltar espaço |
 | `status_bar` | `false` | Barra de status embaixo (estilo Finder) |
 
 **`~/.config/nautilus-vitrine/folders.json`** guarda as regras por pasta:
@@ -302,6 +305,7 @@ vitrine/
   finder/               estilo Finder: aplica e remove a camada visual (barra de ferramentas, barras de baixo)
   schemas/              schema GSettings da Vitrine
   tags.py               etiquetas (user.xdg.tags) e índice dos arquivos etiquetados
+  layout.py             orçamento de largura do modo Colunas (o nome primeiro)
   gallery.py            visualização em Galeria (Ctrl+4)
   tagui.py              telas das etiquetas (barra, barra lateral, página, Todas as etiquetas…)
   history.py            Voltar/Avançar por aba incluindo o Meu computador (sem GTK)
@@ -316,6 +320,7 @@ tools/
   test_config.py        testes das preferências (GSettings)
   test_tags.py          testes das etiquetas
   test_gallery.py       testes dos grupos de data da Galeria
+  test_layout.py        testes do orçamento de largura do modo Colunas
   build_bootstrap.py    gera o criar-vitrine.sh
 packaging/
   nautilus-vitrine.spec receita do pacote RPM

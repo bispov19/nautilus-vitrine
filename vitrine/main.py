@@ -177,6 +177,9 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.InfoProv
                 if ctl.style is not None and ctl.style.active:
                     ctl.style.remove()
                     ctl.style.apply()
+        elif key in ("columns_prioritize_names", "columns_auto_preview"):
+            for ctl in list(self.windows.values()):
+                ctl.schedule_layout()
         elif key in ("computer_in_sidebar", "computer_hidden", "computer_sections"):
             self.refresh_computer_pages()
 

@@ -1,7 +1,7 @@
 %global extdir %{_datadir}/nautilus-python/extensions
 
 Name:           nautilus-vitrine
-Version:        0.4.0
+Version:        0.4.1
 Release:        1%{?dist}
 Summary:        Finder-style look, column and gallery views, tags and preview pane for GNOME Files
 
@@ -56,6 +56,11 @@ glib-compile-schemas --strict %{buildroot}%{extdir}/vitrine/schemas
 %{extdir}/vitrine/
 
 %changelog
+* Thu Nov 26 2026 Vinicius Bispo - 0.4.1-1
+- Modo Colunas: o nome tem prioridade (Tamanho/Modificado, colunas anteriores e
+  painel de pré-visualização cedem espaço; o painel recolhe e volta sozinho)
+- Barra do Finder compacta em janelas estreitas
+
 * Tue Nov 24 2026 Vinicius Bispo - 0.4.0-1
 - Estilo Finder (padrão) com volta ao Nautilus padrão; preferências em GSettings
 - Etiquetas coloridas (user.xdg.tags): menu, barra, barra lateral, Propriedades

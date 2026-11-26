@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import gettext
 import os
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
-from . import discovery, native
+from . import discovery, layout, native, util
 from .columns import ColumnStrip
 from .computer import ComputerPage
 from .finder import FinderStyle
@@ -65,6 +66,12 @@ class WindowController:
         self.tag_page: TagPage | None = None
         self.gallery: GalleryView | None = None
         self.gallery_on = False
+        # Orçamento de largura do modo Colunas (layout.py)
+        self._layout_source = 0
+        self._preview_auto_hidden = False
+        self._preview_forced = False
+        self._preview_width_touched = False
+        self._secondary_width = layout.SECONDARY_DEFAULT
         self._tag_visible: str | None = None
         self.tag_sidebar = None  # seção Etiquetas (só no estilo Finder)
 
@@ -130,6 +137,11 @@ class WindowController:
         self.paned.set_shrink_end_child(False)
         self.paned.connect("notify::max-position", self._on_paned_max)
         self.paned.connect("notify::position", self._on_paned_pos)
+        # Recalcula o orçamento do modo Colunas quando a largura muda. Um tick callback
+        # (só compara um número por quadro) pega todos os casos; o notify::max-position
+        # do Paned não é emitido quando o painel está escondido.
+        self._last_paned_width = 0
+        self.paned.add_tick_callback(self._on_paned_tick)
         toolbar.set_content(self.paned)
 
         self._install_actions()
@@ -181,6 +193,7 @@ class WindowController:
     def _style_sync(self) -> None:
         if self.style is not None and self.style.active:
             self.style.sync()
+        self.schedule_layout()
 
     def should_start_on_computer(self, uri: str | None) -> bool:
         """Só quando a janela abriu na pasta pessoal (menu de aplicativos, Ctrl+N).
@@ -790,6 +803,7 @@ class WindowController:
         if self.gallery_on and self.gallery is not None and regular:
             self.gallery.set_folder(uri)
         self._style_sync()
+        self.schedule_layout(again=True)  # o Nautilus remonta a lista (e as colunas)
 
     def _rebind_model_soon(self) -> None:
         for delay in (0, 250, 900):
@@ -1051,10 +1065,16 @@ class WindowController:
             if self._computer_visible:
                 self.strip.set_visible(False)
         self._sync_buttons()
+        self.schedule_layout(again=True)
 
     def set_preview_visible(self, on: bool) -> None:
+        # Escolha manual: reabrir o painel enquanto ele estava recolhido por falta de
+        # espaço vale até sobrar espaço de novo (não recolhemos de novo por cima).
+        self._preview_forced = bool(on and self._preview_auto_hidden)
+        self._preview_auto_hidden = False
         self.preview.set_visible(on)
         self.cfg.set("preview_visible", on)
+        self.schedule_layout()
         self._sync_buttons()
         if on:
             self._pos_initialized = False
@@ -1107,6 +1127,142 @@ class WindowController:
         width = self.paned.get_property("max-position") - self.paned.get_position()
         if 180 <= width <= 1200 and width != self.cfg.get("preview_width"):
             self.cfg.set("preview_width", int(width))
+
+    # ───────────────────────── modo Colunas: o nome primeiro ─────────────────────────
+    def schedule_layout(self, again: bool = False) -> None:
+        """Recalcula o orçamento de largura (agrupado). `again`: confere de novo depois
+        que o Nautilus terminar de montar a lista (ele mostra as colunas de novo)."""
+        if not self._layout_source:
+            self._layout_source = GLib.idle_add(self._apply_layout, priority=GLib.PRIORITY_LOW)
+        if again:
+            for delay in (300, 900):
+                GLib.timeout_add(delay, lambda: (self.schedule_layout(), GLib.SOURCE_REMOVE)[1])
+
+    def _on_paned_tick(self, paned, _clock) -> bool:
+        w = paned.get_width()
+        if w != self._last_paned_width:
+            self._last_paned_width = w
+            self.schedule_layout()
+        return True
+
+    def _layout_active(self) -> bool:
+        return (self.columns_on and not self.gallery_on and not self._computer_visible
+                and self._tag_visible is None and bool(self.cfg.get("columns_prioritize_names"))
+                and self.strip is not None and self.paned is not None)
+
+    @guarded
+    def _apply_layout(self) -> bool:
+        self._layout_source = 0
+        if not self._layout_active():
+            self._reset_layout()
+            return GLib.SOURCE_REMOVE
+        width = self.paned.get_width()
+        if width <= 0:
+            return GLib.SOURCE_REMOVE
+        measured = self._measure_secondary()
+        if measured:
+            self._secondary_width = measured
+        preview_on = bool(self.cfg.get("preview_visible"))
+        p = layout.plan(width=width, columns=len(self.strip.columns),
+                        column_width=self.strip.column_width, max_visible=self.strip.max_visible,
+                        preview_on=preview_on, preview_width=int(self.cfg.get("preview_width")),
+                        secondary_width=self._secondary_width,
+                        auto_preview=bool(self.cfg.get("columns_auto_preview")),
+                        preview_forced=self._preview_forced)
+        if not p.hide_secondary and p.preview_width == (int(self.cfg.get("preview_width")) if preview_on else 0):
+            self._preview_forced = False  # sobrou espaço: volta ao automático
+        self.strip.set_visible_count(p.strip_columns)
+        self._set_secondary_hidden(p.hide_secondary)
+        if preview_on:
+            if p.preview_width == 0:
+                self.preview.set_visible(False)
+                self._preview_auto_hidden = True
+            else:
+                if self._preview_auto_hidden:
+                    self.preview.set_visible(True)
+                    self._preview_auto_hidden = False
+                self._set_preview_width(p.preview_width)
+        cv = self._native_columnview()
+        if cv is not None and util.DEBUG:
+            cols = cv.get_columns()
+            info = [(cols.get_item(i).get_title(), cols.get_item(i).get_visible(),
+                     cols.get_item(i).get_fixed_width(), cols.get_item(i).get_expand())
+                    for i in range(cols.get_n_items())]
+            pmin = self.preview.measure(Gtk.Orientation.HORIZONTAL, -1)[0]
+            smin = self.strip.measure(Gtk.Orientation.HORIZONTAL, -1)[0]
+            debug(f"colunas: lista={cv.get_width()} painel={self.preview.get_width()} (mín {pmin}) "
+                  f"faixa={self.strip.get_width()} (mín {smin}) conteúdo={self.content_stack.get_width()} "
+                  f"nativas={info[:3]}")
+        debug(f"colunas: largura={width} {p}")
+        return GLib.SOURCE_REMOVE
+
+    def _reset_layout(self) -> None:
+        """Fora do modo Colunas (ou opção desligada): tudo volta ao normal."""
+        if self.strip is not None:
+            self.strip.set_visible_count(None)
+        self._set_secondary_hidden(False)
+        if self._preview_auto_hidden:
+            self._preview_auto_hidden = False
+            if self.cfg.get("preview_visible") and not self.gallery_on:
+                self.preview.set_visible(True)
+        if self._preview_width_touched and self.preview is not None and self.preview.get_visible():
+            self._set_preview_width(int(self.cfg.get("preview_width")))
+            self._preview_width_touched = False
+        self._preview_forced = False
+
+    def _set_preview_width(self, w: int) -> None:
+        # Pela largura real do Paned: o max-position fica desatualizado logo depois de a
+        # janela mudar de tamanho (e o Paned mantém a largura do painel ao redimensionar).
+        total = self.paned.get_width()
+        if total <= 0:
+            return
+        target = max(200, total - 1 - w)  # alça do Paned: 1 px (wide_handle=False)
+        if abs(self.paned.get_position() - target) > 1:
+            self._setting_pos = True   # não grava como preferência do usuário
+            self.paned.set_position(target)
+            self._setting_pos = False
+        self._pos_initialized = True
+        self._preview_width_touched = w != int(self.cfg.get("preview_width"))
+
+    def _native_columnview(self):
+        slot = self.active_slot()
+        fv = find_by_type_name(slot, "NautilusFilesView") if slot is not None else None
+        return find_first(fv, lambda w: isinstance(w, Gtk.ColumnView)) if fv is not None else None
+
+    def _secondary_columns(self, cv) -> list:
+        """Colunas da lista nativa que não são o Nome (Tamanho, Modificado, ☆…)."""
+        cols = cv.get_columns()
+        items = [cols.get_item(i) for i in range(cols.get_n_items())]
+        name_title = gettext.dgettext("nautilus", "Name")
+        name = next((c for c in items if c.get_title() == name_title), items[0] if items else None)
+        return [c for c in items if c is not name]
+
+    def _measure_secondary(self) -> int:
+        cv = self._native_columnview()
+        if cv is None or getattr(cv, "_vitrine_hidden", None):
+            return 0
+        total = 0
+        for col in self._secondary_columns(cv):
+            if col.get_visible():
+                fixed = col.get_fixed_width()
+                total += fixed if fixed > 0 else 110
+        return total
+
+    def _set_secondary_hidden(self, hide: bool) -> None:
+        cv = self._native_columnview()
+        if cv is None:
+            return
+        hidden = getattr(cv, "_vitrine_hidden", None) or []
+        if hide:
+            for col in self._secondary_columns(cv):
+                if col.get_visible():
+                    col.set_visible(False)
+                    hidden.append(col)
+            cv._vitrine_hidden = hidden
+        elif hidden:
+            for col in hidden:
+                col.set_visible(True)
+            cv._vitrine_hidden = []
 
     @guarded
     def _on_destroy(self, *_a) -> None:

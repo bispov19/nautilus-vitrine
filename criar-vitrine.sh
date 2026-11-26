@@ -49,7 +49,7 @@ cat > 'vitrine/__init__.py' <<'__VITRINE_ARQUIVO_1__'
 
 # Fonte única da versão no código. O `Version:` de packaging/nautilus-vitrine.spec
 # precisa ser igual (tools/smoke_test.py confere).
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 __VITRINE_ARQUIVO_1__
 mkdir -p "vitrine"
 cat > 'vitrine/about.py' <<'__VITRINE_ARQUIVO_2__'
@@ -551,6 +551,7 @@ class ColumnStrip(Gtk.Box):
         self._on_reveal = on_reveal
         self.columns: list[FolderColumn] = []
         self.location: Gio.File | None = None
+        self.visible_count: int | None = None  # definido pelo orçamento de largura (layout.py)
         self._nautilus_prefs = Gio.Settings.new("org.gnome.nautilus.preferences")
         self.show_hidden = self._nautilus_prefs.get_boolean("show-hidden-files")
         self._hidden_handler = self._nautilus_prefs.connect(
@@ -609,10 +610,22 @@ class ColumnStrip(Gtk.Box):
             nxt = path[i + 1] if i + 1 < len(path) else None
             col.set_highlight(nxt.get_uri() if nxt is not None else None)
 
+        self.set_visible(len(self.columns) > 0)
+        self._resize()
+
+    def set_visible_count(self, count: int | None) -> None:
+        """Quantas colunas anteriores ficam à vista (as outras continuam acessíveis
+        rolando para a esquerda). None = o padrão (max_visible_columns)."""
+        if count == self.visible_count:
+            return
+        self.visible_count = count
+        self._resize()
+
+    def _resize(self) -> None:
         n = len(self.columns)
-        visible = min(n, self.max_visible)
+        limit = self.max_visible if self.visible_count is None else max(1, self.visible_count)
+        visible = min(n, limit)
         self.scroller.set_size_request(visible * (self.column_width + 1), -1)
-        self.set_visible(n > 0)
         GLib.idle_add(self._scroll_to_end)
 
     def _scroll_to_end(self) -> bool:
@@ -631,7 +644,7 @@ import os
 import socket
 import time
 
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
 
 from . import native, util
 from .about import build_about_page
@@ -1370,6 +1383,16 @@ class ComputerPage(Gtk.ScrolledWindow):
                "Fotos e vídeos em ícones extra grandes, documentos em lista. "
                "Escolhas feitas à mão numa pasta têm prioridade",
                bool(cfg.get("folder_discovery")), lambda v: cfg.set("folder_discovery", v))
+        prio = switch(views, "Priorizar nomes no modo coluna",
+                      "O nome fica sempre legível: Tamanho e Modificado, colunas anteriores "
+                      "e o painel de pré-visualização cedem espaço",
+                      bool(cfg.get("columns_prioritize_names")),
+                      lambda v: cfg.set("columns_prioritize_names", v))
+        auto = switch(views, "Recolher painel de pré-visualização automaticamente quando faltar espaço",
+                      "Só enquanto faltar espaço; a sua opção do painel não muda",
+                      bool(cfg.get("columns_auto_preview")),
+                      lambda v: cfg.set("columns_auto_preview", v))
+        prio.bind_property("active", auto, "sensitive", GObject.BindingFlags.SYNC_CREATE)
         page.add(views)
 
         sections =Adw.PreferencesGroup(title="Seções",
@@ -1520,6 +1543,9 @@ DEFAULT_SETTINGS = {
     # Estilo Finder: barra de caminho e barra de status embaixo.
     "path_bar": False,
     "status_bar": False,
+    # Modo Colunas: o nome tem prioridade (layout.py); o painel recolhe se faltar espaço.
+    "columns_prioritize_names": True,
+    "columns_auto_preview": True,
     # Painel de pré-visualização à direita (Ctrl+Shift+P).
     "preview_visible": True,
     "preview_width": 320,
@@ -1575,6 +1601,7 @@ _GS_TYPES = {
     "default_mode": "s?", "default_grid_zoom": "s?",  # "" no GSettings = None aqui
     "tags": "a(ss)", "tags_in_sidebar": "b", "tags_section_expanded": "b",
     "image_dimensions": "b", "gallery_group_by": "s", "path_bar": "b", "status_bar": "b",
+    "columns_prioritize_names": "b", "columns_auto_preview": "b",
 }
 
 
@@ -2802,7 +2829,98 @@ THUMB_ATTRS = ",".join(
 )
 __VITRINE_ARQUIVO_9__
 mkdir -p "vitrine"
-cat > 'vitrine/main.py' <<'__VITRINE_ARQUIVO_10__'
+cat > 'vitrine/layout.py' <<'__VITRINE_ARQUIVO_10__'
+"""Orçamento de largura do modo Colunas: o NOME tem prioridade.
+
+No modo Colunas a largura da janela é dividida em três partes:
+
+    [colunas anteriores da Vitrine] [lista nativa: Nome | Tamanho | Modificado | ☆] ‖ [pré-visualização]
+
+Antes, as colunas anteriores e o painel tinham largura fixa e a lista nativa ficava com
+a sobra; dentro dela, Tamanho/Modificado/☆ também têm largura própria e o Nome recebia o
+resto (às vezes só "…"). Aqui decidimos, a cada mudança de tamanho ou de pasta, quanto
+cada parte recebe, cedendo espaço ao Nome nesta ordem:
+
+  1. esconder as colunas secundárias da lista (Tamanho, Modificado, ☆);
+  2. mostrar menos colunas anteriores (até 2; as outras continuam acessíveis rolando);
+  3. estreitar o painel de pré-visualização até o mínimo;
+  4. mostrar só 1 coluna anterior;
+  5. recolher o painel (temporariamente: a preferência do usuário não muda).
+
+Python puro (sem GTK): testado em tools/test_layout.py.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+NAME_MIN = 400          # lista nativa: margens (24+24) + ícone (~40) + ~310 px de texto
+PREVIEW_MIN = 240       # menor largura útil do painel de pré-visualização
+SECONDARY_DEFAULT = 300  # Tamanho + Modificado + ☆, quando não dá para medir
+SEPARATOR = 1
+
+
+@dataclass
+class Plan:
+    strip_columns: int       # quantas colunas anteriores ficam visíveis
+    preview_width: int       # largura do painel (0 = recolhido)
+    preview_auto_hidden: bool
+    hide_secondary: bool
+    name_width: int          # largura que sobra para a lista nativa (para o log/testes)
+
+
+def plan(*, width: int, columns: int, column_width: int, max_visible: int,
+         preview_on: bool, preview_width: int, secondary_width: int = SECONDARY_DEFAULT,
+         prioritize: bool = True, auto_preview: bool = True,
+         preview_forced: bool = False) -> Plan:
+    """`width`: largura total de [colunas | lista ‖ painel].
+    `preview_forced`: o usuário reabriu o painel à mão enquanto faltava espaço."""
+    k = min(columns, max(1, max_visible)) if columns > 0 else 0
+    pw = preview_width if preview_on else 0
+
+    def strip(n):
+        return n * (column_width + SEPARATOR) + (SEPARATOR if n else 0)
+
+    def free(n, p):
+        return width - strip(n) - p
+
+    if not prioritize:
+        return Plan(k, pw, False, False, free(k, pw))
+
+    # 0. Cabe tudo, com as colunas secundárias?
+    if free(k, pw) >= NAME_MIN + secondary_width:
+        return Plan(k, pw, False, False, free(k, pw) - secondary_width)
+
+    # 1. Esconde Tamanho/Modificado/☆.
+    if free(k, pw) >= NAME_MIN:
+        return Plan(k, pw, False, True, free(k, pw))
+
+    # 2. Menos colunas anteriores (até 2).
+    while k > 2 and free(k, pw) < NAME_MIN:
+        k -= 1
+    if free(k, pw) >= NAME_MIN:
+        return Plan(k, pw, False, True, free(k, pw))
+
+    # 3. Painel mais estreito (até o mínimo).
+    if pw:
+        need = NAME_MIN - free(k, pw)
+        pw = max(min(PREVIEW_MIN, preview_width), pw - need)
+        if free(k, pw) >= NAME_MIN:
+            return Plan(k, pw, False, True, free(k, pw))
+
+    # 4. Só 1 coluna anterior.
+    while k > 1 and free(k, pw) < NAME_MIN:
+        k -= 1
+    if free(k, pw) >= NAME_MIN:
+        return Plan(k, pw, False, True, free(k, pw))
+
+    # 5. Recolhe o painel (se o usuário não o reabriu à mão).
+    if pw and auto_preview and not preview_forced:
+        return Plan(k, 0, True, True, free(k, 0))
+    return Plan(k, pw, False, True, free(k, pw))
+__VITRINE_ARQUIVO_10__
+mkdir -p "vitrine"
+cat > 'vitrine/main.py' <<'__VITRINE_ARQUIVO_11__'
 """Ponto central: descobre as janelas do Nautilus e oferece o menu "Visualização desta pasta"."""
 
 from __future__ import annotations
@@ -2982,6 +3100,9 @@ class VitrineExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.InfoProv
                 if ctl.style is not None and ctl.style.active:
                     ctl.style.remove()
                     ctl.style.apply()
+        elif key in ("columns_prioritize_names", "columns_auto_preview"):
+            for ctl in list(self.windows.values()):
+                ctl.schedule_layout()
         elif key in ("computer_in_sidebar", "computer_hidden", "computer_sections"):
             self.refresh_computer_pages()
 
@@ -3227,9 +3348,9 @@ def _thousands(n: int) -> str:
 def _open_tag_manager(ctl) -> None:
     from .tagui import open_manager
     open_manager(ctl)
-__VITRINE_ARQUIVO_10__
+__VITRINE_ARQUIVO_11__
 mkdir -p "vitrine"
-cat > 'vitrine/native.py' <<'__VITRINE_ARQUIVO_11__'
+cat > 'vitrine/native.py' <<'__VITRINE_ARQUIVO_12__'
 """Ponte com as partes internas do Nautilus (aba/slot, modo de visualização, seleção).
 
 Regra de ouro: nunca guardar referência forte a widgets ou modelos do Nautilus.
@@ -3484,9 +3605,9 @@ class ModelWatch:
             self._callback(model)
         except Exception as err:  # noqa: BLE001
             log(f"ModelWatch callback: {err}")
-__VITRINE_ARQUIVO_11__
+__VITRINE_ARQUIVO_12__
 mkdir -p "vitrine"
-cat > 'vitrine/preview.py' <<'__VITRINE_ARQUIVO_12__'
+cat > 'vitrine/preview.py' <<'__VITRINE_ARQUIVO_13__'
 """Painel de pré-visualização à direita: imagem, texto, miniatura de vídeo/PDF e informações."""
 
 from __future__ import annotations
@@ -4011,9 +4132,9 @@ class PreviewPane(Gtk.Box):
             self._on_navigate(self._current_uri)
         else:
             util.open_uri(self._current_uri)
-__VITRINE_ARQUIVO_12__
+__VITRINE_ARQUIVO_13__
 mkdir -p "vitrine"
-cat > 'vitrine/selftest.py' <<'__VITRINE_ARQUIVO_13__'
+cat > 'vitrine/selftest.py' <<'__VITRINE_ARQUIVO_14__'
 """Autoteste dentro do Nautilus real. Só roda com VITRINE_SELFTEST=1.
 
 Navega por pastas, troca modos, seleciona arquivos e grava PASSOU/FALHOU no log.
@@ -4717,6 +4838,98 @@ def run(ctl) -> bool:
         check("opção Seção Etiquetas vale na hora (desliga e liga)",
               off and ctl.tag_sidebar is not None and ctl.style.active)
 
+    # ── modo Colunas: o nome tem prioridade ──
+    deep = {}
+    long_names = ("Proposta_Vegah_Salon_2026 (1).pdf", "Relatório de atividades do semestre.txt")
+
+    def name_labels():
+        cv = ctl._native_columnview()
+        if cv is None:
+            return []
+        return [w for w in util.walk(cv) if isinstance(w, Gtk.Label) and w.get_mapped()
+                and w.get_label() in long_names]
+
+    def names_readable():
+        labels = name_labels()
+        return len(labels) == len(long_names) and not any(
+            lb.get_layout().is_ellipsized() for lb in labels), [
+            (lb.get_label(), lb.get_width(), lb.get_layout().is_ellipsized()) for lb in labels]
+
+    @step
+    def c1():
+        root = tempfile.mkdtemp(prefix="vitrine-selftest-colunas-")
+        path = root
+        for name in ("Documentos de exemplo", "02_Estudos e cursos", "01_Cursos_LIVRES online",
+                     "Programação para iniciantes"):
+            path = os.path.join(path, name)
+            os.makedirs(path)
+        for name in long_names:
+            open(os.path.join(path, name), "w").close()
+        deep.update(root=root, leaf=Gio.File.new_for_path(path).get_uri(),
+                    maximized=ctl.win.is_maximized(),
+                    size=(ctl.win.get_width(), ctl.win.get_height()))
+        ctl.set_preview_visible(True)
+        ctl.navigate(deep["leaf"])
+
+    @step
+    def c2():
+        ctl.user_set_mode("columns")
+
+    @step
+    def c3():
+        ok, info = names_readable()
+        check("colunas (janela grande): nome legível com o painel ligado", ok,
+              f"{info} colunas={len(ctl.strip.columns)} painel={ctl.preview.get_visible()} "
+              f"largura={ctl.paned.get_width()}")
+        shot("colunas-janela-grande")
+        ctl.win.unmaximize()
+        ctl.win.set_default_size(860, 640)
+
+    @step
+    def c4():
+        ok, info = names_readable()
+        check("colunas (janela pequena): nome legível; painel cede espaço",
+              ok and ctl.paned.get_width() < 900, f"{info} largura={ctl.paned.get_width()} "
+              f"painel={ctl.preview.get_visible()} faixa={ctl.strip.visible_count}")
+        check("colunas: recolher o painel não muda a preferência do usuário",
+              bool(ctl.cfg.get("preview_visible")))
+        header = ctl.style.header if ctl.style is not None else None
+        hmin = header.measure(Gtk.Orientation.HORIZONTAL, -1)[0] if header is not None else 0
+        sidebar_w = ctl.win.get_width() - (header.get_parent().get_width() if header is not None else 0)
+        check("Finder: barra de ferramentas cabe na janela estreita (modo compacto)",
+              header is None or (ctl.win.has_css_class("vitrine-compact")
+                                 and hmin + sidebar_w <= ctl.win.get_width() + 1),
+              f"barra mín={hmin} lateral={sidebar_w} janela={ctl.win.get_width()}")
+        shot("colunas-janela-pequena")
+        if deep["maximized"]:
+            ctl.win.maximize()
+        else:
+            ctl.win.set_default_size(*deep["size"])
+
+    @step
+    def c5():
+        ok, info = names_readable()
+        check("colunas (janela grande de novo): painel volta sozinho",
+              ok and ctl.preview.get_visible() and not ctl._preview_auto_hidden,
+              f"{info} painel={ctl.preview.get_visible()} largura={ctl.paned.get_width()}")
+        ctl.cfg.set("columns_prioritize_names", False)
+
+    @step
+    def c6():
+        cv = ctl._native_columnview()
+        restored = cv is not None and not getattr(cv, "_vitrine_hidden", None)
+        check("opção Priorizar nomes desligada: colunas e painel como antes",
+              restored and ctl.strip.visible_count is None and ctl.preview.get_visible())
+        ctl.cfg.set("columns_prioritize_names", True)
+        ctl.user_set_mode("list")
+        cfg.forget(deep["leaf"])
+        discovery.forget_manual(deep["leaf"])
+        ctl.navigate(home)
+
+    @step
+    def c7():
+        shutil.rmtree(deep["root"], ignore_errors=True)
+
     @step
     def s11():
         st = state()
@@ -4749,9 +4962,9 @@ def run(ctl) -> bool:
 
     GLib.timeout_add(STEP_MS, runner)
     return GLib.SOURCE_REMOVE
-__VITRINE_ARQUIVO_13__
+__VITRINE_ARQUIVO_14__
 mkdir -p "vitrine"
-cat > 'vitrine/tags.py' <<'__VITRINE_ARQUIVO_14__'
+cat > 'vitrine/tags.py' <<'__VITRINE_ARQUIVO_15__'
 """Etiquetas coloridas, guardadas no atributo estendido padrão `user.xdg.tags`.
 
 O atributo guarda os *nomes* das etiquetas separados por vírgula (o mesmo formato do
@@ -5059,9 +5272,9 @@ class TagStore:
 
 def _clean(name: str) -> str:
     return (name or "").replace(",", " ").strip()[:60]
-__VITRINE_ARQUIVO_14__
+__VITRINE_ARQUIVO_15__
 mkdir -p "vitrine"
-cat > 'vitrine/tagui.py' <<'__VITRINE_ARQUIVO_15__'
+cat > 'vitrine/tagui.py' <<'__VITRINE_ARQUIVO_16__'
 """Telas das etiquetas: botão da barra de ferramentas, seção da barra lateral, página
 com os arquivos de uma etiqueta e a tela "Todas as etiquetas…".
 
@@ -5485,9 +5698,9 @@ class TagManager(Adw.Dialog):
         self._build()
         if self.rows:
             self.rows[-1].grab_focus()
-__VITRINE_ARQUIVO_15__
+__VITRINE_ARQUIVO_16__
 mkdir -p "vitrine"
-cat > 'vitrine/util.py' <<'__VITRINE_ARQUIVO_16__'
+cat > 'vitrine/util.py' <<'__VITRINE_ARQUIVO_17__'
 """Utilitários: log, varredura da árvore de widgets e operações de arquivo nativas."""
 
 from __future__ import annotations
@@ -5741,18 +5954,19 @@ def snapshot_png(widget: Gtk.Widget, path: str) -> bool:
         return False
     tex = native.get_renderer().render_texture(node, Graphene.Rect().init(0, 0, w, h))
     return bool(tex.save_to_png(path))
-__VITRINE_ARQUIVO_16__
+__VITRINE_ARQUIVO_17__
 mkdir -p "vitrine"
-cat > 'vitrine/window.py' <<'__VITRINE_ARQUIVO_17__'
+cat > 'vitrine/window.py' <<'__VITRINE_ARQUIVO_18__'
 """Controlador por janela: injeta Colunas + Pré-visualização e aplica as regras por pasta."""
 
 from __future__ import annotations
 
+import gettext
 import os
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
-from . import discovery, native
+from . import discovery, layout, native, util
 from .columns import ColumnStrip
 from .computer import ComputerPage
 from .finder import FinderStyle
@@ -5811,6 +6025,12 @@ class WindowController:
         self.tag_page: TagPage | None = None
         self.gallery: GalleryView | None = None
         self.gallery_on = False
+        # Orçamento de largura do modo Colunas (layout.py)
+        self._layout_source = 0
+        self._preview_auto_hidden = False
+        self._preview_forced = False
+        self._preview_width_touched = False
+        self._secondary_width = layout.SECONDARY_DEFAULT
         self._tag_visible: str | None = None
         self.tag_sidebar = None  # seção Etiquetas (só no estilo Finder)
 
@@ -5876,6 +6096,11 @@ class WindowController:
         self.paned.set_shrink_end_child(False)
         self.paned.connect("notify::max-position", self._on_paned_max)
         self.paned.connect("notify::position", self._on_paned_pos)
+        # Recalcula o orçamento do modo Colunas quando a largura muda. Um tick callback
+        # (só compara um número por quadro) pega todos os casos; o notify::max-position
+        # do Paned não é emitido quando o painel está escondido.
+        self._last_paned_width = 0
+        self.paned.add_tick_callback(self._on_paned_tick)
         toolbar.set_content(self.paned)
 
         self._install_actions()
@@ -5927,6 +6152,7 @@ class WindowController:
     def _style_sync(self) -> None:
         if self.style is not None and self.style.active:
             self.style.sync()
+        self.schedule_layout()
 
     def should_start_on_computer(self, uri: str | None) -> bool:
         """Só quando a janela abriu na pasta pessoal (menu de aplicativos, Ctrl+N).
@@ -6536,6 +6762,7 @@ class WindowController:
         if self.gallery_on and self.gallery is not None and regular:
             self.gallery.set_folder(uri)
         self._style_sync()
+        self.schedule_layout(again=True)  # o Nautilus remonta a lista (e as colunas)
 
     def _rebind_model_soon(self) -> None:
         for delay in (0, 250, 900):
@@ -6797,10 +7024,16 @@ class WindowController:
             if self._computer_visible:
                 self.strip.set_visible(False)
         self._sync_buttons()
+        self.schedule_layout(again=True)
 
     def set_preview_visible(self, on: bool) -> None:
+        # Escolha manual: reabrir o painel enquanto ele estava recolhido por falta de
+        # espaço vale até sobrar espaço de novo (não recolhemos de novo por cima).
+        self._preview_forced = bool(on and self._preview_auto_hidden)
+        self._preview_auto_hidden = False
         self.preview.set_visible(on)
         self.cfg.set("preview_visible", on)
+        self.schedule_layout()
         self._sync_buttons()
         if on:
             self._pos_initialized = False
@@ -6854,6 +7087,142 @@ class WindowController:
         if 180 <= width <= 1200 and width != self.cfg.get("preview_width"):
             self.cfg.set("preview_width", int(width))
 
+    # ───────────────────────── modo Colunas: o nome primeiro ─────────────────────────
+    def schedule_layout(self, again: bool = False) -> None:
+        """Recalcula o orçamento de largura (agrupado). `again`: confere de novo depois
+        que o Nautilus terminar de montar a lista (ele mostra as colunas de novo)."""
+        if not self._layout_source:
+            self._layout_source = GLib.idle_add(self._apply_layout, priority=GLib.PRIORITY_LOW)
+        if again:
+            for delay in (300, 900):
+                GLib.timeout_add(delay, lambda: (self.schedule_layout(), GLib.SOURCE_REMOVE)[1])
+
+    def _on_paned_tick(self, paned, _clock) -> bool:
+        w = paned.get_width()
+        if w != self._last_paned_width:
+            self._last_paned_width = w
+            self.schedule_layout()
+        return True
+
+    def _layout_active(self) -> bool:
+        return (self.columns_on and not self.gallery_on and not self._computer_visible
+                and self._tag_visible is None and bool(self.cfg.get("columns_prioritize_names"))
+                and self.strip is not None and self.paned is not None)
+
+    @guarded
+    def _apply_layout(self) -> bool:
+        self._layout_source = 0
+        if not self._layout_active():
+            self._reset_layout()
+            return GLib.SOURCE_REMOVE
+        width = self.paned.get_width()
+        if width <= 0:
+            return GLib.SOURCE_REMOVE
+        measured = self._measure_secondary()
+        if measured:
+            self._secondary_width = measured
+        preview_on = bool(self.cfg.get("preview_visible"))
+        p = layout.plan(width=width, columns=len(self.strip.columns),
+                        column_width=self.strip.column_width, max_visible=self.strip.max_visible,
+                        preview_on=preview_on, preview_width=int(self.cfg.get("preview_width")),
+                        secondary_width=self._secondary_width,
+                        auto_preview=bool(self.cfg.get("columns_auto_preview")),
+                        preview_forced=self._preview_forced)
+        if not p.hide_secondary and p.preview_width == (int(self.cfg.get("preview_width")) if preview_on else 0):
+            self._preview_forced = False  # sobrou espaço: volta ao automático
+        self.strip.set_visible_count(p.strip_columns)
+        self._set_secondary_hidden(p.hide_secondary)
+        if preview_on:
+            if p.preview_width == 0:
+                self.preview.set_visible(False)
+                self._preview_auto_hidden = True
+            else:
+                if self._preview_auto_hidden:
+                    self.preview.set_visible(True)
+                    self._preview_auto_hidden = False
+                self._set_preview_width(p.preview_width)
+        cv = self._native_columnview()
+        if cv is not None and util.DEBUG:
+            cols = cv.get_columns()
+            info = [(cols.get_item(i).get_title(), cols.get_item(i).get_visible(),
+                     cols.get_item(i).get_fixed_width(), cols.get_item(i).get_expand())
+                    for i in range(cols.get_n_items())]
+            pmin = self.preview.measure(Gtk.Orientation.HORIZONTAL, -1)[0]
+            smin = self.strip.measure(Gtk.Orientation.HORIZONTAL, -1)[0]
+            debug(f"colunas: lista={cv.get_width()} painel={self.preview.get_width()} (mín {pmin}) "
+                  f"faixa={self.strip.get_width()} (mín {smin}) conteúdo={self.content_stack.get_width()} "
+                  f"nativas={info[:3]}")
+        debug(f"colunas: largura={width} {p}")
+        return GLib.SOURCE_REMOVE
+
+    def _reset_layout(self) -> None:
+        """Fora do modo Colunas (ou opção desligada): tudo volta ao normal."""
+        if self.strip is not None:
+            self.strip.set_visible_count(None)
+        self._set_secondary_hidden(False)
+        if self._preview_auto_hidden:
+            self._preview_auto_hidden = False
+            if self.cfg.get("preview_visible") and not self.gallery_on:
+                self.preview.set_visible(True)
+        if self._preview_width_touched and self.preview is not None and self.preview.get_visible():
+            self._set_preview_width(int(self.cfg.get("preview_width")))
+            self._preview_width_touched = False
+        self._preview_forced = False
+
+    def _set_preview_width(self, w: int) -> None:
+        # Pela largura real do Paned: o max-position fica desatualizado logo depois de a
+        # janela mudar de tamanho (e o Paned mantém a largura do painel ao redimensionar).
+        total = self.paned.get_width()
+        if total <= 0:
+            return
+        target = max(200, total - 1 - w)  # alça do Paned: 1 px (wide_handle=False)
+        if abs(self.paned.get_position() - target) > 1:
+            self._setting_pos = True   # não grava como preferência do usuário
+            self.paned.set_position(target)
+            self._setting_pos = False
+        self._pos_initialized = True
+        self._preview_width_touched = w != int(self.cfg.get("preview_width"))
+
+    def _native_columnview(self):
+        slot = self.active_slot()
+        fv = find_by_type_name(slot, "NautilusFilesView") if slot is not None else None
+        return find_first(fv, lambda w: isinstance(w, Gtk.ColumnView)) if fv is not None else None
+
+    def _secondary_columns(self, cv) -> list:
+        """Colunas da lista nativa que não são o Nome (Tamanho, Modificado, ☆…)."""
+        cols = cv.get_columns()
+        items = [cols.get_item(i) for i in range(cols.get_n_items())]
+        name_title = gettext.dgettext("nautilus", "Name")
+        name = next((c for c in items if c.get_title() == name_title), items[0] if items else None)
+        return [c for c in items if c is not name]
+
+    def _measure_secondary(self) -> int:
+        cv = self._native_columnview()
+        if cv is None or getattr(cv, "_vitrine_hidden", None):
+            return 0
+        total = 0
+        for col in self._secondary_columns(cv):
+            if col.get_visible():
+                fixed = col.get_fixed_width()
+                total += fixed if fixed > 0 else 110
+        return total
+
+    def _set_secondary_hidden(self, hide: bool) -> None:
+        cv = self._native_columnview()
+        if cv is None:
+            return
+        hidden = getattr(cv, "_vitrine_hidden", None) or []
+        if hide:
+            for col in self._secondary_columns(cv):
+                if col.get_visible():
+                    col.set_visible(False)
+                    hidden.append(col)
+            cv._vitrine_hidden = hidden
+        elif hidden:
+            for col in hidden:
+                col.set_visible(True)
+            cv._vitrine_hidden = []
+
     @guarded
     def _on_destroy(self, *_a) -> None:
         if self.style is not None:
@@ -6862,9 +7231,9 @@ class WindowController:
         if self.strip is not None:
             self.strip.teardown()
         self.ext.forget_window(self.win)
-__VITRINE_ARQUIVO_17__
+__VITRINE_ARQUIVO_18__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/about.css' <<'__VITRINE_ARQUIVO_18__'
+cat > 'vitrine/assets/about.css' <<'__VITRINE_ARQUIVO_19__'
 /* Card principal da página "Sobre" (vitrine/about.py).
    --card-bg-color do libadwaita já é um pouco mais claro que a janela nos dois temas;
    a borda usa o azul da logo. */
@@ -6874,9 +7243,9 @@ cat > 'vitrine/assets/about.css' <<'__VITRINE_ARQUIVO_18__'
   border-radius: 16px;
   padding: 32px 24px 24px 24px;
 }
-__VITRINE_ARQUIVO_18__
+__VITRINE_ARQUIVO_19__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/finder.css' <<'__VITRINE_ARQUIVO_19__'
+cat > 'vitrine/assets/finder.css' <<'__VITRINE_ARQUIVO_20__'
 /* Estilo "Finder (macOS)" da Vitrine.
  *
  * Toda regra começa com window.vitrine-finder: sem essa classe na janela, nada daqui
@@ -7041,9 +7410,17 @@ window.vitrine-finder .vitrine-finder-status {
   font-size: 0.85em; padding: 3px 0 5px 0;
   color: color-mix(in srgb, currentColor 55%, transparent);
 }
-__VITRINE_ARQUIVO_19__
+
+/* ── janela estreita (FinderToolbar.set_compact) ── */
+window.vitrine-finder.vitrine-compact .vitrine-search-pill { min-width: 0; padding: 0 9px; }
+window.vitrine-finder.vitrine-compact .vitrine-capsule button,
+window.vitrine-finder.vitrine-compact .vitrine-capsule menubutton > button {
+  min-width: 28px; padding: 0 5px;
+}
+window.vitrine-finder.vitrine-compact .vitrine-finder-header > windowhandle > box { padding: 6px 4px; }
+__VITRINE_ARQUIVO_20__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/nautilus-vitrine-logo.svg' <<'__VITRINE_ARQUIVO_20__'
+cat > 'vitrine/assets/nautilus-vitrine-logo.svg' <<'__VITRINE_ARQUIVO_21__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
@@ -7064,9 +7441,9 @@ cat > 'vitrine/assets/nautilus-vitrine-logo.svg' <<'__VITRINE_ARQUIVO_20__'
   <path d="M58 98 a18 18 0 0 1 18-18 h30 l14 16 h60 a18 18 0 0 1 18 18 v60 a18 18 0 0 1 -18 18 H76 a18 18 0 0 1 -18-18 Z" fill="none" stroke="url(#glass)" stroke-width="15" stroke-linejoin="round"/>
   <path d="M128 120 Q131.5 136.5 148 140 Q131.5 143.5 128 160 Q124.5 143.5 108 140 Q124.5 136.5 128 120 Z" fill="#ffd166"/>
 </svg>
-__VITRINE_ARQUIVO_20__
+__VITRINE_ARQUIVO_21__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/nautilus-vitrine-mark.svg' <<'__VITRINE_ARQUIVO_21__'
+cat > 'vitrine/assets/nautilus-vitrine-mark.svg' <<'__VITRINE_ARQUIVO_22__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
   <defs>
     <linearGradient id="glass" x1="0" y1="0" x2="1" y2="1">
@@ -7077,9 +7454,9 @@ cat > 'vitrine/assets/nautilus-vitrine-mark.svg' <<'__VITRINE_ARQUIVO_21__'
   <path d="M40 90 a22 22 0 0 1 22-22 h38 l18 20 h76 a22 22 0 0 1 22 22 v74 a22 22 0 0 1 -22 22 H62 a22 22 0 0 1 -22-22 Z" fill="none" stroke="url(#glass)" stroke-width="16" stroke-linejoin="round"/>
   <path d="M128 112 Q132.5 133.5 154 138 Q132.5 142.5 128 164 Q123.5 142.5 102 138 Q123.5 133.5 128 112 Z" fill="#ffd166"/>
 </svg>
-__VITRINE_ARQUIVO_21__
+__VITRINE_ARQUIVO_22__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/nautilus-vitrine-symbolic.svg' <<'__VITRINE_ARQUIVO_22__'
+cat > 'vitrine/assets/nautilus-vitrine-symbolic.svg' <<'__VITRINE_ARQUIVO_23__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Ícones simbólicos do GTK são recoloridos forçando `fill`: por isso o contorno
        da pasta é um caminho preenchido (borda externa menos borda interna, evenodd)
@@ -7087,66 +7464,66 @@ cat > 'vitrine/assets/nautilus-vitrine-symbolic.svg' <<'__VITRINE_ARQUIVO_22__'
   <path fill="currentColor" fill-rule="evenodd" d="M1.2 4.6 A2.2 2.2 0 0 1 3.4 2.4 H6.2 A0.8 0.8 0 0 1 6.807 2.679 L7.768 3.8 H12.6 A2.2 2.2 0 0 1 14.8 6 V12.4 A2.2 2.2 0 0 1 12.6 14.6 H3.4 A2.2 2.2 0 0 1 1.2 12.4 Z M2.8 4.6 A0.6 0.6 0 0 1 3.4 4 H5.832 L6.793 5.121 A0.8 0.8 0 0 0 7.4 5.4 H12.6 A0.6 0.6 0 0 1 13.2 6 V12.4 A0.6 0.6 0 0 1 12.6 13 H3.4 A0.6 0.6 0 0 1 2.8 12.4 Z"/>
   <path fill="currentColor" d="M8 6.1 Q8.35 8.15 10.4 8.5 Q8.35 8.85 8 10.9 Q7.65 8.85 5.6 8.5 Q7.65 8.15 8 6.1 Z"/>
 </svg>
-__VITRINE_ARQUIVO_22__
+__VITRINE_ARQUIVO_23__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/vitrine-tag-blue.svg' <<'__VITRINE_ARQUIVO_23__'
+cat > 'vitrine/assets/vitrine-tag-blue.svg' <<'__VITRINE_ARQUIVO_24__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Emblema da etiqueta "blue" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
   <circle cx="8" cy="8" r="6.5" fill="#0a84ff" stroke="#ffffff" stroke-width="1.5"/>
 </svg>
-__VITRINE_ARQUIVO_23__
+__VITRINE_ARQUIVO_24__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/vitrine-tag-gray.svg' <<'__VITRINE_ARQUIVO_24__'
+cat > 'vitrine/assets/vitrine-tag-gray.svg' <<'__VITRINE_ARQUIVO_25__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Emblema da etiqueta "gray" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
   <circle cx="8" cy="8" r="6.5" fill="#98989d" stroke="#ffffff" stroke-width="1.5"/>
 </svg>
-__VITRINE_ARQUIVO_24__
+__VITRINE_ARQUIVO_25__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/vitrine-tag-green.svg' <<'__VITRINE_ARQUIVO_25__'
+cat > 'vitrine/assets/vitrine-tag-green.svg' <<'__VITRINE_ARQUIVO_26__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Emblema da etiqueta "green" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
   <circle cx="8" cy="8" r="6.5" fill="#30d158" stroke="#ffffff" stroke-width="1.5"/>
 </svg>
-__VITRINE_ARQUIVO_25__
+__VITRINE_ARQUIVO_26__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/vitrine-tag-orange.svg' <<'__VITRINE_ARQUIVO_26__'
+cat > 'vitrine/assets/vitrine-tag-orange.svg' <<'__VITRINE_ARQUIVO_27__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Emblema da etiqueta "orange" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
   <circle cx="8" cy="8" r="6.5" fill="#ff9f0a" stroke="#ffffff" stroke-width="1.5"/>
 </svg>
-__VITRINE_ARQUIVO_26__
+__VITRINE_ARQUIVO_27__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/vitrine-tag-purple.svg' <<'__VITRINE_ARQUIVO_27__'
+cat > 'vitrine/assets/vitrine-tag-purple.svg' <<'__VITRINE_ARQUIVO_28__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Emblema da etiqueta "purple" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
   <circle cx="8" cy="8" r="6.5" fill="#bf5af2" stroke="#ffffff" stroke-width="1.5"/>
 </svg>
-__VITRINE_ARQUIVO_27__
+__VITRINE_ARQUIVO_28__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/vitrine-tag-red.svg' <<'__VITRINE_ARQUIVO_28__'
+cat > 'vitrine/assets/vitrine-tag-red.svg' <<'__VITRINE_ARQUIVO_29__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Emblema da etiqueta "red" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
   <circle cx="8" cy="8" r="6.5" fill="#ff453a" stroke="#ffffff" stroke-width="1.5"/>
 </svg>
-__VITRINE_ARQUIVO_28__
+__VITRINE_ARQUIVO_29__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/vitrine-tag-symbolic.svg' <<'__VITRINE_ARQUIVO_29__'
+cat > 'vitrine/assets/vitrine-tag-symbolic.svg' <<'__VITRINE_ARQUIVO_30__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Etiqueta (botão "Etiquetas" do estilo Finder). Só preenchimento, como todo ícone
        simbólico do GTK: contorno = forma externa menos a interna (evenodd), com o furo. -->
   <path fill="currentColor" fill-rule="evenodd" d="M2.6 1.5 H7.6 a1.5 1.5 0 0 1 1.06 .44 l5.4 5.4 a1.5 1.5 0 0 1 0 2.12 l-4.94 4.94 a1.5 1.5 0 0 1 -2.12 0 l-5.4 -5.4 A1.5 1.5 0 0 1 1.1 7.94 V3 A1.5 1.5 0 0 1 2.6 1.5 Z M2.7 3.1 V7.75 l5.3 5.3 4.95 -4.95 -5.3 -5.3 Z M5 4 a1 1 0 1 1 0 2 a1 1 0 1 1 0 -2 Z"/>
 </svg>
-__VITRINE_ARQUIVO_29__
+__VITRINE_ARQUIVO_30__
 mkdir -p "vitrine/assets"
-cat > 'vitrine/assets/vitrine-tag-yellow.svg' <<'__VITRINE_ARQUIVO_30__'
+cat > 'vitrine/assets/vitrine-tag-yellow.svg' <<'__VITRINE_ARQUIVO_31__'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <!-- Emblema da etiqueta "yellow" (vitrine/tags.py). Anel branco para destacar sobre miniaturas. -->
   <circle cx="8" cy="8" r="6.5" fill="#ffd60a" stroke="#ffffff" stroke-width="1.5"/>
 </svg>
-__VITRINE_ARQUIVO_30__
+__VITRINE_ARQUIVO_31__
 mkdir -p "vitrine/finder"
-cat > 'vitrine/finder/__init__.py' <<'__VITRINE_ARQUIVO_31__'
+cat > 'vitrine/finder/__init__.py' <<'__VITRINE_ARQUIVO_32__'
 """Estilo "Finder (macOS)": visual e ferramentas inspirados no Finder, por cima do
 Nautilus, e removível a qualquer momento.
 
@@ -7463,10 +7840,20 @@ class FinderStyle:
 
         self.toolbar = FinderToolbar(self.ctl, switcher)
         self.toolbar.attach(header, self._later)
+        # Barra compacta em janela estreita: confere a largura a cada quadro (só compara
+        # um número; o callback sai junto com a camada Finder).
+        tick = header.add_tick_callback(self._on_tick)
+        self._later(lambda: header.remove_tick_callback(tick))
+        self._later(lambda: self.win.remove_css_class("vitrine-compact"))
         if switcher is not None:
             self._connect(switcher, "notify::visible-child-name",
                           lambda *_a: self.toolbar and self.toolbar.sync_title())
             self._later(lambda s=switcher: s.set_visible(True))
+
+    def _on_tick(self, _widget, _clock) -> bool:
+        if self.toolbar is not None:
+            self.toolbar.set_compact(self.win.get_width() < self.toolbar.COMPACT_BELOW)
+        return True
 
     # ── estado ──
     def sync(self) -> None:
@@ -7484,9 +7871,9 @@ def describe(win) -> str:
     return (f"classe={win.has_css_class('vitrine-finder')} css={css_loaded()} "
             f"janela={gtype_name(win)}")
 
-__VITRINE_ARQUIVO_31__
+__VITRINE_ARQUIVO_32__
 mkdir -p "vitrine/finder"
-cat > 'vitrine/finder/bottombar.py' <<'__VITRINE_ARQUIVO_32__'
+cat > 'vitrine/finder/bottombar.py' <<'__VITRINE_ARQUIVO_33__'
 """Barras de baixo do estilo Finder (opcionais, desligadas de fábrica como no macOS):
 
   * barra de caminho: a hierarquia da pasta atual, clicável
@@ -7628,9 +8015,9 @@ class FinderBottomBar(Gtk.Box):
 
         Gio.File.new_for_uri(uri).query_filesystem_info_async(
             "filesystem::free", GLib.PRIORITY_LOW, self._cancel, done)
-__VITRINE_ARQUIVO_32__
+__VITRINE_ARQUIVO_33__
 mkdir -p "vitrine/finder"
-cat > 'vitrine/finder/toolbar.py' <<'__VITRINE_ARQUIVO_33__'
+cat > 'vitrine/finder/toolbar.py' <<'__VITRINE_ARQUIVO_34__'
 """Barra de ferramentas do estilo Finder, montada dentro do AdwHeaderBar do Nautilus:
 
     [← | →]  Título da pasta          [▦ ☰ ▥] [⇅ ⌄] [⇪] [⋯] [🔍 Pesquisar]
@@ -7807,9 +8194,11 @@ class FinderToolbar:
         content.append(Gtk.Image.new_from_icon_name("system-search-symbolic"))
         label = Gtk.Label(label="Pesquisar", xalign=0, hexpand=True)
         content.append(label)
+        self.search_label = label
         btn = Gtk.Button(child=content, valign=Gtk.Align.CENTER,
                          tooltip_text=f"{nt('Search Current Folder', 'Pesquisar pasta atual')} (Ctrl+F)")
         btn.add_css_class("vitrine-search-pill")
+        self.search_button = btn
         btn.connect("clicked", lambda *_a: self._start_search())
         return btn
 
@@ -7870,6 +8259,23 @@ class FinderToolbar:
         if slot is not None:
             slot.activate_action("slot.search-visible", None)
 
+    # ── janela estreita ──
+    COMPACT_BELOW = 1150
+
+    def set_compact(self, compact: bool) -> None:
+        """Janela estreita: Pesquisar vira só a lupa e as cápsulas ficam mais justas,
+        para a barra não ficar mais larga que a janela."""
+        if getattr(self, "_compact", None) == compact:
+            return
+        self._compact = compact
+        self.search_label.set_visible(not compact)
+        self.title.set_max_width_chars(14 if compact else 28)
+        for w in (self.search_button, self.ctl.win):
+            if compact:
+                w.add_css_class("vitrine-compact")
+            else:
+                w.remove_css_class("vitrine-compact")
+
     # ── estado ──
     @guarded
     def _on_view_toggled(self, btn, mode: str) -> None:
@@ -7927,9 +8333,9 @@ def _spawn(argv: list[str]) -> None:
         Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE)
     except GLib.Error as err:
         log(f"não foi possível abrir {argv[0]}: {err.message}")
-__VITRINE_ARQUIVO_33__
+__VITRINE_ARQUIVO_34__
 mkdir -p "vitrine/schemas"
-cat > 'vitrine/schemas/io.github.bispov19.NautilusVitrine.gschema.xml' <<'__VITRINE_ARQUIVO_34__'
+cat > 'vitrine/schemas/io.github.bispov19.NautilusVitrine.gschema.xml' <<'__VITRINE_ARQUIVO_35__'
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   Preferências da Vitrine para Nautilus.
@@ -8067,15 +8473,25 @@ cat > 'vitrine/schemas/io.github.bispov19.NautilusVitrine.gschema.xml' <<'__VITR
       <summary>Barra de status embaixo (estilo Finder)</summary>
     </key>
 
+    <key name="columns-prioritize-names" type="b">
+      <default>true</default>
+      <summary>Priorizar nomes no modo coluna</summary>
+      <description>Tamanho/Modificado, colunas anteriores e o painel de pré-visualização cedem espaço para o nome ficar legível.</description>
+    </key>
+    <key name="columns-auto-preview" type="b">
+      <default>true</default>
+      <summary>Recolher o painel de pré-visualização automaticamente quando faltar espaço</summary>
+    </key>
+
     <key name="json-migrated" type="b">
       <default>false</default>
       <summary>As preferências antigas (settings.json) já foram importadas</summary>
     </key>
   </schema>
 </schemalist>
-__VITRINE_ARQUIVO_34__
+__VITRINE_ARQUIVO_35__
 mkdir -p "tools"
-cat > 'tools/smoke_test.py' <<'__VITRINE_ARQUIVO_35__'
+cat > 'tools/smoke_test.py' <<'__VITRINE_ARQUIVO_36__'
 """Teste rápido FORA do Nautilus: abre as colunas e o painel de preview numa janela
 própria e salva uma captura em PNG; monta a página "Sobre" nos temas claro e escuro
 (saida-sobre-claro.png / saida-sobre-escuro.png) e confere se a versão do .spec é a
@@ -8211,9 +8627,9 @@ app.run([])
 if failures:
     print("FALHAS:", failures)
     sys.exit(1)
-__VITRINE_ARQUIVO_35__
+__VITRINE_ARQUIVO_36__
 mkdir -p "tools"
-cat > 'tools/test_history.py' <<'__VITRINE_ARQUIVO_36__'
+cat > 'tools/test_history.py' <<'__VITRINE_ARQUIVO_37__'
 """Testes do histórico de Voltar/Avançar com o Meu computador (sem GTK, sem Nautilus).
 
     python3 tools/test_history.py
@@ -8416,9 +8832,9 @@ def run() -> bool:
 
 if __name__ == "__main__":
     sys.exit(0 if run() else 1)
-__VITRINE_ARQUIVO_36__
+__VITRINE_ARQUIVO_37__
 mkdir -p "tools"
-cat > 'tools/test_config.py' <<'__VITRINE_ARQUIVO_37__'
+cat > 'tools/test_config.py' <<'__VITRINE_ARQUIVO_38__'
 """Testes das preferências em GSettings (sem tocar nas suas preferências reais).
 
     python3 tools/test_config.py
@@ -8512,9 +8928,9 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-__VITRINE_ARQUIVO_37__
+__VITRINE_ARQUIVO_38__
 mkdir -p "tools"
-cat > 'tools/test_tags.py' <<'__VITRINE_ARQUIVO_38__'
+cat > 'tools/test_tags.py' <<'__VITRINE_ARQUIVO_39__'
 """Testes das etiquetas (user.xdg.tags) em arquivos temporários.
 
     python3 tools/test_tags.py
@@ -8618,9 +9034,9 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-__VITRINE_ARQUIVO_38__
+__VITRINE_ARQUIVO_39__
 mkdir -p "tools"
-cat > 'tools/test_gallery.py' <<'__VITRINE_ARQUIVO_39__'
+cat > 'tools/test_gallery.py' <<'__VITRINE_ARQUIVO_40__'
 """Testes dos grupos da Galeria (sem Nautilus).
 
     python3 tools/test_gallery.py
@@ -8665,9 +9081,82 @@ order = [date_bucket(t, now)[0] for t in (now, at(2026, 11, 23), at(2026, 11, 19
 check("grupos do mais novo para o mais antigo", order, sorted(order))
 print(f"\n{sum(results)}/{len(results)} verificações passaram")
 sys.exit(0 if all(results) else 1)
-__VITRINE_ARQUIVO_39__
+__VITRINE_ARQUIVO_40__
 mkdir -p "tools"
-cat > 'tools/build_bootstrap.py' <<'__VITRINE_ARQUIVO_40__'
+cat > 'tools/test_layout.py' <<'__VITRINE_ARQUIVO_41__'
+"""Testes do orçamento de largura do modo Colunas (sem GTK).
+
+    python3 tools/test_layout.py
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+from vitrine.layout import NAME_MIN, PREVIEW_MIN, plan  # noqa: E402
+
+results = []
+
+
+def check(name, ok, detail=""):
+    results.append(bool(ok))
+    print(f"{'PASSOU' if ok else 'FALHOU'}: {name}" + ("" if ok else f"  ({detail})"))
+
+
+base = dict(column_width=230, max_visible=3, preview_width=320)
+
+p = plan(width=2000, columns=3, preview_on=True, **base)
+check("janela grande: tudo aparece", p.strip_columns == 3 and p.preview_width == 320
+      and not p.hide_secondary and p.name_width >= NAME_MIN, p)
+
+# o caso da captura: 3 colunas + painel numa área de ~1860 px lógicos menos a barra lateral
+p = plan(width=1500, columns=3, preview_on=True, **base)
+check("apertado: primeiro some Tamanho/Modificado/☆", p.hide_secondary and p.strip_columns == 3
+      and p.preview_width == 320 and p.name_width >= NAME_MIN, p)
+
+p = plan(width=1250, columns=5, preview_on=True, **base)
+check("5 níveis: menos colunas anteriores antes de mexer no painel",
+      p.strip_columns == 2 and p.preview_width == 320 and p.name_width >= NAME_MIN, p)
+
+p = plan(width=1150, columns=5, preview_on=True, **base)
+check("mais apertado: painel estreita até o mínimo", p.strip_columns == 2
+      and PREVIEW_MIN <= p.preview_width < 320 and p.name_width >= NAME_MIN, p)
+
+p = plan(width=950, columns=5, preview_on=True, **base)
+check("ainda mais: só 1 coluna anterior", p.strip_columns == 1 and p.preview_width >= PREVIEW_MIN
+      and p.name_width >= NAME_MIN, p)
+
+p = plan(width=700, columns=5, preview_on=True, **base)
+check("janela pequena: painel recolhe sozinho", p.preview_width == 0 and p.preview_auto_hidden
+      and p.name_width >= NAME_MIN, p)
+
+p = plan(width=700, columns=5, preview_on=True, preview_forced=True, **base)
+check("painel reaberto à mão: não recolhe de novo", p.preview_width > 0 and not p.preview_auto_hidden, p)
+
+p = plan(width=700, columns=5, preview_on=True, auto_preview=False, **base)
+check("opção de recolher desligada: painel fica", p.preview_width > 0, p)
+
+p = plan(width=2000, columns=5, preview_on=True, **base)
+check("espaço de volta: painel volta ao tamanho normal", p.preview_width == 320
+      and not p.preview_auto_hidden, p)
+
+p = plan(width=900, columns=3, preview_on=False, **base)
+check("painel desligado pelo usuário continua desligado", p.preview_width == 0
+      and not p.preview_auto_hidden and p.name_width >= NAME_MIN, p)
+
+p = plan(width=900, columns=3, preview_on=True, prioritize=False, **base)
+check("opção Priorizar nomes desligada: comportamento antigo", p.strip_columns == 3
+      and p.preview_width == 320 and not p.hide_secondary, p)
+
+p = plan(width=1200, columns=0, preview_on=True, **base)
+check("pasta raiz (sem colunas anteriores)", p.strip_columns == 0 and p.name_width >= NAME_MIN, p)
+
+print(f"\n{sum(results)}/{len(results)} verificações passaram")
+sys.exit(0 if all(results) else 1)
+__VITRINE_ARQUIVO_41__
+mkdir -p "tools"
+cat > 'tools/build_bootstrap.py' <<'__VITRINE_ARQUIVO_42__'
 """Gera `criar-vitrine.sh`: um único script bash que recria o projeto inteiro
 (todos os arquivos) numa pasta e, se você quiser, já instala no Nautilus.
 
@@ -8687,6 +9176,7 @@ INCLUDE = [
     "tools/test_config.py",
     "tools/test_tags.py",
     "tools/test_gallery.py",
+    "tools/test_layout.py",
     "tools/build_bootstrap.py",
     "install.sh",
     "uninstall.sh",
@@ -8786,8 +9276,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-__VITRINE_ARQUIVO_40__
-cat > 'install.sh' <<'__VITRINE_ARQUIVO_41__'
+__VITRINE_ARQUIVO_42__
+cat > 'install.sh' <<'__VITRINE_ARQUIVO_43__'
 #!/usr/bin/env bash
 # Instala a Vitrine para o seu usuário (não precisa de root, exceto para o nautilus-python).
 #
@@ -8853,8 +9343,8 @@ if [[ "$RESTART" == 1 ]]; then
   (setsid nautilus >/dev/null 2>&1 &)
 fi
 echo "Pronto. Log: ${XDG_CACHE_HOME:-$HOME/.cache}/nautilus-vitrine/vitrine.log"
-__VITRINE_ARQUIVO_41__
-cat > 'uninstall.sh' <<'__VITRINE_ARQUIVO_42__'
+__VITRINE_ARQUIVO_43__
+cat > 'uninstall.sh' <<'__VITRINE_ARQUIVO_44__'
 #!/usr/bin/env bash
 # Remove a Vitrine. Suas regras por pasta ficam em ~/.config/nautilus-vitrine
 # (use --purge para apagá-las também).
@@ -8866,15 +9356,15 @@ if [[ "${1:-}" == "--purge" ]]; then
 fi
 nautilus -q 2>/dev/null || true
 echo "Vitrine removida. Abra o Arquivos de novo para voltar ao Nautilus original."
-__VITRINE_ARQUIVO_42__
+__VITRINE_ARQUIVO_44__
 mkdir -p ".vscode"
-cat > '.vscode/extensions.json' <<'__VITRINE_ARQUIVO_43__'
+cat > '.vscode/extensions.json' <<'__VITRINE_ARQUIVO_45__'
 {
   "recommendations": ["ms-python.python", "ms-python.vscode-pylance"]
 }
-__VITRINE_ARQUIVO_43__
+__VITRINE_ARQUIVO_45__
 mkdir -p ".vscode"
-cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_44__'
+cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_46__'
 {
   "python.defaultInterpreterPath": "/usr/bin/python3",
   "python.analysis.extraPaths": ["${workspaceFolder}"],
@@ -8882,9 +9372,9 @@ cat > '.vscode/settings.json' <<'__VITRINE_ARQUIVO_44__'
   "editor.rulers": [100],
   "[python]": { "editor.tabSize": 4 }
 }
-__VITRINE_ARQUIVO_44__
+__VITRINE_ARQUIVO_46__
 mkdir -p ".vscode"
-cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_45__'
+cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_47__'
 {
   // Ctrl+Shift+P → "Tasks: Run Task" para ver estas tarefas.
   // Ctrl+Shift+B roda a tarefa padrão (instalar em modo dev + reiniciar o Nautilus).
@@ -8955,8 +9445,8 @@ cat > '.vscode/tasks.json' <<'__VITRINE_ARQUIVO_45__'
     }
   ]
 }
-__VITRINE_ARQUIVO_45__
-cat > 'README.md' <<'__VITRINE_ARQUIVO_46__'
+__VITRINE_ARQUIVO_47__
+cat > 'README.md' <<'__VITRINE_ARQUIVO_48__'
 <p align="center">
   <img src="vitrine/assets/nautilus-vitrine-logo.svg" width="96" alt="Logo da Vitrine para Nautilus">
 </p>
@@ -9021,6 +9511,7 @@ Ative com **Ctrl+4**, com o botão da Galeria (estilo Finder) ou em **Visualiza�
 - **Arraste e solte** entre colunas, da coluna para a lista e da lista para a coluna. Mover e copiar usam as operações do próprio Nautilus, com barra de progresso, diálogo de conflito e **Ctrl+Z**.
 - Clique do meio numa pasta abre em nova janela. O clique direito traz Abrir, Abrir em nova janela, Mostrar na lista, Copiar caminho e Mover para a lixeira.
 - Respeita a opção de **mostrar arquivos ocultos** do Nautilus.
+- **O nome vem primeiro.** Se faltar espaço para ler os nomes da pasta atual, a Vitrine cede espaço nesta ordem: esconde Tamanho, Modificado e a estrela; mostra menos colunas anteriores (role para a esquerda para ver as outras); estreita o painel de pré-visualização; e, por fim, recolhe o painel. Quando a janela volta a ter espaço, tudo volta sozinho. Recolher o painel não muda a sua preferência, e se você reabrir o painel à mão ele fica aberto. Desligue em *Personalizar → Priorizar nomes no modo coluna*.
 
 ### 🖼️ Painel de pré-visualização
 
@@ -9219,6 +9710,8 @@ Na primeira execução da versão com GSettings, o antigo `settings.json` é imp
 | `image_dimensions` | `true` | Dimensões das imagens abaixo do nome na grade (estilo Finder) |
 | `gallery_group_by` | `"date"` | Agrupamento da Galeria: `none`, `date`, `type`, `size`, `tags` |
 | `path_bar` | `false` | Barra de caminho embaixo (estilo Finder) |
+| `columns_prioritize_names` | `true` | Modo Colunas: Tamanho/Modificado, colunas anteriores e painel cedem espaço ao nome |
+| `columns_auto_preview` | `true` | Modo Colunas: recolher o painel de pré-visualização enquanto faltar espaço |
 | `status_bar` | `false` | Barra de status embaixo (estilo Finder) |
 
 **`~/.config/nautilus-vitrine/folders.json`** guarda as regras por pasta:
@@ -9261,6 +9754,7 @@ vitrine/
   finder/               estilo Finder: aplica e remove a camada visual (barra de ferramentas, barras de baixo)
   schemas/              schema GSettings da Vitrine
   tags.py               etiquetas (user.xdg.tags) e índice dos arquivos etiquetados
+  layout.py             orçamento de largura do modo Colunas (o nome primeiro)
   gallery.py            visualização em Galeria (Ctrl+4)
   tagui.py              telas das etiquetas (barra, barra lateral, página, Todas as etiquetas…)
   history.py            Voltar/Avançar por aba incluindo o Meu computador (sem GTK)
@@ -9275,6 +9769,7 @@ tools/
   test_config.py        testes das preferências (GSettings)
   test_tags.py          testes das etiquetas
   test_gallery.py       testes dos grupos de data da Galeria
+  test_layout.py        testes do orçamento de largura do modo Colunas
   build_bootstrap.py    gera o criar-vitrine.sh
 packaging/
   nautilus-vitrine.spec receita do pacote RPM
@@ -9385,8 +9880,8 @@ A técnica de injeção na janela foi inspirada no projeto **[My Computer for Na
 ## Licença
 
 [MIT](LICENSE)
-__VITRINE_ARQUIVO_46__
-cat > 'LICENSE' <<'__VITRINE_ARQUIVO_47__'
+__VITRINE_ARQUIVO_48__
+cat > 'LICENSE' <<'__VITRINE_ARQUIVO_49__'
 MIT License
 
 Copyright (c) 2026 Vitrine para Nautilus contributors
@@ -9412,16 +9907,16 @@ SOFTWARE.
 ---
 Inspired by "My Computer for Nautilus" (https://github.com/yannmasoch/nautilus-my-computer),
 Copyright (c) 2026 Yann Masoch, MIT License.
-__VITRINE_ARQUIVO_47__
-cat > '.gitignore' <<'__VITRINE_ARQUIVO_48__'
+__VITRINE_ARQUIVO_49__
+cat > '.gitignore' <<'__VITRINE_ARQUIVO_50__'
 __pycache__/
 *.pyc
 *.tmp
 dist/
 dist-build.log
 gschemas.compiled
-__VITRINE_ARQUIVO_48__
-cat > 'Makefile' <<'__VITRINE_ARQUIVO_49__'
+__VITRINE_ARQUIVO_50__
+cat > 'Makefile' <<'__VITRINE_ARQUIVO_51__'
 # Empacotamento local.  Requer: sudo dnf install make rpm-build python3-devel
 #
 #   make rpm        gera o RPM em dist/
@@ -9455,13 +9950,13 @@ install-rpm:
 
 clean:
 	rm -rf $(DIST)
-__VITRINE_ARQUIVO_49__
+__VITRINE_ARQUIVO_51__
 mkdir -p "packaging"
-cat > 'packaging/nautilus-vitrine.spec' <<'__VITRINE_ARQUIVO_50__'
+cat > 'packaging/nautilus-vitrine.spec' <<'__VITRINE_ARQUIVO_52__'
 %global extdir %{_datadir}/nautilus-python/extensions
 
 Name:           nautilus-vitrine
-Version:        0.4.0
+Version:        0.4.1
 Release:        1%{?dist}
 Summary:        Finder-style look, column and gallery views, tags and preview pane for GNOME Files
 
@@ -9516,6 +10011,11 @@ glib-compile-schemas --strict %{buildroot}%{extdir}/vitrine/schemas
 %{extdir}/vitrine/
 
 %changelog
+* Thu Nov 26 2026 Vinicius Bispo - 0.4.1-1
+- Modo Colunas: o nome tem prioridade (Tamanho/Modificado, colunas anteriores e
+  painel de pré-visualização cedem espaço; o painel recolhe e volta sozinho)
+- Barra do Finder compacta em janelas estreitas
+
 * Tue Nov 24 2026 Vinicius Bispo - 0.4.0-1
 - Estilo Finder (padrão) com volta ao Nautilus padrão; preferências em GSettings
 - Etiquetas coloridas (user.xdg.tags): menu, barra, barra lateral, Propriedades
@@ -9537,9 +10037,9 @@ glib-compile-schemas --strict %{buildroot}%{extdir}/vitrine/schemas
 
 * Wed Nov 11 2026 Vinicius Bispo - 0.1.0-1
 - Primeira versão: modo Colunas, painel de pré-visualização e visualização por pasta
-__VITRINE_ARQUIVO_50__
+__VITRINE_ARQUIVO_52__
 mkdir -p ".copr"
-cat > '.copr/Makefile' <<'__VITRINE_ARQUIVO_51__'
+cat > '.copr/Makefile' <<'__VITRINE_ARQUIVO_53__'
 # Usado pelo COPR (método "make srpm"): gera o SRPM direto do repositório git.
 # O COPR chama:  make -f .copr/Makefile srpm outdir=<pasta> spec=<arquivo .spec>
 SPEC := packaging/nautilus-vitrine.spec
@@ -9554,7 +10054,7 @@ srpm:
 	rpmbuild -bs $(SPEC) \
 		--define "_sourcedir $(outdir)" \
 		--define "_srcrpmdir $(outdir)"
-__VITRINE_ARQUIVO_51__
+__VITRINE_ARQUIVO_53__
 
 chmod +x install.sh uninstall.sh
 echo "Projeto criado em $TARGET"

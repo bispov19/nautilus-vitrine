@@ -44,6 +44,9 @@ DEFAULT_SETTINGS = {
     # Estilo Finder: barra de caminho e barra de status embaixo.
     "path_bar": False,
     "status_bar": False,
+    # Modo Colunas: o nome tem prioridade (layout.py); o painel recolhe se faltar espaço.
+    "columns_prioritize_names": True,
+    "columns_auto_preview": True,
     # Painel de pré-visualização à direita (Ctrl+Shift+P).
     "preview_visible": True,
     "preview_width": 320,
@@ -99,6 +102,7 @@ _GS_TYPES = {
     "default_mode": "s?", "default_grid_zoom": "s?",  # "" no GSettings = None aqui
     "tags": "a(ss)", "tags_in_sidebar": "b", "tags_section_expanded": "b",
     "image_dimensions": "b", "gallery_group_by": "s", "path_bar": "b", "status_bar": "b",
+    "columns_prioritize_names": "b", "columns_auto_preview": "b",
 }
 
 
