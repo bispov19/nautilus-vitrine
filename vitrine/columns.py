@@ -382,6 +382,7 @@ class ColumnStrip(Gtk.Box):
         self._on_reveal = on_reveal
         self.columns: list[FolderColumn] = []
         self.location: Gio.File | None = None
+        self.visible_count: int | None = None  # definido pelo orçamento de largura (layout.py)
         self._nautilus_prefs = Gio.Settings.new("org.gnome.nautilus.preferences")
         self.show_hidden = self._nautilus_prefs.get_boolean("show-hidden-files")
         self._hidden_handler = self._nautilus_prefs.connect(
@@ -440,10 +441,22 @@ class ColumnStrip(Gtk.Box):
             nxt = path[i + 1] if i + 1 < len(path) else None
             col.set_highlight(nxt.get_uri() if nxt is not None else None)
 
+        self.set_visible(len(self.columns) > 0)
+        self._resize()
+
+    def set_visible_count(self, count: int | None) -> None:
+        """Quantas colunas anteriores ficam à vista (as outras continuam acessíveis
+        rolando para a esquerda). None = o padrão (max_visible_columns)."""
+        if count == self.visible_count:
+            return
+        self.visible_count = count
+        self._resize()
+
+    def _resize(self) -> None:
         n = len(self.columns)
-        visible = min(n, self.max_visible)
+        limit = self.max_visible if self.visible_count is None else max(1, self.visible_count)
+        visible = min(n, limit)
         self.scroller.set_size_request(visible * (self.column_width + 1), -1)
-        self.set_visible(n > 0)
         GLib.idle_add(self._scroll_to_end)
 
     def _scroll_to_end(self) -> bool:

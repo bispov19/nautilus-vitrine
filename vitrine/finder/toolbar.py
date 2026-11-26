@@ -174,9 +174,11 @@ class FinderToolbar:
         content.append(Gtk.Image.new_from_icon_name("system-search-symbolic"))
         label = Gtk.Label(label="Pesquisar", xalign=0, hexpand=True)
         content.append(label)
+        self.search_label = label
         btn = Gtk.Button(child=content, valign=Gtk.Align.CENTER,
                          tooltip_text=f"{nt('Search Current Folder', 'Pesquisar pasta atual')} (Ctrl+F)")
         btn.add_css_class("vitrine-search-pill")
+        self.search_button = btn
         btn.connect("clicked", lambda *_a: self._start_search())
         return btn
 
@@ -236,6 +238,23 @@ class FinderToolbar:
         slot = self.ctl.active_slot()
         if slot is not None:
             slot.activate_action("slot.search-visible", None)
+
+    # ── janela estreita ──
+    COMPACT_BELOW = 1150
+
+    def set_compact(self, compact: bool) -> None:
+        """Janela estreita: Pesquisar vira só a lupa e as cápsulas ficam mais justas,
+        para a barra não ficar mais larga que a janela."""
+        if getattr(self, "_compact", None) == compact:
+            return
+        self._compact = compact
+        self.search_label.set_visible(not compact)
+        self.title.set_max_width_chars(14 if compact else 28)
+        for w in (self.search_button, self.ctl.win):
+            if compact:
+                w.add_css_class("vitrine-compact")
+            else:
+                w.remove_css_class("vitrine-compact")
 
     # ── estado ──
     @guarded

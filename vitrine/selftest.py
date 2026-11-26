@@ -701,6 +701,98 @@ def run(ctl) -> bool:
         check("opção Seção Etiquetas vale na hora (desliga e liga)",
               off and ctl.tag_sidebar is not None and ctl.style.active)
 
+    # ── modo Colunas: o nome tem prioridade ──
+    deep = {}
+    long_names = ("Proposta_Vegah_Salon_2026 (1).pdf", "Relatório de atividades do semestre.txt")
+
+    def name_labels():
+        cv = ctl._native_columnview()
+        if cv is None:
+            return []
+        return [w for w in util.walk(cv) if isinstance(w, Gtk.Label) and w.get_mapped()
+                and w.get_label() in long_names]
+
+    def names_readable():
+        labels = name_labels()
+        return len(labels) == len(long_names) and not any(
+            lb.get_layout().is_ellipsized() for lb in labels), [
+            (lb.get_label(), lb.get_width(), lb.get_layout().is_ellipsized()) for lb in labels]
+
+    @step
+    def c1():
+        root = tempfile.mkdtemp(prefix="vitrine-selftest-colunas-")
+        path = root
+        for name in ("Documentos de exemplo", "02_Estudos e cursos", "01_Cursos_LIVRES online",
+                     "Programação para iniciantes"):
+            path = os.path.join(path, name)
+            os.makedirs(path)
+        for name in long_names:
+            open(os.path.join(path, name), "w").close()
+        deep.update(root=root, leaf=Gio.File.new_for_path(path).get_uri(),
+                    maximized=ctl.win.is_maximized(),
+                    size=(ctl.win.get_width(), ctl.win.get_height()))
+        ctl.set_preview_visible(True)
+        ctl.navigate(deep["leaf"])
+
+    @step
+    def c2():
+        ctl.user_set_mode("columns")
+
+    @step
+    def c3():
+        ok, info = names_readable()
+        check("colunas (janela grande): nome legível com o painel ligado", ok,
+              f"{info} colunas={len(ctl.strip.columns)} painel={ctl.preview.get_visible()} "
+              f"largura={ctl.paned.get_width()}")
+        shot("colunas-janela-grande")
+        ctl.win.unmaximize()
+        ctl.win.set_default_size(860, 640)
+
+    @step
+    def c4():
+        ok, info = names_readable()
+        check("colunas (janela pequena): nome legível; painel cede espaço",
+              ok and ctl.paned.get_width() < 900, f"{info} largura={ctl.paned.get_width()} "
+              f"painel={ctl.preview.get_visible()} faixa={ctl.strip.visible_count}")
+        check("colunas: recolher o painel não muda a preferência do usuário",
+              bool(ctl.cfg.get("preview_visible")))
+        header = ctl.style.header if ctl.style is not None else None
+        hmin = header.measure(Gtk.Orientation.HORIZONTAL, -1)[0] if header is not None else 0
+        sidebar_w = ctl.win.get_width() - (header.get_parent().get_width() if header is not None else 0)
+        check("Finder: barra de ferramentas cabe na janela estreita (modo compacto)",
+              header is None or (ctl.win.has_css_class("vitrine-compact")
+                                 and hmin + sidebar_w <= ctl.win.get_width() + 1),
+              f"barra mín={hmin} lateral={sidebar_w} janela={ctl.win.get_width()}")
+        shot("colunas-janela-pequena")
+        if deep["maximized"]:
+            ctl.win.maximize()
+        else:
+            ctl.win.set_default_size(*deep["size"])
+
+    @step
+    def c5():
+        ok, info = names_readable()
+        check("colunas (janela grande de novo): painel volta sozinho",
+              ok and ctl.preview.get_visible() and not ctl._preview_auto_hidden,
+              f"{info} painel={ctl.preview.get_visible()} largura={ctl.paned.get_width()}")
+        ctl.cfg.set("columns_prioritize_names", False)
+
+    @step
+    def c6():
+        cv = ctl._native_columnview()
+        restored = cv is not None and not getattr(cv, "_vitrine_hidden", None)
+        check("opção Priorizar nomes desligada: colunas e painel como antes",
+              restored and ctl.strip.visible_count is None and ctl.preview.get_visible())
+        ctl.cfg.set("columns_prioritize_names", True)
+        ctl.user_set_mode("list")
+        cfg.forget(deep["leaf"])
+        discovery.forget_manual(deep["leaf"])
+        ctl.navigate(home)
+
+    @step
+    def c7():
+        shutil.rmtree(deep["root"], ignore_errors=True)
+
     @step
     def s11():
         st = state()

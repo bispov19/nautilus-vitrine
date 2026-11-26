@@ -162,3 +162,11 @@ window.vitrine-finder .vitrine-finder-status {
   font-size: 0.85em; padding: 3px 0 5px 0;
   color: color-mix(in srgb, currentColor 55%, transparent);
 }
+
+/* ── janela estreita (FinderToolbar.set_compact) ── */
+window.vitrine-finder.vitrine-compact .vitrine-search-pill { min-width: 0; padding: 0 9px; }
+window.vitrine-finder.vitrine-compact .vitrine-capsule button,
+window.vitrine-finder.vitrine-compact .vitrine-capsule menubutton > button {
+  min-width: 28px; padding: 0 5px;
+}
+window.vitrine-finder.vitrine-compact .vitrine-finder-header > windowhandle > box { padding: 6px 4px; }

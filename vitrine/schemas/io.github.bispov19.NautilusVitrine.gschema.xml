@@ -135,6 +135,16 @@
       <summary>Barra de status embaixo (estilo Finder)</summary>
     </key>
 
+    <key name="columns-prioritize-names" type="b">
+      <default>true</default>
+      <summary>Priorizar nomes no modo coluna</summary>
+      <description>Tamanho/Modificado, colunas anteriores e o painel de pré-visualização cedem espaço para o nome ficar legível.</description>
+    </key>
+    <key name="columns-auto-preview" type="b">
+      <default>true</default>
+      <summary>Recolher o painel de pré-visualização automaticamente quando faltar espaço</summary>
+    </key>
+
     <key name="json-migrated" type="b">
       <default>false</default>
       <summary>As preferências antigas (settings.json) já foram importadas</summary>
